@@ -267,7 +267,15 @@ namespace USI
 		o["EnteringKingRule"] << Option(ekr_rules, ekr_rules[EKR_27_POINT], [](auto& o) { set_entering_king_rule(o); });
 #endif
 
-		o["EvalDir"] << Option("eval");
+		// 評価関数1格納フォルダ、評価関数2格納フォルダ
+		o["Eval1Dir"] << Option("eval1");
+		o["Eval2Dir"] << Option("eval2");
+
+		// 評価関数2を混ぜる割合(%)
+		// （例）この設定値が  0の場合、評価関数1が100%、評価関数2が  0%
+		// （例）この設定値が 30の場合、評価関数1が 70%、評価関数2が 30%
+		// （例）この設定値が100の場合、評価関数1が  0%、評価関数2が100%
+		o["Eval2Rate"] << Option(50, 0, 100);
 
 #if defined(EVAL_KPPT) && defined (USE_SHARED_MEMORY_IN_EVAL) && defined(_MSC_VER)
 		// 評価関数パラメーターを共有するか

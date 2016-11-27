@@ -51,20 +51,109 @@ namespace Eval
 	void load_eval_impl()
 	{
 		{
+			// ----- 評価関数1の読込み
+
 			// KK
-			std::ifstream ifsKK(path_combine((string)Options["EvalDir"], KK_BIN), std::ios::binary);
+			std::ifstream ifsKK(path_combine((string)Options["Eval1Dir"], KK_BIN), std::ios::binary);
 			if (ifsKK) ifsKK.read(reinterpret_cast<char*>(kk), sizeof(kk));
 			else goto Error;
 
 			// KKP
-			std::ifstream ifsKKP(path_combine((string)Options["EvalDir"], KKP_BIN), std::ios::binary);
+			std::ifstream ifsKKP(path_combine((string)Options["Eval1Dir"], KKP_BIN), std::ios::binary);
 			if (ifsKKP) ifsKKP.read(reinterpret_cast<char*>(kkp), sizeof(kkp));
 			else goto Error;
 
 			// KPP
-			std::ifstream ifsKPP(path_combine((string)Options["EvalDir"], KPP_BIN), std::ios::binary);
+			std::ifstream ifsKPP(path_combine((string)Options["Eval1Dir"], KPP_BIN), std::ios::binary);
 			if (ifsKPP) ifsKPP.read(reinterpret_cast<char*>(kpp), sizeof(kpp));
 			else goto Error;
+
+
+			// ----- 評価関数2の読込み
+
+			// KK
+			cout << "KK2 read start" << endl;
+			int count_kk2 = (int)SQ_NB * (int)SQ_NB;
+			size_t size_kk2 = sizeof(ValueKk) * count_kk2;
+			ValueKk* tmp_kk2 = new ValueKk[count_kk2];
+			std::ifstream ifsKK2(path_combine((string)Options["Eval2Dir"], KK_BIN), std::ios::binary);
+			if (ifsKK2) ifsKK2.read(reinterpret_cast<char*>(tmp_kk2), size_kk2);
+			else goto Error;
+
+			// KKP
+			cout << "KKP2 read start" << endl;
+			int count_kkp2 = (int)SQ_NB * (int)SQ_NB * (int)fe_end;
+			size_t size_kkp2 = sizeof(ValueKkp) * count_kkp2;
+			ValueKkp* tmp_kkp2 = new ValueKkp[count_kkp2];
+			std::ifstream ifsKKP2(path_combine((string)Options["Eval2Dir"], KKP_BIN), std::ios::binary);
+			if (ifsKKP2) ifsKKP2.read(reinterpret_cast<char*>(tmp_kkp2), size_kkp2);
+			else goto Error;
+
+			// KPP
+			cout << "KPP2 read start" << endl;
+			int count_kpp2 = (int)SQ_NB * (int)fe_end * (int)fe_end;
+			size_t size_kpp2 = sizeof(ValueKpp) * count_kpp2;
+			ValueKpp* tmp_kpp2 = new ValueKpp[count_kpp2];
+			std::ifstream ifsKPP2(path_combine((string)Options["Eval2Dir"], KPP_BIN), std::ios::binary);
+			if (ifsKPP2) ifsKPP2.read(reinterpret_cast<char*>(tmp_kpp2), size_kpp2);
+			else goto Error;
+
+
+			// ----- 評価関数1と評価関数2を混ぜ合わせる
+			
+			// 評価関数2の割合、評価関数1の割合
+			double eval2_rate = (double)Options["Eval2Rate"] / 100;
+			double eval1_rate = 1 - eval2_rate;
+
+			#define TMP_KK2(k1, k2)     tmp_kk2 [k1 * (int32_t)SQ_NB + k2]
+			#define TMP_KKP2(k1, k2, p) tmp_kkp2[k1 * (int32_t)SQ_NB * (int32_t)fe_end + k2 * (int32_t)fe_end + p]
+			#define TMP_KPP2(k, p1, p2) tmp_kpp2[k * (int32_t)fe_end * (int32_t)fe_end + p1 * (int32_t)fe_end + p2]
+			
+			// KK
+			cout << "KK mix start" << endl;
+			for (int k1 = 0; k1 < SQ_NB; ++k1) {
+				for (int k2 = 0; k2 < SQ_NB; ++k2) {
+					for (int i = 0; i < 2; ++i) {
+						kk[k1][k2][i] = (int32_t)(kk[k1][k2][i] * eval1_rate + TMP_KK2(k1, k2)[i] * eval2_rate);
+					}
+				}
+			}
+			
+			// KKP
+			cout << "KKP mix start" << endl;
+			for (int k1 = 0; k1 < SQ_NB; ++k1) {
+				for (int k2 = 0; k2 < SQ_NB; ++k2) {
+					for (int p = 0; p < fe_end; ++p) {
+						for (int i = 0; i < 2; ++i) {
+							kkp[k1][k2][p][i] = (int32_t)(kkp[k1][k2][p][i] * eval1_rate + TMP_KKP2(k1, k2, p)[i] * eval2_rate);
+						}
+					}
+				}
+			}
+			
+			// KPP
+			cout << "KPP mix start" << endl;
+			for (int k = 0; k < SQ_NB; ++k) {
+				for (int p1 = 0; p1 < fe_end; ++p1) {
+					for (int p2 = 0; p2 < fe_end; ++p2) {
+						for (int i = 0; i < 2; ++i) {
+							kpp[k][p1][p2][i] = (int16_t)(kpp[k][p1][p2][i] * eval1_rate + TMP_KPP2(k, p1, p2)[i] * eval2_rate);
+						}
+					}
+				}
+			}
+
+			cout << "EvalMix end" << endl;
+			
+			// メモリ解放
+			delete[] tmp_kk2;
+			delete[] tmp_kkp2;
+			delete[] tmp_kpp2;
+
+			// undef
+			#undef TMP_KK2
+			#undef TMP_KKP2
+			#undef TMP_KPP2
 
 #if 0
 			// kppのp1==p2のところ、値はゼロとなっていること。(参照はするけど学習のときに使いたくないので)

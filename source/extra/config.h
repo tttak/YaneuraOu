@@ -273,7 +273,8 @@
 // 定跡生成絡み
 #define ENABLE_MAKEBOOK_CMD
 // 評価関数を共用して複数プロセス立ち上げたときのメモリを節約。(いまのところWindows限定)
-#define USE_SHARED_MEMORY_IN_EVAL
+// ・EvalMix版の場合、SHARED_MEMORYは使用しない
+//#define USE_SHARED_MEMORY_IN_EVAL
 // パラメーターの自動調整絡み
 #define USE_GAMEOVER_HANDLER
 //#define LONG_EFFECT_LIBRARY
