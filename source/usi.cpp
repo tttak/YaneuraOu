@@ -717,6 +717,9 @@ void USI::loop(int argc, char* argv[])
 		// 我々はこれに関知しないので単に無視すれば良い。
 		else if (token == "usinewgame") continue;
 
+		// sfen文字列を標準出力へ出力
+		else if (token == "printsfen") cout << "sfen " << pos.sfen() << endl;
+
 		else
 		{
 			//    簡略表現として、
