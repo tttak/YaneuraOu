@@ -87,7 +87,7 @@ const string engine_info() {
 	else
 	{
 		ss  << "id name " << ENGINE_NAME << ' '
-			<< EVAL_TYPE_NAME << ' '
+			<< EVAL_TYPE_NAME << ' ' << "MateInfo "
 			<< ENGINE_VERSION << setfill('0')
 			<< (Is64Bit ? " 64" : " 32")
 			<< TARGET_CPU << endl
