@@ -401,7 +401,7 @@ void is_ready_cmd(Position& pos)
 }
 
 // "position"コマンド処理部
-void position_cmd(Position& pos, istringstream& is)
+void position_cmd(Position& pos, istringstream& is, bool updateSetupStates = true)
 {
 	Move m;
 	string token, sfen;
@@ -426,15 +426,23 @@ void position_cmd(Position& pos, istringstream& is)
 
 	pos.set(sfen);
 
-	SetupStates = Search::StateStackPtr(new aligned_stack<StateInfo>);
+	if (updateSetupStates) {
+		SetupStates = Search::StateStackPtr(new aligned_stack<StateInfo>);
+	}
 
 	// 指し手のリストをパースする(あるなら)
 	while (is >> token && (m = move_from_usi(pos, token)) != MOVE_NONE)
 	{
 		// 1手進めるごとにStateInfoが積まれていく。これは千日手の検出のために必要。
 		// ToDoあとで考える。
-		SetupStates->push(StateInfo());
-		pos.do_move(m, SetupStates->top());
+		if (updateSetupStates) {
+			SetupStates->push(StateInfo());
+			pos.do_move(m, SetupStates->top());
+		}
+		else {
+			StateInfo st;
+			pos.do_move(m, st);
+		}
 	}
 }
 
@@ -757,7 +765,7 @@ void USI::loop(int argc, char* argv[])
 
 				// 局面をセット
 				Position mate_pos;
-				position_cmd(mate_pos, is_sfen);
+				position_cmd(mate_pos, is_sfen, false);
 
 				// 詰みまでの指し手
 				std::vector<std::string> sfen_moves;
