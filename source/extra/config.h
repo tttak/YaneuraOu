@@ -331,6 +331,13 @@
 #define USE_GLOBAL_OPTIONS
 #endif
 
+//NNUE EmptyはYANEURAOU_2018_TNK_ENGINEをベースにする
+//まずTNKの設定をそのまま行い必要な部分を追加・改変する
+#if defined(YANEURAOU_2018_NNUE_EMPTY_ENGINE)
+#ifndef YANEURAOU_2018_TNK_ENGINE
+#define YANEURAOU_2018_TNK_ENGINE
+#endif
+#endif 
 
 #if defined(YANEURAOU_2018_TNK_ENGINE)
 #define ENGINE_NAME "YaneuraOu 2018 T.N.K."
@@ -370,6 +377,19 @@
 #endif
 
 
+//NNUE EmptyのTNKとの差を記述する部分
+#if defined(YANEURAOU_2018_NNUE_EMPTY_ENGINE)
+
+#undef ENGINE_NAME //警告抑制のため一度undefして再定義
+#define ENGINE_NAME "YaneuraOu 2018 AKI "
+
+//このフラグはEVAL_NNUEとともに使う
+#define EVAL_NNUE_EMPTY
+
+#endif 
+
+
+
 #ifdef LOCAL_GAME_SERVER
 #define ENGINE_NAME "YaneuraOu Local Game Server"
 #define EVAL_MATERIAL
@@ -377,7 +397,6 @@
 #define KEEP_LAST_MOVE
 #define USE_ENTERING_KING_WIN
 #endif
-
 
 // --- 協力詰めエンジンとして実行ファイルを公開するとき用の設定集
 
@@ -763,6 +782,8 @@ inline int MKDIR(std::string dir_name)
 #define EVAL_TYPE_NAME "KPP_KKPT_FV_VAR"
 #elif defined(EVAL_NABLA)
 #define EVAL_TYPE_NAME "NABLA V2"
+#elif defined(EVAL_NNUE_EMPTY)
+#define EVAL_TYPE_NAME "NNUE Empty"
 #elif defined(EVAL_NNUE)
 #define EVAL_TYPE_NAME "NNUE"
 #else

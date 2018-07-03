@@ -295,6 +295,12 @@
     <ClInclude Include="eval\nnue\trainer\features\factorizer_half_kp.h">
       <Filter>リソース ファイル\eval\nnue\trainer\features</Filter>
     </ClInclude>
+    <ClInclude Include="eval\nnue\features\empty.h">
+      <Filter>リソース ファイル\eval\nnue\features</Filter>
+    </ClInclude>
+    <ClInclude Include="eval\nnue\architectures\halfkp_empty_256x2-32-32.h">
+      <Filter>リソース ファイル\eval\nnue\architectures</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="movegen.cpp">
@@ -465,6 +471,9 @@
     <ClCompile Include="eval\nnue\features\p.cpp">
       <Filter>リソース ファイル\eval\nnue\features</Filter>
     </ClCompile>
+    <ClCompile Include="eval\nnue\features\empty.cpp">
+      <Filter>リソース ファイル\eval\nnue\features</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <Text Include="..\docs\USI拡張コマンド.txt">
@@ -508,5 +517,6 @@
     <None Include="..\docs\README2017.md">
       <Filter>docs</Filter>
     </None>
+    <None Include="packages.config" />
   </ItemGroup>
 </Project>

@@ -224,6 +224,9 @@ namespace Eval {
 	// BonaPiece、f側だけを表示する。
 	inline std::ostream& operator<<(std::ostream& os, ExtBonaPiece bp) { os << bp.fb; return os; }
 
+
+	inline Square squareFromBonapiece(BonaPiece bp) { return (Square)((bp - fe_hand_end) % SQ_NB); }
+
 	// 駒が今回の指し手によってどこからどこに移動したのかの情報。
 	// 駒はExtBonaPiece表現であるとする。
 	struct ChangedBonaPiece
