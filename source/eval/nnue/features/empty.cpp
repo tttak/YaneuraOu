@@ -21,9 +21,9 @@ namespace Eval {
 
 				for (int i = 0; i < SQ_NB; i++) {
 					Square sq = static_cast<Square>(i);
-					if (perspective == WHITE)
-						sq = Inv(sq);
 					if (empties & sq) {
+						if (perspective == WHITE)
+							sq = Inv(sq);
 						active->push_back(sq);
 					}
 				}
