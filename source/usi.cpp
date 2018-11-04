@@ -822,6 +822,59 @@ void search_cmd(Position& pos, istringstream& is)
 
 #endif
 
+// mateinfoコマンド対応
+// ・SimpleGougiShogiの合議タイプ「詰探索エンジンとの合議（読み筋の局面も詰探索）」で使用する。
+// ・過去にGUI側に送った読み筋の局面について詰探索エンジンが詰みを見つけた場合、GUI側から以下のようなコマンドが送られてくる。
+//   「mateinfo position sfen（読み筋の局面）checkmate（詰みまでの指し手）」
+//   （例）「mateinfo position sfen ln1g1g1n1/2s1k4/p1ppp3p/5ppR1/P8/2P1LKP2/3PPP2P/5+rS2/L5sNL b BGSN2Pbg2p 1 checkmate 5f5c+ 5b5c N*6e 5c4b S*4c 4b5a G*4b 4a4b 4c4b+ 5a4b 2d2b+ S*3b G*5c 4b4a B*5b 6a5b 5c5b 4a5b 2b3b L*4b S*5c 5b6a G*6b」
+// ・相手玉の詰みを見つけた場合だけではなく、自玉の詰みを見つけた場合もあるので注意。
+// ・mateinfoコマンドの利用方法の一例として、この実装では置換表にmateの評価値を登録してみる。
+void mateinfo_cmd(string cmd)
+{
+	std::size_t found_sfen = cmd.find(" sfen ");
+	std::size_t found_checkmate = cmd.find(" checkmate ");
+
+	if (found_sfen == std::string::npos || found_checkmate == std::string::npos) {
+		return;
+	}
+
+	// （例）「ln1g1g1n1/2s1k4/p1ppp3p/5ppR1/P8/2P1LKP2/3PPP2P/5+rS2/L5sNL b BGSN2Pbg2p 1」
+	std::string sfen = cmd.substr(found_sfen + std::string(" sfen ").length(), found_checkmate - found_sfen - std::string(" sfen ").length());
+	// （例）「5f5c+ 5b5c N*6e 5c4b S*4c 4b5a G*4b 4a4b 4c4b+ 5a4b 2d2b+ S*3b G*5c 4b4a B*5b 6a5b 5c5b 4a5b 2b3b L*4b S*5c 5b6a G*6b」
+	std::string moves = cmd.substr(found_checkmate + std::string(" checkmate ").length());
+
+	// 局面をセット
+	Position mate_pos;
+	StateInfo st;
+	mate_pos.set(sfen, &st, Threads.main());
+
+	// 詰みまでの指し手
+	std::istringstream is_moves(moves);
+	std::vector<std::string> sfen_moves;
+	for (std::string sfen_move; is_moves >> sfen_move;) {
+		sfen_moves.push_back(sfen_move);
+	}
+
+	// 読み筋の局面の詰み情報をエンジンに伝える
+	for (size_t i = 0, n = sfen_moves.size(); i < n; ++i) {
+		Move move = move_from_usi(mate_pos, sfen_moves[i]);
+		Value mate_value = i % 2 == 0 ? mate_in(n - i) : mated_in(n - i);
+
+		// 読み筋の局面の詰み情報を置換表に格納する
+		bool ttHit;
+		Key posKey = mate_pos.key();
+		TTEntry* tte = TT.probe(posKey, ttHit);
+		tte->save(posKey, mate_value, BOUND_EXACT,
+			DEPTH_MAX, move, mate_value, TT.generation());
+
+		//std::cout << "i=" << i << ", move=" << move << ", mate_value=" << mate_value << std::endl;
+
+		// 局面を進める
+		StateInfo st;
+		mate_pos.do_move(move, st);
+	}
+}
+
 // --------------------
 // 　　USI応答部
 // --------------------
@@ -1020,6 +1073,9 @@ void USI::loop(int argc, char* argv[])
 		// "usinewgame"はゲーム中にsetoptionなどを送らないことを宣言するためのものだが、
 		// 我々はこれに関知しないので単に無視すれば良い。
 		else if (token == "usinewgame") continue;
+
+		// mateinfoコマンド
+		else if (token == "mateinfo") mateinfo_cmd(cmd);
 
 		else
 		{
