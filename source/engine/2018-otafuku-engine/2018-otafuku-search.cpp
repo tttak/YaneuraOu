@@ -122,6 +122,12 @@ void USI::extra_option(USI::OptionsMap & o)
 
 	// fail low/highのときにPVを出力するかどうか。
 	o["OutputFailLHPV"] << Option(true);
+
+#if defined(EVAL_NNUE_KPPT)
+	// NNUEとKPPTの評価値を混ぜる際のKPPTの割合（0%～100%）
+	o["EvalKpptRatio"] << Option(50, 0, 100);
+#endif
+
 }
 
 // -----------------------

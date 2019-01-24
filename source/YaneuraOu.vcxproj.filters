@@ -86,6 +86,9 @@
     <Filter Include="リソース ファイル\eval\nnue\trainer\features">
       <UniqueIdentifier>{6e8ef4d1-31b3-42c5-b6a5-a0b811d671bb}</UniqueIdentifier>
     </Filter>
+    <Filter Include="リソース ファイル\eval\nnue_kppt">
+      <UniqueIdentifier>{2fa38397-f29c-41bf-9c72-7f0947d950be}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="evaluate.h">
@@ -295,6 +298,9 @@
     <ClInclude Include="eval\nnue\trainer\features\factorizer_half_kp.h">
       <Filter>リソース ファイル\eval\nnue\trainer\features</Filter>
     </ClInclude>
+    <ClInclude Include="eval\nnue_kppt\evaluate_nnue_kppt.h">
+      <Filter>リソース ファイル\eval\nnue_kppt</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="movegen.cpp">
@@ -464,6 +470,9 @@
     </ClCompile>
     <ClCompile Include="eval\nnue\features\p.cpp">
       <Filter>リソース ファイル\eval\nnue\features</Filter>
+    </ClCompile>
+    <ClCompile Include="eval\nnue_kppt\evaluate_nnue_kppt.cpp">
+      <Filter>リソース ファイル\eval\nnue_kppt</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>

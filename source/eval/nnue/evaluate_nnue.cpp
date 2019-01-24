@@ -134,7 +134,7 @@ static Value ComputeScore(const Position& pos, bool refresh = false) {
   return accumulator.score;
 }
 
-}  // namespace NNUE
+//}  // namespace NNUE
 
 #if defined(USE_EVAL_HASH)
 // HashTableに評価値を保存するために利用するクラス
@@ -288,6 +288,8 @@ void evaluate_with_no_return(const Position& pos) {
 void print_eval_stat(Position& /*pos*/) {
   std::cout << "--- EVAL STAT: not implemented" << std::endl;
 }
+
+}  // namespace NNUE
 
 }  // namespace Eval
 

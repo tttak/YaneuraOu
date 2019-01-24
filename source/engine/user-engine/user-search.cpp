@@ -6,6 +6,7 @@ void user_test(Position& pos_, istringstream& is)
 }
 
 #ifdef USER_ENGINE
+#if !defined (EVAL_NNUE_KPPT)
 
 // USIに追加オプションを設定したいときは、この関数を定義すること。
 // USI::init()のなかからコールバックされる。
@@ -41,4 +42,5 @@ void Thread::search()
 {
 }
 
+#endif // !defined (EVAL_NNUE_KPPT)
 #endif // USER_ENGINE

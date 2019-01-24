@@ -45,7 +45,8 @@ using namespace std;
 
 namespace Eval
 {
-
+namespace KPPT
+{
 	// 評価関数パラメーター
 	// 2GBを超える配列は確保できないようなのでポインターにしておき、動的に確保する。
 
@@ -787,6 +788,12 @@ namespace Eval
 
 			const int listIndex = dp.pieceNo[0];
 
+			// 玉の情報をバックアップしておき、後で戻す
+			BonaPiece bak_list0_38 = list0[38];
+			BonaPiece bak_list0_39 = list0[39];
+			BonaPiece bak_list1_38 = list1[38];
+			BonaPiece bak_list1_39 = list1[39];
+
 			// do_a_pc()の最適化の関係で使わない玉の情報を吹き飛ばし、0にする
 			list0[38] = static_cast<BonaPiece>(0);
 			list0[39] = static_cast<BonaPiece>(0);
@@ -829,6 +836,12 @@ namespace Eval
 
 			list0[listIndex] = dp.changed_piece[0].new_piece.fb;
 			list1[listIndex] = dp.changed_piece[0].new_piece.fw;
+
+			// 玉の情報を元に戻しておく
+			list0[38] = bak_list0_38;
+			list0[39] = bak_list0_39;
+			list1[38] = bak_list1_38;
+			list1[39] = bak_list1_39;
 
 			// 前nodeからの駒割りの増分を加算。
 			diff.p[2][0] += (now->materialValue - prev->materialValue) * FV_SCALE;
@@ -1267,6 +1280,7 @@ namespace Eval
 	}
 
 
-}
+} // namespace KPPT
+} // namespace Eval
 
 #endif // defined (EVAL_KPPT)

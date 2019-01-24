@@ -430,8 +430,26 @@
 // --- ユーザーの自作エンジンとして実行ファイルを公開するとき用の設定集
 
 #ifdef USER_ENGINE
-#define ENGINE_NAME "YaneuraOu user engine"
-#define EVAL_KPP
+#define ENGINE_NAME "YaneuraOu 2018 NNUE-KPPT-Mix"
+
+#define EVAL_NNUE_KPPT
+#define EVAL_KPPT
+#define EVAL_NNUE
+
+#define USE_EVAL_HASH
+#define USE_SEE
+#define USE_MATE_1PLY
+#define USE_ENTERING_KING_WIN
+#define USE_TIME_MANAGEMENT
+#define KEEP_PIECE_IN_GENERATE_MOVES
+#define ONE_PLY_EQ_1
+
+// GlobalOptionsは有効にしておく。
+#define USE_GLOBAL_OPTIONS
+
+// 探索部はYANEURAOU_2018_OTAFUKU_ENGINEを使う。
+#define YANEURAOU_2018_OTAFUKU_ENGINE
+
 #endif
 
 // --------------------
