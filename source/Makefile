@@ -1,15 +1,15 @@
 # > Select YaneuraOu edition below.
 
-YANEURAOU_EDITION = YANEURAOU_2018_OTAFUKU_ENGINE
+#YANEURAOU_EDITION = YANEURAOU_2018_OTAFUKU_ENGINE
 #YANEURAOU_EDITION = HELP_MATE_ENGINE
 #YANEURAOU_EDITION = MATE_ENGINE
 #YANEURAOU_EDITION = YANEURAOU_2018_GOKU_ENGINE
-#YANEURAOU_EDITION = YANEURAOU_2018_TNK_ENGINE
+YANEURAOU_EDITION = YANEURAOU_2018_TNK_ENGINE
 
 
 # clangでコンパイルしたほうがgccより数%速いっぽい。
-#COMPILER = g++
-COMPILER = clang++
+COMPILER = g++
+#COMPILER = clang++
 
 # 標準的なコンパイルオプション
 CFLAGS   = -std=c++14 -fno-exceptions -fno-rtti -Wextra -Ofast -MMD -MP -fpermissive
@@ -165,7 +165,9 @@ ifeq ($(YANEURAOU_EDITION),YANEURAOU_2018_TNK_ENGINE)
 	           eval/nnue/features/k.cpp                                        \
 	           eval/nnue/features/p.cpp                                        \
 	           eval/nnue/features/half_kp.cpp                                  \
-	           eval/nnue/features/half_relative_kp.cpp
+	           eval/nnue/features/half_relative_kp.cpp                         \
+	           eval/nnue/features/material1.cpp                                \
+	           eval/nnue/features/material2.cpp
 endif
 
 OBJECTS  = $(addprefix $(OBJDIR)/, $(SOURCES:.cpp=.o))
