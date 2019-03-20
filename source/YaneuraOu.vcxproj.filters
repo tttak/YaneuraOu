@@ -307,6 +307,12 @@
     <ClInclude Include="eval\nnue\features\material1.h">
       <Filter>リソース ファイル\eval\nnue\features</Filter>
     </ClInclude>
+    <ClInclude Include="eval\nnue\features\gameply.h">
+      <Filter>リソース ファイル\eval\nnue\features</Filter>
+    </ClInclude>
+    <ClInclude Include="eval\nnue\architectures\material2_gameply_256x2-32-32.h">
+      <Filter>リソース ファイル\eval\nnue\architectures</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="movegen.cpp">
@@ -481,6 +487,9 @@
       <Filter>リソース ファイル\eval\nnue\features</Filter>
     </ClCompile>
     <ClCompile Include="eval\nnue\features\material1.cpp">
+      <Filter>リソース ファイル\eval\nnue\features</Filter>
+    </ClCompile>
+    <ClCompile Include="eval\nnue\features\gameply.cpp">
       <Filter>リソース ファイル\eval\nnue\features</Filter>
     </ClCompile>
   </ItemGroup>

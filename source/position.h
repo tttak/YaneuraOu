@@ -197,6 +197,9 @@ struct Position
 	// 平手の開始局面なら1が返る。(0ではない)
 	int game_ply() const { return gamePly; }
 
+	// 開始局面からの手数をセットする。
+	void set_game_ply(int ply) { gamePly = ply; }
+
 	// この局面クラスを用いて探索しているスレッドを返す。 
 	Thread* this_thread() const { return thisThread; }
 

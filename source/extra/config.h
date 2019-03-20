@@ -786,8 +786,9 @@ inline int MKDIR(std::string dir_name)
 #define EVAL_TYPE_NAME "NABLA V2"
 #elif defined(EVAL_NNUE)
 //#define EVAL_TYPE_NAME "NNUE"
-#define EVAL_TYPE_NAME "NNUE-Material1"
+//#define EVAL_TYPE_NAME "NNUE-Material1"
 //#define EVAL_TYPE_NAME "NNUE-Material2"
+#define EVAL_TYPE_NAME "NNUE-Material2-GamePly"
 #else
 #define EVAL_TYPE_NAME ""
 #endif

@@ -167,7 +167,8 @@ ifeq ($(YANEURAOU_EDITION),YANEURAOU_2018_TNK_ENGINE)
 	           eval/nnue/features/half_kp.cpp                                  \
 	           eval/nnue/features/half_relative_kp.cpp                         \
 	           eval/nnue/features/material1.cpp                                \
-	           eval/nnue/features/material2.cpp
+	           eval/nnue/features/material2.cpp                                \
+	           eval/nnue/features/gameply.cpp
 endif
 
 OBJECTS  = $(addprefix $(OBJDIR)/, $(SOURCES:.cpp=.o))

@@ -10,8 +10,9 @@
 // 入力特徴量とネットワーク構造が定義されたヘッダをincludeする
 //#include "architectures/halfkp_256x2-32-32.h"
 //#include "architectures/k-p_256x2-32-32.h"
-#include "architectures/material1_256x2-32-32.h"
+//#include "architectures/material1_256x2-32-32.h"
 //#include "architectures/material2_256x2-32-32.h"
+#include "architectures/material2_gameply_256x2-32-32.h"
 
 namespace Eval {
 
