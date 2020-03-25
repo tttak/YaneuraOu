@@ -1,7 +1,7 @@
 ﻿#ifndef _BITBOARD_H_
 #define _BITBOARD_H_
 
-#include "shogi.h"
+#include "types.h"
 
 // --------------------
 //     Bitboard
@@ -560,7 +560,7 @@ inline Bitboard dragonEffect(Square sq, const Bitboard& occupied)
 
 // 盤上sqに駒pc(先後の区別あり)を置いたときの利き。
 // pc == QUEENだと馬+龍の利きが返る。
-Bitboard effects_from(Piece pc, Square sq, const Bitboard& occ);
+extern Bitboard effects_from(Piece pc, Square sq, const Bitboard& occ);
 
 // --------------------
 //   Bitboard tools

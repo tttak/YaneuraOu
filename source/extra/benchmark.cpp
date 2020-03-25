@@ -1,9 +1,10 @@
-﻿#include "../shogi.h"
+﻿#include "../types.h"
 
 #include <sstream>
 #include "../tt.h"
 #include "../search.h"
 #include "../thread.h"
+#include "../usi.h"
 
 using namespace std;
 
@@ -59,7 +60,7 @@ void bench_cmd(Position& current, istringstream& is)
 	}
 
 	if (limitType == "time")
-		limits.movetime = 1000 * stoi(limit); // movetime is in ms
+		limits.movetime = (TimePoint)1000 * stoi(limit); // movetime is in ms
 
 	else if (limitType == "nodes")
 		limits.nodes = stoll(limit);
@@ -70,18 +71,16 @@ void bench_cmd(Position& current, istringstream& is)
 	else
 		limits.depth = stoi(limit);
 
-	Options["Hash"] = ttSize;
+	Options["USI_Hash"] = ttSize;
 	Options["Threads"] = threads;
 
-#if defined(YANEURAOU_2017_EARLY_ENGINE)
+#if defined(YANEURAOU_ENGINE)
 	// 定跡にhitされるとベンチマークにならない。
-	Options["BookFile"] = "no_book";
+	Options["BookFile"] = string("no_book");
 #endif
 
 	// ベンチマークモードにしておかないとPVの出力のときに置換表を漁られて探索に影響がある。
 	limits.bench = true;
-
-	TT.clear();
 
 	// Optionsの影響を受けると嫌なので、その他の条件を固定しておく。
 	limits.enteringKingRule = EKR_NONE;
@@ -93,10 +92,13 @@ void bench_cmd(Position& current, istringstream& is)
 	else if (fenFile == "current")
 		fens.push_back(current.sfen());
 	else
-		read_all_lines(fenFile, fens);
+		FileOperator::ReadAllLines(fenFile, fens);
 
 	// 評価関数の読み込み等
 	is_ready();
+
+//	TT.clear();
+	// → is_ready()のなかでsearch::clear()が呼び出されて、そのなかでTT.clear()しているのでこの初期化は不要。
 
 	// トータルの探索したノード数
 	int64_t nodes = 0;

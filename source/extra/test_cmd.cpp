@@ -1,13 +1,11 @@
-﻿#include "../shogi.h"
+﻿#include "../types.h"
 
 // USI拡張コマンドのうち、開発上のテスト関係のコマンド。
 // 思考エンジンの実行には関係しない。GitHubにはcommitしないかも。
 
 #if defined(ENABLE_TEST_CMD)
 
-#include "all.h"
 #include "../eval/evaluate_io.h"
-#include <unordered_set>
 
 #if defined(EVAL_LEARN)
 #include "../learn/learn.h"
@@ -15,178 +13,14 @@
 using namespace EvalLearningTools;
 #endif
 
-// ----------------------------------
-//  USI拡張コマンド "perft"(パフォーマンステスト)
-// ----------------------------------
-
-// perft()で用いるsolver
-// cf. http://qiita.com/ak11/items/8bd5f2bb0f5b014143c8
-
-// 通常のPERFTと、置換表を用いる高速なPERFTと選択できる。
-// 後者を用いる場合は、hash keyの衝突を避けるためにHASH_KEY_BITSを128にしておくこと。
-// ※　あと、後者は以下のところで置換表を15GBほど固定で確保しているので、動作環境に応じて修正すること。
-// >  entryCount = 256 * 1024 * 1024; // * sizeof(PerftSolverResult) == 15GBほど
-
-#define NORMAL_PERFT
-
-// perftのときにeval値も加算していくモード。評価関数のテスト用。
-//#define EVAL_PERFT
-
-
-struct PerftSolverResult {
-	uint64_t nodes, captures, promotions, checks, mates;
-#ifdef EVAL_PERFT
-	int64_t eval;
+#if defined(EVAL_NNUE)
+#include "../eval/evaluate_common.h"
+#include "../eval/nnue/nnue_test_command.h"
 #endif
 
-	void operator+=(const PerftSolverResult& other) {
-		nodes += other.nodes;
-		captures += other.captures;
-		promotions += other.promotions;
-		checks += other.checks;
-		mates += other.mates;
-#ifdef EVAL_PERFT
-		eval += other.eval;
-#endif
-	}
-};
-
-#ifndef NORMAL_PERFT
-// perftで用いる置換表
-namespace Perft {
-	struct TTEntry {
-		void save(HASH_KEY key_, PerftSolverResult& result_)
-		{
-			key = key_;
-			result = result_;
-		}
-		HASH_KEY key;
-		PerftSolverResult result;
-	};
-
-	struct TranspositionTable {
-		TranspositionTable() {
-			entryCount = 256*1024*1024; // * sizeof(PerftSolverResult) == 15GBほど
-			table = (TTEntry*)calloc( entryCount * sizeof(TTEntry) , 1);
-		}
-		~TranspositionTable() { free(table); }
-
-		TTEntry* probe(const HASH_KEY key_,int depth,bool& found)
-		{
-			auto key = key_ ^ DepthHash(depth); // depthの分だけhash keyを変更しておく。
-			auto& tte = table[key /*.p(0)*/ & (entryCount - 1)];
-			found = (tte.key == key_); // 変更前のhash keyが書かれているはず
-			return &tte;
-		}
-	private:
-		TTEntry* table;
-		size_t entryCount; // TTEntryの数
-	};
-	TranspositionTable TT;
-}
-
-#endif
-
-#ifdef NORMAL_PERFT
-struct PerftSolver {
-	template <bool Root>
-	PerftSolverResult Perft(Position& pos, int depth) {
-		StateInfo st;
-		PerftSolverResult result = {};
-		if (depth == 0) {
-			result.nodes++;
-			if (pos.captured_piece() != NO_PIECE) result.captures++;
-#ifdef KEEP_LAST_MOVE
-			if (is_promote(pos.state()->lastMove)) result.promotions++;
-#endif
-#ifdef EVAL_PERFT
-//			cout << pos.sfen() << " , eval = " << Eval::evaluate(pos) << endl;
-			/*
-			if (pos.sfen() == "1nsgkgsnl/lr5b1/pppppp+Bpp/9/9/2P6/PP1PPPPPP/7R1/LNSGKGSNL w P 4")
-			{
-//				cout << Eval::evaluate(pos);
-				Eval::print_eval_stat(pos);
-			}
-			*/
-			result.eval += Eval::evaluate(pos);
-#endif
-			if (pos.checkers()) {
-				result.checks++;
-				if (pos.is_mated()) result.mates++;
-			}
-		} else {
-			for (auto m : MoveList<LEGAL_ALL>(pos)) {
-				if (Root)
-					cout << ".";
-				pos.do_move(m, st);
-				result += Perft<false>(pos, depth - 1);
-				pos.undo_move(m);
-			}
-		}
-		return result;
-	}
-};
-#else // 置換表を用いる高速なperft
-struct PerftSolver {
-	template <bool Root>
-	PerftSolverResult Perft(Position& pos, int depth) {
-		HASH_KEY key = pos.state()->long_key();
-		bool found;
-
-		PerftSolverResult result = {};
-
-		auto tt = Perft::TT.probe(key, depth, found); // 置換表に登録されているか。
-		if (found)
-			return tt->result;
-
-		StateInfo st;
-		for (auto m : MoveList<LEGAL_ALL>(pos)) {
-			if (Root)
-				cout << ".";
-
-			pos.do_move(m.move, st);
-			if (depth > 1)
-				result += Perft<false>(pos, depth - 1);
-			else {
-				result.nodes++;
-				if (pos.state()->capturedType != NO_PIECE) result.captures++;
-				#ifdef        KEEP_LAST_MOVE
-				if (is_promote(pos.state()->lastMove)) result.promotions++;
-				#endif
-				if (pos.checkers()) {
-					result.checks++;
-					if (pos.is_mated()) result.mates++;
-				}
-			}
-			pos.undo_move(m.move);
-		}
-		tt->save(key, result); // 登録されていなかったので置換表に保存する
-
-		return result;
-	}
-};
-#endif
-
-// N手で到達できる局面数を計算する。成る手、取る手、詰んだ局面がどれくらい含まれているかも計算する。
-void perft(Position& pos, istringstream& is)
-{
-	int depth = 5 ;
-	is >> depth;
-	cout << "perft depth = " << depth << endl;
-	PerftSolver solver;
-	// 局面コピーして並列的に呼び出してやるだけであとはなんとかなる。
-
-	auto result = solver.Perft<true>(pos, depth);
-
-	cout << endl << "nodes = " << result.nodes << " , captures = " << result.captures <<
-#ifdef KEEP_LAST_MOVE
-		" , promotion = " << result.promotions <<
-#endif
-#ifdef EVAL_PERFT
-		" , eval(sum) = " << result.eval <<
-#endif
-		" , checks = " << result.checks << " , checkmates = " << result.mates << endl;
-}
+#include <unordered_set>
+#include <cmath>               // sqrt() , fabs()
+#include "all.h"
 
 // ----------------------------------
 //      USI拡張コマンド "test"
@@ -534,7 +368,7 @@ void test_genchecks(Position& pos, istringstream& is)
 void cooperation_mate(Position& pos, int depth)
 {
 	// moves_from_start_pretty()がKEEP_LAST_MOVEを要求する。
-#ifdef  KEEP_LAST_MOVE
+#if defined(KEEP_LAST_MOVE)
 
 	StateInfo st;
 	for (auto m : MoveList<LEGAL_ALL>(pos))
@@ -646,7 +480,7 @@ void test_read_record(Position& pos, istringstream& is)
 	is >> filename;
 	cout << "read " << filename << endl;
 
-	fstream fs;
+	ifstream fs;
 	fs.open(filename, ios::in | ios::binary);
 	if (fs.fail())
 	{
@@ -658,7 +492,7 @@ void test_read_record(Position& pos, istringstream& is)
 	uint64_t line_no = 0;
 
 	string line;
-	while (getline(fs, line))
+	while (Tools::getline(fs, line))
 	{
 		++line_no;
 		if ((line_no % 100) == 0) cout << '.'; // 100行おきに'.'を一つ出力。
@@ -786,7 +620,7 @@ void test_timeman()
 
 		Timer time;
 
-		int remain = limits.time[BLACK];
+		TimePoint remain = limits.time[BLACK];
 
 		for (int ply = 1; ply <= limits.max_game_ply; ply += 2)
 		{
@@ -799,7 +633,7 @@ void test_timeman()
 				;
 
 			// 4回に1回はtime.minimum()ぶんだけ使ったとみなす。残り3回はtime.optimum()だけ使ったとみなす。
-			int used_time = ((ply % 8) == 1) ?  time.minimum() : time.optimum();
+			TimePoint used_time = ((ply % 8) == 1) ?  time.minimum() : time.optimum();
 			// 1秒未満繰り上げ。ただし、2秒は計測1秒扱い。
 			used_time = ((used_time + delay + 999) / 1000) * 1000;
 			if (used_time <= 2000)
@@ -973,26 +807,6 @@ void unit_test(Position& pos, istringstream& is)
 		check( pos.state()->key() == UINT64_C(0x75a12070b8bd438a));
 	}
 
-	// perft
-	{
-		// 最多合法手局面
-		const string POS593 = "R8/2K1S1SSk/4B4/9/9/9/9/9/1L1L1L3 b RBGSNLP3g3n17p 1";
-		cout << "> genmove sfen = " << POS593;
-		pos.set(POS593,&si,th);
-		auto mg = MoveList<LEGAL_ALL>(pos);
-		cout << " , moves = " << mg.size();
-		check( mg.size() == 593);
-
-		cout << "> perft depth 6 ";
-		pos.set_hirate(&si,th);
-		auto result = PerftSolver().Perft<true>(pos,6);
-		check(  result.nodes == 547581517 && result.captures == 3387051
-#ifdef      KEEP_LAST_MOVE
-			&& result.promotions == 1588324
-#endif
-			&& result.checks == 1730177 && result.mates == 0);
-	}
-
 	// random pleyer
 	{
 		cout << "> random player 100000 ";
@@ -1063,7 +877,7 @@ void exam_book(Position& pos)
 			else if (token == "moves")
 				continue; // 読み飛ばす
 
-			Move move = move_from_usi(pos, token);
+			Move move = USI::to_move(pos, token);
 			// illigal moveであるとMOVE_NONEが返る。
 			if (move == MOVE_NONE)
 			{
@@ -1324,8 +1138,7 @@ void test_search(Position& pos, istringstream& is)
 }
 #endif
 
-#if defined (EVAL_KPPT) || defined(EVAL_KPP_KKPT) || defined (EVAL_KPPPT) || defined(EVAL_KPPP_KKPT) || defined(EVAL_KKPP_KKPT) || defined(EVAL_KKPPT) || \
-	defined(EVAL_KPP_KKPT_FV_VAR) || defined(EVAL_HELICES) || defined(EVAL_NABLA)
+#if defined (EVAL_KPPT) || defined(EVAL_KPP_KKPT)
 #include "../eval/evaluate_common.h"
 
 // 現在の評価関数のパラメーターについて調査して出力する。(分析用)
@@ -1413,7 +1226,7 @@ struct KPPT_reader
 
 	void read(string dir)
 	{
-		auto make_name = [&](std::string filename) { return path_combine(dir, filename); };
+		auto make_name = [&](std::string filename) { return Path::Combine(dir, filename); };
 		auto input = EvalIO::EvalInfo::build_kppt32(make_name(KK_BIN), make_name(KKP_BIN), make_name(KPP_BIN));
 		auto output = EvalIO::EvalInfo::build_kppt32((void*)kk_, (void*)kkp_, (void*)kpp_);
 
@@ -1433,7 +1246,7 @@ struct KPPT_reader
 	{
 		// read()のときとinputとoutputを入れ替えると書き出せる。EvalIOマジ天使。
 
-		auto make_name = [&](std::string filename) { return path_combine(dir, filename); };
+		auto make_name = [&](std::string filename) { return Path::Combine(dir, filename); };
 		auto input = EvalIO::EvalInfo::build_kppt32((void*)kk_, (void*)kkp_, (void*)kpp_);
 		auto output = EvalIO::EvalInfo::build_kppt32(make_name(KK_BIN), make_name(KKP_BIN), make_name(KPP_BIN));
 		input.fe_end = output.fe_end = Eval::fe_end;
@@ -1656,7 +1469,7 @@ void eval_merge(istringstream& is)
 		}
 	}
 
-	MKDIR(dir3);
+	Directory::CreateFolder(dir3);
 
 	KPPT_reader eval1, eval2;
 	eval1.read(dir1);
@@ -1808,7 +1621,7 @@ void eval_convert(istringstream& is)
 	// EvalIOを使うとマジで簡単に変換できる。
 	auto get_info = [](std::string path , std::string format)
 	{
-		auto make_name = [&](std::string filename) { return path_combine(path, filename); };
+		auto make_name = [&](std::string filename) { return Path::Combine(path, filename); };
 		if (format == "kppt32")
 			return EvalIO::EvalInfo::build_kppt32(make_name(KK_BIN), make_name(KKP_BIN), make_name(KPP_BIN));
 		else if (format == "kppt16")
@@ -1842,7 +1655,7 @@ void eval_convert(istringstream& is)
 		return;
 
 	// 出力先のフォルダ、なければ掘る。
-	MKDIR(output_dir);
+	Directory::CreateFolder(output_dir);
 
 	auto input = get_info(input_dir, input_format);
 	auto output = get_info(output_dir, output_format);
@@ -2110,6 +1923,9 @@ void test_cmd(Position& pos, istringstream& is)
 #ifdef USE_KIF_CONVERT_TOOLS
 	else if (param == "kifconvert") test_kif_convert_tools(pos, is); // 現局面からの全合法手を各種形式で出力チェック
 #endif
+#if defined(EVAL_NNUE)
+	else if (param == "nnue") Eval::NNUE::TestCommand(pos, is);
+#endif
 	else {
 		// --- usage
 
@@ -2168,7 +1984,7 @@ void test_mate_engine_cmd(Position& pos, istringstream& is) {
 	// →　デフォルト1024にしておかないと置換表あふれるな。
 	string ttSize = (is >> token) ? token : "1024";
 
-	Options["Hash"] = ttSize;
+	Options["USI_Hash"] = ttSize;
 
 	Search::LimitsType limits;
 

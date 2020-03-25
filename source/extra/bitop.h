@@ -1,11 +1,12 @@
 ﻿#ifndef _BITOP_H_
 #define _BITOP_H_
 
-#include "../shogi.h"
-
 //
 //   bit operation library
 //
+
+#include <cstddef> // std::size_t
+#include <cstdint> // uint64_tなどの定義
 
 // ターゲット環境でSSE,AVX,AVX2が搭載されていない場合はこれらの命令をsoftware emulationにより実行する。
 // software emulationなので多少遅いが、SSE2,SSE4.1,SSE4.2,AVX,AVX2,AVX-512の使えない環境でそれに合わせたコードを書く労力が省ける。
@@ -15,17 +16,24 @@
 // ----------------------------
 
 #if defined(USE_AVX512)
-#include <zmmintrin.h>
+// immintrin.h から AVX512 関連の intrinsic は読み込まれる
+// intel: https://software.intel.com/sites/landingpage/IntrinsicsGuide/#techs=AVX_512
+// gcc: https://github.com/gcc-mirror/gcc/blob/master/gcc/config/i386/immintrin.h
+// clang: https://github.com/llvm-mirror/clang/blob/master/lib/Headers/immintrin.h
+#include <immintrin.h>
 #elif defined(USE_AVX2)
 #include <immintrin.h>
 #elif defined(USE_SSE42)
 #include <nmmintrin.h>
 #elif defined(USE_SSE41)
 #include <smmintrin.h>
-#elif defined (USE_SSE2)
+#elif defined(USE_SSE2)
 #include <emmintrin.h>
+#elif defined(IS_ARM)
+#include <arm_neon.h>
+#include <mm_malloc.h> // for _mm_alloc()
 #else
-#if defined (__GNUC__) 
+#if defined (__GNUC__)
 #include <mm_malloc.h> // for _mm_alloc()
 #endif
 #endif
@@ -33,6 +41,7 @@
 // ----------------------------
 //      type define(uint)
 // ----------------------------
+
 typedef  uint8_t  u8;
 typedef   int8_t  s8;
 typedef uint16_t u16;
@@ -158,7 +167,7 @@ FORCE_INLINE int MSB32(uint32_t v) { ASSERT_LV3(v != 0); unsigned long index; _B
 FORCE_INLINE int MSB64(uint64_t v) { ASSERT_LV3(v != 0); return uint32_t(v >> 32) ? 32 + MSB32(uint32_t(v >> 32)) : MSB32(uint32_t(v)); }
 #endif
 
-#elif defined(__GNUC__) && ( defined(__i386__) || defined(__x86_64__) )
+#elif defined(__GNUC__) && ( defined(__i386__) || defined(__x86_64__) || defined(__ANDROID__) )
 
 FORCE_INLINE int LSB32(const u32 v) { ASSERT_LV3(v != 0); return __builtin_ctzll(v); }
 FORCE_INLINE int LSB64(const u64 v) { ASSERT_LV3(v != 0); return __builtin_ctzll(v); }
@@ -275,34 +284,8 @@ extern ymm ymm_one;   // all packed bytes are 1.
 //    custom allocator
 // ----------------------------
 
-inline void* aligned_malloc(size_t size, size_t align)
-{
-	void* p = _mm_malloc(size, align);
-	if (p == nullptr)
-	{
-		std::cout << "info string can't allocate memory. sise = " << size << std::endl;
-		exit(1);
-	}
-	return p;
-}
-inline void aligned_free(void* ptr) { _mm_free(ptr); }
-
-// alignasを指定しているのにnewのときに無視される＆STLのコンテナがメモリ確保するときに無視するので、
-// そのために用いるカスタムアロケーター。
-template <typename T>
-class AlignedAllocator {
-public:
-	using value_type = T;
-
-	AlignedAllocator() {}
-	AlignedAllocator(const AlignedAllocator&) {}
-	AlignedAllocator(AlignedAllocator&&) {}
-
-	template <typename U> AlignedAllocator(const AlignedAllocator<U>&) {}
-
-	T* allocate(std::size_t n) { return (T*)aligned_malloc(n * sizeof(T), alignof(T)); }
-	void deallocate(T* p, std::size_t n) { aligned_free(p); }
-};
+extern void* aligned_malloc(size_t size, size_t align);
+static void aligned_free(void* ptr) { _mm_free(ptr); }
 
 // ----------------------------
 //    BSLR
@@ -310,10 +293,7 @@ public:
 
 // 最下位bitをresetする命令。
 
-// gccでコンパイルするとき-marchとして具体的なCPU名を指定したときに、_blsr_u64がinline展開できないようで
-// コンパイルエラーになる。
-
-#if (defined(USE_AVX2) && defined(IS_64BIT)) && !defined(__GNUC__)
+#if (defined(USE_AVX2) && defined(IS_64BIT))
 #define BLSR(x) _blsr_u64(x)
 #else
 #define BLSR(x) (x & (x-1))

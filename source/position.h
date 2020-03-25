@@ -1,11 +1,20 @@
 ﻿#ifndef _POSITION_H_
 #define _POSITION_H_
 
-#include "shogi.h"
+#include "types.h"
 #include "bitboard.h"
 #include "evaluate.h"
 #include "extra/key128.h"
 #include "extra/long_effect.h"
+#include "misc.h"
+
+#include <deque>
+#include <memory> // std::unique_ptr
+
+
+#if defined(EVAL_NNUE)
+#include "eval/nnue/nnue_accumulator.h"
+#endif
 
 class Thread;
 
@@ -44,7 +53,7 @@ struct StateInfo
 
 	// 自玉に対してpinしている(可能性のある)敵の大駒。
 	// 自玉に対して上下左右方向にある敵の飛車、斜め十字方向にある敵の角、玉の前方向にある敵の香、…
-	Bitboard pinnersForKing[COLOR_NB];
+	Bitboard pinners[COLOR_NB];
 
 	// 自駒の駒種Xによって敵玉が王手となる升のbitboard
 	Bitboard checkSquares[PIECE_WHITE];
@@ -68,20 +77,18 @@ struct StateInfo
 	// この局面における手番側の持ち駒。優等局面の判定のために必要。
 	Hand hand;
 
-	// この局面で捕獲された駒
+	// この局面で捕獲された駒。先後の区別あり。
 	// ※　次の局面にdo_move()で進むときにこの値が設定される
-	// 先後の区別はなし。馬とか龍など成り駒である可能性はある。
 	Piece capturedPiece;
 
-	friend struct Position;
+	friend class Position;
 
 	// --- evaluate
 
 	// この局面での評価関数の駒割
 	Value materialValue;
 
-#if defined(EVAL_KPPT) || defined(EVAL_KPP_KKPT) || defined(EVAL_KPPPT) || defined(EVAL_KPPP_KKPT) || defined(EVAL_KKPP_KKPT) || defined(EVAL_KKPPT) || \
-	defined(EVAL_KPP_KKPT_FV_VAR) || defined(EVAL_EXPERIMENTAL) || defined(EVAL_HELICES) || defined(EVAL_NABLA)
+#if defined(EVAL_KPPT) || defined(EVAL_KPP_KKPT)
 
 	// 評価値。(次の局面で評価値を差分計算するときに用いる)
 	// まだ計算されていなければsum.p[2][0]の値はINT_MAX
@@ -89,16 +96,13 @@ struct StateInfo
 
 #endif
 
+#if defined(EVAL_NNUE)
+	Eval::NNUE::Accumulator accumulator;
+#endif
+
 #if defined(EVAL_KKPP_KKPT) || defined(EVAL_KKPPT)
 	// 評価関数で用いる、前回のencoded_eval_kkを保存しておく。
 	int encoded_eval_kk;
-#endif
-
-	// 作業用のwork
-	// do_move()のときに前nodeからコピーされる。
-	// undo_move()のとき自動的に破棄される。
-#if defined(EVAL_NABLA)
-	u16 nabla_work[6];
 #endif
 
 #if defined(USE_FV38) || defined(USE_FV_VAR)
@@ -140,7 +144,7 @@ struct StateInfo
 // setup moves("position"コマンドで設定される、現局面までの指し手)に沿った局面の状態を追跡するためのStateInfoのlist。
 // 千日手の判定のためにこれが必要。std::dequeを使っているのは、StateInfoがポインターを内包しているので、resizeに対して
 // 無効化されないように。
-typedef std::deque<StateInfo, AlignedAllocator<StateInfo>> StateList;
+typedef std::deque<StateInfo> StateList;
 typedef std::unique_ptr<StateList> StateListPtr;
 
 // --------------------
@@ -151,8 +155,9 @@ typedef std::unique_ptr<StateList> StateListPtr;
 struct PackedSfen { u8 data[32]; };
 
 // 盤面
-struct Position
+class Position
 {
+public:
 	// --- ctor
 
 	// Positionのコンストラクタで平手に初期化すると、compute_eval()が呼び出され、このときに
@@ -193,13 +198,16 @@ struct Position
 	// この局面クラスを用いて探索しているスレッドを返す。 
 	Thread* this_thread() const { return thisThread; }
 
-	// 盤面上の駒を返す
+	// 盤面上の駒を返す。
 	Piece piece_on(Square sq) const { ASSERT_LV3(sq <= SQ_NB); return board[sq]; }
 
-	// c側の手駒を返す
+	// ある升に駒がないならtrueを返す。
+	bool empty(Square sq) const { return piece_on(sq) == NO_PIECE; }
+
+	// c側の手駒を返す。
 	Hand hand_of(Color c) const { ASSERT_LV3(is_ok(c));  return hand[c]; }
 
-	// c側の玉の位置を返す
+	// c側の玉の位置を返す。
 	FORCE_INLINE Square king_square(Color c) const { ASSERT_LV3(is_ok(c)); return kingSquare[c]; }
 
 	// 保持しているデータに矛盾がないかテストする。
@@ -224,8 +232,8 @@ struct Position
 #endif
 	}
 
-	// moved_pieceの拡張版。駒打ちのときは、打ち駒(+32 == PIECE_DROP)を加算した駒種を返す。
-	// historyなどでUSE_DROPBIT_IN_STATSを有効にするときに用いる。
+	// moved_pieceの拡張版。
+	// USE_DROPBIT_IN_STATSがdefineされていると駒打ちのときは、打ち駒(+32 == PIECE_DROP)を加算した駒種を返す。
 	// 成りの指し手のときは成りの指し手を返す。(移動後の駒)
 	// KEEP_PIECE_IN_GENERATE_MOVESのときは単にmoveの上位16bitを返す。
 	Piece moved_piece_after(Move m) const
@@ -245,21 +253,23 @@ struct Position
 	}
 
 	// 置換表から取り出したMoveを32bit化する。
-	Move move16_to_move(Move m) const {
-		// 置換表から取り出した値なので m==0である可能性があり、ASSERTは書けない。
-		// その場合、piece_on(SQ_ZERO)の駒が上位16bitに格納されるが、
-		// 指し手自体はilligal moveなのでこの指し手が選択されることはない。
-		//		ASSERT_LV3(is_ok(m));
+	// mは16bitの値であること。
+	Move move16_to_move(Move m) const;
 
-		return Move(u16(m) +
-			((is_drop(m) ? (Piece)(make_piece(sideToMove,move_dropped_piece(m)) + PIECE_DROP)
-				: is_promote(m) ? (Piece)(piece_on(move_from(m)) + PIECE_PROMOTE) : piece_on(move_from(m))) << 16)
-		);
-	}
+	// 普通の千日手、連続王手の千日手等を判定する。
+	// そこまでの局面と同一局面であるかを、局面を遡って調べる。
+	// plies_from_root : rootからの手数。ss->plyを渡すこと。
+	// 　※　rootとは、探索開始局面であり、そこまでの経路(手順)がある場合、そこよりさらに遡って調べる。
+	// →　これ無駄なのでやめた。(V4.87)[2019/06/09]
+	// rep_ply         : 遡る手数。デフォルトでは16手。あまり大きくすると速度低下を招く。
+	RepetitionState is_repetition(int rep_ply = 16) const;
 
-	// 連続王手の千日手等で引き分けかどうかを返す
-	// plyには、ss->plyを渡すこと。
-	RepetitionState is_repetition(int ply) const;
+#if defined(CUCKOO)
+	// この局面から以前と同一局面に到達する指し手があるか。
+	// plies_from_root : rootからの手数。ss->plyを渡すこと。
+	// rep_ply         : 遡る手数。デフォルトでは16手。あまり大きくすると速度低下を招く。
+	bool has_game_cycle(int plies_from_root , int rep_ply = 16) const;
+#endif
 
 	// --- Bitboard
 
@@ -308,12 +318,8 @@ struct Position
 	// 現局面で王手している駒
 	Bitboard checkers() const { return st->checkersBB; }
 
-	// 移動させると(相手側＝非手番側)の玉に対して空き王手となる候補の(手番側)駒のbitboard。
-	Bitboard discovered_check_candidates() const { return st->blockersForKing[~sideToMove] & pieces(sideToMove); }
-
-	// ピンされているc側の駒。下手な方向に移動させるとc側の玉が素抜かれる。
-	// 手番側のpinされている駒はpos.pinned_pieces(pos.side_to_move())のようにして取得できる。
-	Bitboard pinned_pieces(Color c) const { ASSERT_LV3(is_ok(c)); return st->blockersForKing[c] & pieces(c); }
+	// c側の玉に対してpinしている駒(その駒をc側の玉との直線上から動かしたときにc側の玉に王手となる)
+	Bitboard blockers_for_king(Color c) const { return st->blockersForKing[c]; }
 
 	// 現局面で駒Ptを動かしたときに王手となる升を表現するBitboard
 	Bitboard check_squares(Piece pt) const { ASSERT_LV3(pt!= NO_PIECE && pt < PIECE_WHITE); return st->checkSquares[pt]; }
@@ -385,24 +391,7 @@ struct Position
 	// ※　連続王手の千日手などについては探索の問題なのでこの関数のなかでは行わない。
 	// ※　それ以上のテストは行わないので、置換表から取ってきた指し手などについては、
 	// pseudo_legal()を用いて、そのあとこの関数で判定すること。
-	bool legal(Move m) const
-	{
-		if (is_drop(m))
-			// 打ち歩詰めは指し手生成で除外されている。
-			return true;
-		else
-		{
-			Color us = sideToMove;
-			Square from = move_from(m);
-
-			// もし移動させる駒が玉であるなら、行き先の升に相手側の利きがないかをチェックする。
-			if (type_of(piece_on(from)) == KING)
-				return !effected_to(~us, move_to(m), from);
-
-			return   !(pinned_pieces(us) & from)
-				|| aligned(from, to_sq(m), square<KING>(us));
-		}
-	}
+	bool legal(Move m) const;
 
 	// mがpseudo_legalな指し手であるかを判定する。
 	// ※　pseudo_legalとは、擬似合法手(自殺手が含まれていて良い)
@@ -475,7 +464,8 @@ struct Position
 
 
 	// 指し手mで王手になるかを判定する。
-	// 指し手mはpseudo-legal(擬似合法)の指し手であるものとする。
+	// 前提条件 : 指し手mはpseudo-legal(擬似合法)の指し手であるものとする。
+	// (つまり、mのfromにある駒は自駒であることは確定しているものとする。)
 	bool gives_check(Move m) const;
 
 	// 手番側の駒をfromからtoに移動させると素抜きに遭うのか？
@@ -534,7 +524,7 @@ struct Position
 	bool capture(Move m) const { return !is_drop(m) && piece_on(move_to(m)) != NO_PIECE; }
 
 	// --- 1手詰め判定
-#ifdef USE_MATE_1PLY
+#if defined(USE_MATE_1PLY)
   // 現局面で1手詰めであるかを判定する。1手詰めであればその指し手を返す。
   // ただし1手詰めであれば確実に詰ませられるわけではなく、簡単に判定できそうな近接王手による
   // 1手詰めのみを判定する。(要するに判定に漏れがある。)
@@ -554,15 +544,14 @@ struct Position
 #endif
 
 	// 入玉時の宣言勝ち
-#if defined (USE_ENTERING_KING_WIN)
   // Search::Limits.enteringKingRuleに基いて、宣言勝ちを行なう。
   // 条件を満たしているとき、MOVE_WINや、玉を移動する指し手(トライルール時)が返る。さもなくば、MOVE_NONEが返る。
   // mate1ply()から内部的に呼び出す。(そうするとついでに処理出来て良い)
+	// ※　トライルールのときに返ってくるのは16bitのmoveなので注意。
 	Move DeclarationWin() const;
-#endif
 
 	// -- sfen化ヘルパ
-#ifdef USE_SFEN_PACKER
+#if defined(USE_SFEN_PACKER)
   // packされたsfenを得る。引数に指定したバッファに返す。
   // gamePlyはpackに含めない。
 	void sfen_pack(PackedSfen& sfen);
@@ -573,15 +562,16 @@ struct Position
 
 	// ↑sfenを経由すると遅いので直接packされたsfenをセットする関数を作った。
 	// pos.set(sfen_unpack(data),si,th); と等価。
-	// 渡された局面に問題があって、エラーのときは非0を返す。
-	int set_from_packed_sfen(const PackedSfen& sfen , StateInfo * si , Thread* th);
+	// 渡された局面に問題があって、エラーのときはTools::Result::SomeErrorを返す。
+	// PackedSfenにgamePlyは含まないので復元できない。そこを設定したいのであれば引数で指定すること。
+	Tools::Result set_from_packed_sfen(const PackedSfen& sfen , StateInfo * si , Thread* th, bool mirror=false , int gamePly_ = 0);
 
 	// 盤面と手駒、手番を与えて、そのsfenを返す。
 	static std::string sfen_from_rawdata(Piece board[81], Hand hands[2], Color turn, int gamePly);
 #endif
 
 	// -- 利き
-#ifdef LONG_EFFECT_LIBRARY
+#if defined(LONG_EFFECT_LIBRARY)
 
   // 各升の利きの数
 	LongEffect::ByteBoard board_effect[COLOR_NB];
@@ -592,7 +582,7 @@ struct Position
 
 	// --- デバッグ用の出力
 
-#ifdef KEEP_LAST_MOVE
+#if defined(KEEP_LAST_MOVE)
   // 開始局面からこの局面にいたるまでの指し手を表示する。
 	std::string moves_from_start() const { return moves_from_start(false); }
 	std::string moves_from_start_pretty() const { return moves_from_start(true); }

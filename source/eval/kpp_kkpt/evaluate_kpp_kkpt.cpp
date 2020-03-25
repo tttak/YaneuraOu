@@ -1,4 +1,4 @@
-﻿#include "../../shogi.h"
+﻿#include "../../config.h"
 
 // KPP+KKPTの実験用コード。
 // ほとんどevaluate_kppt.cppと同じ。
@@ -12,6 +12,7 @@
 #include "../../evaluate.h"
 #include "../../position.h"
 #include "../../misc.h"
+#include "../../usi.h"
 #include "../../extra/bitop.h"
 #include "../evaluate_io.h"
 #include "evaluate_kpp_kkpt.h"
@@ -21,10 +22,12 @@
 #include "../experimental/evaluate_experimental.h"
 #endif
 
+#if defined (USE_EVAL_HASH)
+#include "../evalhash.h"
+#endif
+
 // EvalShareの機能を使うために必要
 #if defined (USE_SHARED_MEMORY_IN_EVAL) && defined(_WIN32)
-#include <codecvt>	 // mkdirするのにwstringが欲しいのでこれが必要
-#include <locale>    // wstring_convertにこれが必要。
 #include <windows.h>
 #endif
 
@@ -51,7 +54,7 @@ namespace Eval
 		// EvalIOを利用して評価関数ファイルを読み込む。
 		// ちなみに、inputのところにあるbasic_kppt32()をbasic_kppt16()に変更するとApery(WCSC27)の評価関数ファイルが読み込める。
 		// また、eval_convert()に渡している引数のinputとoutputを入れ替えるとファイルに書き出すことが出来る。EvalIOマジ、っょぃ。
-		auto make_name = [&](std::string filename) { return path_combine((string)Options["EvalDir"], filename); };
+		auto make_name = [&](std::string filename) { return Path::Combine((string)Options["EvalDir"], filename); };
 		auto input = EvalIO::EvalInfo::build_kpp_kkpt32(make_name(KK_BIN), make_name(KKP_BIN), make_name(KPP_BIN));
 		auto output = EvalIO::EvalInfo::build_kpp_kkpt32((void*)kk, (void*)kkp, (void*)kpp);
 
@@ -69,7 +72,7 @@ namespace Eval
 	Error:;
 		// 評価関数ファイルの読み込みに失敗した場合、思考を開始しないように抑制したほうがいいと思う。
 		sync_cout << "\ninfo string Error! open evaluation file failed.\n" << sync_endl;
-		my_exit();
+		Tools::exit();
 	}
 
 
@@ -147,19 +150,33 @@ namespace Eval
 			return;
 		}
 
-		// エンジンのバージョンによって評価関数は一意に定まるものとする。
-		// Numaで確保する名前を変更しておく。
+		// 評価関数ファイルが格納されているDirectory名をfull pathにて取得。
+		// それをMutex名にしておく。つまり同一フォルダの評価関数ファイルを参照している場合に限り、EvalShareで共有される。
 
-		auto dir_name = (string)Options["EvalDir"];
-		// Mutex名にbackslashは使えないらしいので、escapeする。念のため'/'もescapeする。
+		// カレントフォルダに".."みたいなフォルダ駆け上がりが含まれていて、絶対pathは同じなのに同じ文字列にならないかも知れない。
+		// それはPath::Combine()が正規化して欲しい気はするが…面倒なのでやってない。
+
+		auto dir_name = Path::Combine(Directory::GetCurrentFolder(), (std::string)Options["EvalDir"]);
+		sync_cout << "info string EvalDirectory = " << dir_name << sync_endl;
+
+		// Mutex名,MMF(Memory Mapped File)名にbackslash文字は使えないらしいので、escapeする。念のため'/'もescapeする。
+		// (フォルダの絶対pathが同じなのに"/"と"\"とで合致しないと嫌なため)
 		replace(dir_name.begin(), dir_name.end(), '\\', '_');
 		replace(dir_name.begin(), dir_name.end(), '/', '_');
-		// wchar_t*が必要なので変換する。
-		std::wstring_convert<std::codecvt_utf8<wchar_t>, wchar_t> cv;
-		cv.from_bytes(dir_name).c_str();
+		// フォルダ記号を"_"に置換しているので、たまたまpathに"_"が含まれているとややこしいことになるが、
+		// まあそんな運用普通しないと思うので気にしないことにする。
 
-		auto mapped_file_name = TEXT("YANEURAOU_KPP_KKPT_MMF" ENGINE_VERSION) + cv.from_bytes(dir_name);
-		auto mutex_name = TEXT("YANEURAOU_KPP_KKPT_MUTEX" ENGINE_VERSION) + cv.from_bytes(dir_name);
+		// Visual Studio 2019で「デバッグなしで実行」をしたとき、2回に一回ぐらい、shared memoryが使われない。
+		// VSのデバッガーが何か悪さをしているくさい。
+
+		// wchar_t*が必要なので変換する。
+
+		auto w_dir = Tools::MultiByteToWideChar(dir_name);
+
+		// Mutex名、MAX_PATH(==260)文字までなので、w_dir自体があまり深い階層だとこの制限を上回ってしまうが…。
+		// これは仕様だとする。PATH名が230文字超えるようなところに評価関数ファイル配置しないで。(´ω｀)
+		auto mapped_file_name = TEXT("YANEURAOU_KPP_KKPT_MMF" ENGINE_VERSION) + w_dir;
+		auto mutex_name = TEXT("YANEURAOU_KPP_KKPT_MUTEX" ENGINE_VERSION) + w_dir;
 
 		// プロセス間の排他用mutex
 		auto hMutex = CreateMutex(NULL, FALSE, mutex_name.c_str());
@@ -184,7 +201,7 @@ namespace Eval
 			if (shared_eval_ptr == nullptr)
 			{
 				sync_cout << "info string can't allocate shared eval memory." << sync_endl;
-				my_exit();
+				Tools::exit();
 			}
 			else
 			{
@@ -476,7 +493,13 @@ namespace Eval
 
 
 #if defined (USE_EVAL_HASH)
+	// evaluateしたものを保存しておくHashTable(俗にいうehash)
+
+	struct EvaluateHashTable : HashTable<EvalSum> {};
 	EvaluateHashTable g_evalTable;
+
+	void EvalHash_Resize(size_t mbSize) { g_evalTable.resize(mbSize); }
+	void EvalHash_Clear() { g_evalTable.clear(); };
 
 	// prefetchする関数も用意しておく。
 	void prefetch_evalhash(const Key key)
@@ -796,7 +819,7 @@ namespace Eval
 		// 評価関数本体を呼び出して求める。
 		evaluateBody(pos);
 
-#if defined ( USE_EVAL_HASH )
+#if defined(USE_EVAL_HASH)
 		// せっかく計算したのでevaluate hash tableに保存しておく。
 		sum.key = keyExcludeTurn;
 		sum.encode();

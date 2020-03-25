@@ -1,6 +1,944 @@
 ﻿
 やねうら王 更新履歴
 
+	TODO:
+		https://github.com/yaneurao/YaneuraOu/pull/100
+		llvmのリンクオプション最適化
+		ちゃんと検証してからMakefile書き直す。
+
+
+■　2020/02/28 V4.89
+
+
+- V4.89にバージョンナンバーを上げる。
+	- 公開している実行ファイルから、YaneuraOu2018の2018の文字を取り除く。
+	- tanuki-詰将棋エンジンは、tanuki_MATE_XXXというファイル名で公開するように変更する。
+
+
+- misc.h/cppのリファクタリング
+	- Pathをstructではなくnamespaceに。
+	- misc.hにあったnamespaceの外に出てた独自拡張の関数をnamespace Toolsに。
+	- my_exit() →　Tools::exit()に移動。
+	- uint64_t get_thread_id(); →　削除
+	- sleep() →　Tools::sleep()に移動。
+	- struct Finally → BOOST:: BOOST_SCOPE_EXITに倣い、マクロで実装しなおす。
+		- SCOPE_EXITマクロ追加。
+	- StringExtension::trim_inplace()追加
+	- StringExtension::trim()のコード、簡略化。
+	- Dependency::getline() → Tools::getline()に移動。
+
+このcommitによる機能的な変更は無し。
+
+
+■　2020/02/26
+
+
+- 定跡読み込み高速化
+  - ifstreamを使うのをやめた
+  - istringstreamを使うのをやめた
+  - 大改造になったので何かバグってたら教えてください(´ω｀)
+
+
+- 定跡にhitしたときに、読み筋(pv)のあとにscore等を出力していたの修正。
+(USIプロトコルではpvのあとにサブコマンド(score,depth等)を書くことはできない
+とされているのでこれはUSIの規約違反)
+
+誤)　info pv 3i4h 3c3d 6i7h 4a3b 2g2f (4.17%) score cp 31 depth 3 multipv 4
+正)　info score cp 31 depth 3 multipv 4 pv 3i4h 3c3d 6i7h 4a3b 2g2f (4.17%)
+
+
+■　2020/02/06
+
+
+- NNUEの学習用のビルドで、gccで未初期化の配列がある警告が出ていたのを抑制。
+
+
+■　2020/01/20
+
+
+- mkdir()→CreateFolder()に変更した件、test_cmd.cpp修正忘れ。(#106) Mizarさん。
+
+
+- isreadyのあと、keepalive代わりに改行を5秒ごとに送信していた件、やめる。
+
+cf. USIプロトコルでisready後の初期化に時間がかかる時にどうすれば良いのか？ : http://yaneuraou.yaneu.com/2020/01/05/usi%e3%83%97%e3%83%ad%e3%83%88%e3%82%b3%e3%83%ab%e3%81%a7isready%e5%be%8c%e3%81%ae%e5%88%9d%e6%9c%9f%e5%8c%96%e3%81%ab%e6%99%82%e9%96%93%e3%81%8c%e3%81%8b%e3%81%8b%e3%82%8b%e6%99%82%e3%81%ab%e3%81%a9/
+
+
+- BookOnTheFlyで定跡にhitしないことがあるのを修正。
+	cf. https://github.com/yaneurao/YaneuraOu/issues/102
+
+
+- nodestimeオプション廃止。
+  - 秒読みを考慮していなかったが、それとは別に、将棋(やねうら王)の場合、NetworkDelay,NetworkDelay2やMinimumThinkingTimeなどの影響も計算しないといけなくて、そのへんまできちんと計算しようと思うと時間制御のコードがすごく複雑化するというのと、そもそもこの機能要らないんじゃ…みたいに思えてきたのでこの機能は削除する。
+- EngineNumaオプションの説明削除。
+
+
+- gcc/clangのためにMakefile修正。
+	- gcc/clangの新しいバージョンでは、-std=c++1zではなく、-std=c++17と書く必要がある。
+		- cf. https://cpprefjp.github.io/implementation.html
+
+
+- C++17でコンパイルするように変更。
+	- Makefile、gcc/clangでC++17でコンパイルするように変更。
+	- alignasを指定しているとnewしたときもそれを守るようになったらしいので、
+		custom allocatorのコードを削除する。
+		cf. https://cpprefjp.github.io/lang/cpp17/dynamic_memory_allocation_for_over-aligned_data.html
+	- alligned_malloc()自体は、HashTableで使っているので削除できない。
+
+
+- 一つ前の修正でmisc.cpp、gcc/clangでコンパイル通らなくなっていたのを修正。
+	cf. https://github.com/mizar/YaneuraOu/commit/3bcc7cda8176644261008f5ead0a964fb348ebf8
+
+
+■　2020/01/18
+
+
+- misc.hにあった、mkdir、Directory::CreateDirectoryに移動。
+
+
+- Visual C++ 2019では、C++14からC++17でコンパイルするように変更。
+	- C++17のfilesystemを使うように変更。(misc.h/cppにDirectoryクラス追加)
+	- gcc/clangではビルドの仕方よくわからん…。
+- yaneuraou-search.cpp、utf8のBOMついてなかったのでつけた。
+
+
+■　2020/01/17
+
+- fix "makebook endless_extend_tree" (#103)
+	- "makebook endless_extend_tree"コマンドがバグっていたの修正。Mizarさん。
+
+- perft LEGAL_ALL (#105)
+	- perftコマンドで香の不成などを生成していなかったの修正。Mizarさん。
+
+
+■　2019/11/28
+
+- Android用のAndroid.mkでのビルドが通らなくなっていたのを修正。
+
+
+■　2019/07/04
+
+
+- 解説.txtの説明が古かったの修正。
+
+
+■　2019/07/03
+
+
+- エンジン名のdefineからOTAFUKUの文字を取り忘れていたところがあったのを修正。
+  - bookコマンド一部動かなくなってた。ごめん。
+- lintで引っかかっていた箇所修正。
+
+
+
+■　2019/06/30
+
+
+- USIコマンド拡張。"side"追加。(AyaneruServerの実装で必要となった。)
+
+
+
+■　2019/06/29
+
+
+- トライルールのときにトライの指し手を選ばなかったの修正。
+
+
+■　2019/06/26 V4.88
+
+
+- V4.88にバージョンナンバーを上げる。
+
+
+- makebook extend_treeで"sfen"局面を読み込んだ時に"moves"がついていないなら"moves"を付与する。
+
+
+■　2019/06/25
+
+
+- engine_options.txtでオプションを読み込んだときにハンドラを壊していたの修正
+
+
+- Stockfish 20190625分まで反映
+
+
+- makebook build_treeコマンド(テラショック定跡生成コマンド)、駒落ちの各初期局面もroot局面にするように変更。
+  - これで駒落ちの定跡もビルドできるようになった。
+- makebook extend_treeコマンド、"startpos moves .."形式だけではなく"sfen ..."形式もサポートする。
+
+
+- TOURNAMENT用のビルド、EvalHashの初期値が1024になっていなかったの修正。
+
+
+■　2019/06/24
+
+
+- Makefile、すべてのCPU用のすべてのビルドターゲットをビルドできるように修正する。
+- 一つ前のcommitによってclangでコンパイルエラーになっていたの修正。
+
+
+- movepick.cppのQUIET_INITでskipQuietのときには指し手を生成しない。
+  cf. http://yaneuraou.yaneu.com/2019/06/24/%e5%b0%86%e6%a3%8b%e3%82%bd%e3%83%95%e3%83%88%e9%96%8b%e7%99%ba%e8%80%85%e3%81%8cstockfish%e3%81%ab%e8%b2%a2%e7%8c%ae%e3%81%99%e3%82%8b%e6%97%a5/
+
+
+- makebookコマンドでオプションのBookFileで指定されている定跡は読み込まないように改善。
+- makebook build_treeコマンドで同一局面の場合、gamePlyが最小となる局面についての情報を書き出すように修正。
+
+
+■　2019/06/23
+
+
+- engine_options.txtを読み込んでいるのにソースコードのコメントでengine_option.txtと書いていた箇所修正。
+
+
+- EnteringKingRuleがengine_options.txtで反映しなかったの修正
+- 入玉ルールまわりの処理、リファクタリング
+- extra/entering_king_rule.cpp →　position.cppに吸収
+- engine_options.txtでoverrideしたときに、Optionのhandlerを呼び出すように修正
+
+
+■　2019/06/22
+
+
+- "engine_options.txt"側でBookFileを指定できなかったbug修正。
+
+
+- ニコニコ生放送用にmultipvで出力しないオプション追加。
+
+
+- 定跡ファイルの読み込み中にinfo stringでその旨を出力する。
+
+
+■　2019/06/17
+
+
+- Positionクラス、千日手の処理変更。
+  - 以前の方法の処理に戻す。
+
+
+- Android用Makefile , AVX512対応の用意など。  Mizerさんのプルリク(#98)
+
+
+
+■　2019/06/15 V4.87
+
+
+- include忘れ修正
+手元の環境だとコンパイル通るのなんで…。
+
+
+- V4.87にバージョンナンバーを上げる。
+
+
+- EvalHashオプション追加
+
+
+- Position::pseudo_legal_s()の不要なチェックを削除 (#97)  Aperyの平岡さんのプルリク(#97)
+
+
+■　2019/06/10
+
+
+- make時のエンジン表示名の指定に対応
+
+
+- USI_Ponder受けつけてなかったの修正
+- benchコマンドがASSERTに引っかかっていたの修正
+
+
+- ASSERT有効にしたときにコンパイルが通らなくなっていたの修正。
+
+
+■　2019/06/09
+
+
+- ENABLE_OUTPUT_GAME_RESULTまわり、コード整理
+
+
+- Position::discovered_check_candidates(),pinned_pieces()廃止。
+
+
+- 計測資料、記述追加、readme.mdに定跡生成手順などの補足
+
+
+- cuckoo配列の初期化コード追加、Position::has_game_cycle()実装など。
+
+
+■　2019/06/07
+
+
+- 定跡DBの書き出し、必ずsortするように仕様変更。
+
+
+■　2019/06/03
+
+
+- Makefile整理
+- プロジェクトファイル整理
+
+
+■　2019/06/02
+
+
+- V4.86にバージョンナンバーを上げる。
+- 1つ前のcommitでgccでコンパイルが通らなかったの修正
+
+
+- build_treeの千日手まわりの処理、修正
+- build_treeでビルド時に手数違いの局面にもヒットするように変更
+- 定跡の書き出しの時に同一局面の手数違いの局面は、一番手数の若い局面のみを書き出すように変更。
+- Position::is_repetition()、遡る手数を引数に追加。説明が間違っていたの修正。
+
+
+- IgnoreBookPlyオプション導入
+- 定跡の出力、multipv 1から正順で出力するように変更
+- 定跡で重複局面が登録されていたときに出現率の計算がおかしくなるの修正。
+- 定跡の書き出し時に同一局面の手数違いの局面については一番手数の若い局面以外を書き出さないように修正。
+// 手数違いの重複局面はOptions["IgnoreBookPly"]==trueのときに有害であるため、plyが最小のもの以外を削除する必要がある。
+// (Options["BookOnTheFly"]==true かつ Options["IgnoreBookPly"] == true のときに、手数違いのものがヒットするだとか、そういう問題と、
+// Options["IgnoreBookPly"]==trueのときにMemoryBook::read_book()で読み込むときに重複エントリーがあって何か地雷を踏んでしまう的な問題を回避。
+- 定跡の読み筋で千日手(rep_draw)の出力
+- std::string to_usi_string(RepetitionState rs)追加
+
+
+- miscにnamespace StringExtension追加。
+- MKDIRなどをnamespace Dependencyに入れる。関数名をmkdirに変更。
+
+
+
+■　2019/05/30
+
+
+- Position::pinned_pieces() obsoleteに。
+
+- 定跡DBに候補手のない局面が登録されているとそこにヒットしたときに落ちていたの修正。(バグ報告、ロタさん)
+
+- ARM向け、コンパイル通らなかったの修正(#94 , Mizarさん)
+
+
+■　2019/05/28
+
+
+- Cuckooアルゴリズムまわりの説明が間違っていたので修正
+
+- Ubuntuでコンパイルが通らなかったのを修正。(Ubuntu 18.04のgccでコンパイルが通ることを確認)
+
+- 32bit環境用のMSYS2でビルドできなかった問題を修正
+
+- mate engine、LONG EFFECT LIBRARYを使用していたの修正
+- mate engine , kppt/kkpt評価関数のコンパイルが通らなくなっていたの修正
+
+- V4.85にバージョンナンバーを上げる。
+- テラショック定跡の生成部を実装したので、これをリファレンスするためにバージョンナンバーを上げておく
+
+	engine1 = YaneuraOu2018NNUE_avx2-v483git.exe , eval = tanuki2018_nnue-best
+	engine2 = YaneuraOu2018NNUE_avx2git201905280050.exe , eval = tanuki2018_nnue-best
+	T2,b1000,789 - 105 - 836(48.55% R-10.05) win black : white = 53.42% : 46.58%
+
+- futility move countのコード、新しいコードに差し替え
+
+- book2019.cpp、sjisで保存してたので、コメント文の「機能」の「能」の文字の2バイト目に￥があって、gcc/clangでコンパイルエラーになっていた。utf-8で保存しなおした。
+
+- Lazy SMPでhelper threadをmain threadより先行させるコード、削除
+
+- テラショック定跡部　丸ごと
+
+- StatsEntry 一部を新しいコードに差し替え
+
+- TTEntryのdepth、int8_tからuint8に変更
+
+- timeman、USI_Ponderオプションを考慮するように修正
+
+- EasyMove削除
+- LazySMPのvoteの処理、改良
+- 探索のtime managementまわり、Stockfish10のコードと差し替え
+
+	engine1 = YaneuraOu2018NNUE_avx2-v483git.exe , eval = tanuki2018_nnue-best
+	engine2 = YaneuraOu2018NNUE_avx2git201905272200.exe , eval = tanuki2018_nnue-best
+	T2,b1000,459 - 42 - 489(48.42% R-11.0) win black : white = 51.05% : 48.95%
+
+
+■　2019/05/27
+
+
+- seeのコード、きちんと差し替わっていなかった。修正。
+
+- Stockfish10で探索部にperft追加されたのでそちらのperftを使うようにしてtestコマンドのほうのperftのコードを削除
+
+- extra/timeman.cppのフォルダ移動
+- main.cpp追加
+- move_pick.h/cppをmovepick.h/cppとリネーム
+
+
+■　2019/05/26
+
+
+- searchのコード、むちゃくちゃ整理した
+
+engine1 = YaneuraOu2018NNUE_avx2-v483git.exe , eval = tanuki2018_nnue-best
+engine2 = YaneuraOu2018NNUE_avx2-v484git201905251830.exe , eval = tanuki2018_nnue-best
+T2,b1000,889 - 111 - 940(48.61% R-9.69) win black : white = 51.67% : 48.33%
+
+
+
+■　2019/05/25
+
+
+- seeのコード、最新のものに差し替え
+
+- tt.h / tt.cppを最新のコードに
+- NO_EVAL_IN_TT廃止
+- 置換表にスレッドごとに領域を分ける機能廃止(ソースコード見づらい＆複雑になる＆教師生成時の効果に乏しい)
+
+
+■　2019/05/24
+
+
+- V4.84にバージョンナンバーを上げる。
+BookPvMovesを導入したのでこれをリファレンスするためにバージョンナンバーが以前と変わっている必要がある。
+アップデート自体はまだ作業中。近日中に残りのアップデートを行う。
+
+- 置換表使用率が最大で99.9%にしかならないのを修正
+
+- makebook thinkコマンドでノード制限の指定が出来るように
+
+- config.hのフォルダを移動させたのでそれに伴う解説文の修正
+
+- 定跡にヒットしたときにその定跡の変化を深くまで出力するように。
+- BookPvMovesオプション導入。
+
+- 定跡書き出し時、採択率が同じ場合に評価値で並び替えがされないbug修正。
+
+- MovePicker、少し最新のコードに寄せる
+
+- threadまわり、もう少し最新のコードに寄せる
+
+- Learner::search()は千日手スコアはContemptの値を無視して、0を返すべき。
+ (スレッドごとにDrawValueを持っていないので複数スレッドから書き換えられると整合性が取れなくて困るため)
+
+- stricmp()自前実装に置き換え
+
+
+■　2019/05/23
+
+
+- config.hからもincludeをなるべく減らす
+
+- ビルド速度upのため、ソースコード大整理
+
+- Learner::search()のnode数制限の実装
+
+- move_picker.hなど、ファイル名をStockfish10になるべく倣う
+
+- 古い評価関数、古いエンジン部をold_enginesに移動
+
+- 古い告知文、削除および過去記事のほうに移動
+
+- WCSC29優勝に関してreadme.md更新
+
+- Visual Studio 2019のためにproject fileのアップデート
+
+- GPLv3のライセンステキスト追加
+
+
+■　2019/05/18
+
+
+Position::set()とPosition::set_from_packed_sfen()でLongEffect::calc_effect()とEval::compute_eval()の呼び出し順を変更 (#93) tttakさん
+評価関数で利きを使用する場合を考慮し、LongEffect::calc_effect()を呼んでからEval::compute_eval()を呼ぶように変更
+
+
+■　2019/03/04 - 2019/03/18
+
+// これらはWCSC29に向けた作業。やねうら王のGitHubには反映させていない。
+// 反映させるのはWCSC29終了後。
+
+- ソースコードをStockfish10に追随する。
+	- Stockfishになるべく引数の変数名を合わせる。
+		- ソースコードの比較のときに紛らわしいため。
+	- move_picker.h/cpp → move_pick.h/cppにrename。
+	- 今回、Stockfishのソースコードになるべく合わせたファイル
+		search.h
+		tt.h
+		tt.cpp
+		misc.h
+		misc.cpp
+		thread.h
+		thread.cpp
+		thread_win32.h
+		usi.h          // 新規ファイル
+		usioption.cpp  // 新規ファイル
+		usi.cpp        // これは、半分ぐらいだけ作業した。残りはまたの機会でいいや。
+		move_pick.h     // ファイル名をmove_picker.h   から rename
+		move_picker.cpp // ファイル名をmove_picker.cpp から rename
+	- usi.h
+		std::string score_to_usi(Value v); → USI::value()に移動。Stockfishに合わせる。
+		Move move_from_usi(const Position& pos, const std::string& str); → USI::to_move()に移動。
+	- see_ge()のコード、Stockfish10に倣った。
+
+- コンパイルの高速化のためにソースコードの整理。
+	- Thread::think()廃止。Stockfishに合わせてThread::search()を用いるように変更。
+	- thread_win32.h を source/extraからsource/に移動。
+	- shogi.h / shogi.cppを types.h , types.cppにrename。
+	- source/extra/config.h を source/config.hに移動。
+	- all.h削除(使ってない＆保守しつづけるの手間)
+
+- ソースコードの単純化のために以下の機能を廃止する。
+	- NO_EVAL_IN_TT
+		- 置換表のTTEntryにevaluate()の値を格納しないオプションだが、これ実質的に使っていないので廃止する。
+	- スレッドごとの置換表
+		- 教師局面の生成時や教師局面からの学習時などに必要かと思って用意していたが、スレッド数で置換表を分割するために
+			置換表効率が悪くなるので置換表のエントリーが衝突する損より大きな損を抱えることになる。
+		- 教師局面生成時に限って言えば、他のスレッドが見つけた詰み筋など、depthが大きなTTEntryは残るので、詰みを回避することで別の
+			終局図に到達する可能性が高まり、elmo式の勝敗項の偏りを均す働きがあるので、スレッドごとに置換表は持たないほうが良いという見方ができる。
+
+			// スレッドごとに置換表を用意する設定
+			// Learner::search(),Leaner::qsearch()を呼ぶときにスレッドごとに置換表が用意されていないと嫌ならこれを呼び出す。
+			// この機能を有効にした場合、TT.new_search()を呼び出したときのOptions["Threads"]の値に従って、
+			// 置換表を分割するのでLearner::search()を呼ぶまでに事前にTT.new_search()を呼び出すこと。
+			bool use_per_thread_tt;
+
+			// 置換表とTTEntryの世代が異なるなら、値(TTEntry.value)は信用できないと仮定するフラグ。
+			// TT.probe()のときに、TTEntryとTT.generationとが厳密に一致しない場合は、
+			// 置換表にhitしても、そのTTEntryはVALUE_NONEを返す。
+			// こうすることで、hash衝突しておかしな値が書き込まれていてもそれを回避できる。
+			// gensfenコマンドでこの機能が必要だった。
+			// cf. http://yaneuraou.yaneu.com/2017/06/30/%E3%80%90%E8%A7%A3%E6%B1%BA%E3%80%91gensfen%E3%81%A7%E6%95%99%E5%B8%AB%E5%B1%80%E9%9D%A2%E7%94%9F%E6%88%90%E6%99%82%E3%81%AB%E9%81%85%E3%81%8F%E3%81%AA%E3%82%8B%E5%95%8F%E9%A1%8C/
+			bool use_strict_generational_tt;
+		- 教師生成時のeval_limitは設定しない(上限値である32000にする)ほうが良いことが判明したので[tanuki-(WCSC28)]、上の問題は回避できる。
+	- KKPPTなどの使っていない評価関数
+		- コンパイル時間の短縮化のため
+	- help mate engine
+		- 都度保守していくのが大変なため。いずれ書き直す。
+	- local game server
+		- python製の自己対局スクリプトのほうが使いやすいため。
+
+- Stockfishの変更を反映しないクラス
+	- Positionクラス
+		Bitboard discovered_check_candidates() const { return st->blockersForKing[~sideToMove] & pieces(sideToMove); }
+		Bitboard pinned_pieces(Color c) const { ASSERT_LV3(is_ok(c)); return st->blockersForKing[c] & pieces(c); }
+	→　この２つ無くすと変更が大変なので現状維持で…。(´ω｀)
+
+- 探索部の改良
+	- razoringのパラメーターを3つから1つに変更。(Stockfish10)
+	- 探索パラメーターのparam1,param2廃止。この調整の仕方、しない。
+	- やねうら王独自のコードを明確に区別してわけるようにした。
+		- 一部の変数はMainThreadに移動させた。
+
+- その他の改良点
+	- NNUE評価関数の評価関数ファイル読み込み時にエラーになった場合、エンジンを終了するようにした。
+	- perftコマンド追加。(トーナメントビルド以外)
+	- Timerクラス、扱う時刻の値はすべてTimePoint型に
+
+
+■　2018/12/29
+
+
+- USE_RANDOM_PARAMETERSをdefineしたときにコンパイルが通らなかったのを修正。
+
+
+■　2018/12/21
+
+
+- misc.cpp : clangでcastのときに警告が出ていたの修正。
+
+
+■　2018/11/18
+
+
+- 8スレ以上のときに対局開始時のメモリのゼロクリアを並列して行うようにする。
+	- Stockfishのtt.h / tt.cppにある程度追随。
+	- TT、メモリをresizeで確保しなおしたときにメモリをクリアするように変わった。
+		- 二重初期化になる。この修正、取り入れないでおこう。
+	- benchコマンドでTTを二重にメモリ初期化していたの修正。
+	- MateEngineでもトーナメントモードでのビルドのときは同様の初期化を行うことにした。
+
+
+===========================
+Total time (ms) : 19613
+Nodes searched  : 11033416
+Nodes/second    : 562556
+
+
+■　2018/11/12
+
+
+- MateEngineで"go nodes [ノード数] mate XXX"を受け付けるようにする。
+	- MateEngineで"nodes"と"depth"の指定ができるようにしようと思ったが、USIプロトコル的に対応してなかった。そうか…。
+	- USI2.0として対応することにした。
+
+
+■　2018/11/08
+
+
+- MateEngineのときにゼロクリアするコード、無効化しておく。
+
+
+- 置換表のメモリのゼロクリア、進捗を2GBごとに出力するように変更。
+
+
+- mate engine、Hashの初期化をisreadyokやっていないの修正。
+	- しかし、ゼロクリアしていないので時間的にはわずかか…。
+	- VirtualAlloc()で確保されたメモリを実メモリにcommitするためにゼロクリアしたほうが良いような気がするけども、
+	hash値が衝突してもTTEntryにmoveを保存していないので別に落ちることはないのか…。そうか…。
+
+
+- "isready"を受け取ったあと、"readyok"を返すまで5秒ごとに改行を送るように修正する。(keep alive的な処理)
+
+USI2.0の仕様より。
+> - "isready"のあとのtime out時間は、30秒程度とする。これを超えて、評価関数の初期化、hashテーブルの確保をしたい場合、
+>  思考エンジン側から定期的に何らかのメッセージ(改行可)を送るべきである。
+>  - ShogiGUIではすでにそうなっているので、MyShogiもそれに追随する。
+>  - また、やねうら王のエンジン側は、"isready"を受け取ったあと、"readyok"を返すまで10秒ごとに改行を送るように修正する。
+- "isready"時にhashの確保を開始するタイミングでhash sizeも出力するようにしよう。
+
+- GenAllLegalMovesオプション追加。
+	- これ、トーナメントモードでは無効化しておく。
+- 王手将棋の時のコードが残っていたの削除。
+
+
+■　2018/10/04
+
+
+- BookDirを変更したときに、Aperyの定跡ファイル(book.bin)が読み込めなくなるのを修正。(ohtaroさんの報告) (修正内容の指摘、tttakさん)
+	cf. https://github.com/yaneurao/MyShogi/issues/57
+- フォルダ名を変更したときに、定跡を使わない場合にも"no_book"というファイルを読みに行っていたのを修正。
+- misc.hにPathクラス追加。
+	- C#のメソッド名に合わせる。
+	- path_combine → Combineにrename
+	- GetFileName()追加
+
+
+■　2018/09/24
+
+
+- MSYS2上でNNUE型の評価関数の実行ファイルがビルドできない件を解説.txtに追記
+
+
+- LineScanner、少しリファクタリング。(挙動はほぼ変わらず)
+
+
+- engine_options.txtの読み込み時にbuffer overrunすることがあったの修正。
+	- LineScannerのEof()判定、間違っていた。
+
+
+■　2018/09/23
+
+
+- SkillLevel実装。(Stockfishの"Skill Level"を忠実に移植。)
+
+
+■　2018/09/15
+
+
+- tanuki-詰将棋エンジン
+	- ソースコードにコメント大量追加
+	- intになっているところ、桁が足りない恐れがあるところはuint32_tに変更。
+	- uint16_tで済むところはuint16_tに変更。
+	- info hash..の出力、もう少し細かくやるように変更。
+	- TTの世代カウンター復活。16bitにする。
+	- あとは、sub-treeの大きさの評価をきちんとすべき。(現状、num_searchedがsub-treeの大きさを反映していない)
+	- できればGC実装すべきだと思う。
+
+
+■　2018/09/10
+
+
+- tanuki-詰将棋エンジン , 詰探索中の出力を変更した (#91)   (tanuki-さんのプルリク)
+* clang++によるコンパイル警告を抑制した
+* 詰探索中の進捗状況の出力を変更した
+
+
+■　2018/09/08
+
+
+- tanuki-詰将棋エンジン , clang++によるコンパイル警告を抑制した #90  (tanuki-さんのプルリク)
+
+
+■　2018/09/07
+
+
+- tanuki-詰将棋エンジン , 置換表エントリの世代を削除し、置換表エントリのハッシュの最下位ビットに探索開始局面の手番を入れるようにした #89 (tanuki-さんのプルリク)
+  - この修正により、一度解いた局面を解かせるときには一瞬で応答が返ってくるようになった。
+
+
+■　2018/09/06
+
+
+- V4.83にバージョンナンバーを上げる。
+
+
+-  詰将棋ルーチンで受け側の局面から探索させたあとに攻め側の局面から探索させると不詰と出力されるバグを修正した #88 (tanuki-さんのプルリク)
+
+
+-  詰将棋エンジンハッシュエントリをつぶすとき、探索ノード数を考慮するようにした (#87)  (tanuki-さんのプルリク)
+
+
+■　2018/08/22
+
+
+- 詰将棋エンジン、Hashが二重に確保されているのを修正。part2
+
+
+
+■　2018/08/14
+
+
+- 詰将棋エンジン、Hashが二重に確保されているのを修正。
+  - Hashに16MBを指定したときに4096MB確保されるの修正。
+
+
+■　2018/08/12
+
+
+-  詰将棋エンジン コンパイル時のwarningを消した (#86) (tanuki-さんのプルリク)
+
+
+- 詰み手順を復元する探索ルーチンの中で受け手側の手番かつ王手がかかっている状況で1手詰みルーチンを呼び出すバグを修正した #85(tanuki-さんのプルリク)
+	詰手順を復元する探索ルーチンの中で
+	受け手側の手番かつ王手がかかっている状況で
+	1手詰みルーチンを呼び出しているバグを修正しました。
+	これにより金子清志氏の全応手逆王手最長１５手で
+	合法な詰手順が出力されるようになりました。
+	http://www.ne.jp/asahi/tetsu/toybox/challenge/c1090.htm
+	ただし、最短の詰手順ではありません。
+
+
+- 逆王手がかかっている局面でも詰みを探索するようにした #84  (tanuki-さんのプルリク)
+	逆王手がかかっている局面でnotimplementedを返さないようにするオプション、
+	ReturnNotImplementedIfCheckedを追加いたしました。
+	デフォルトはtrueで、falseにすると逆王手がかかっている局面でも探索を行います。
+
+
+- 詰将棋エンジンで制限時間をチェックするようにした #83 (tanuki-さんのプルリク)
+
+	詰将棋エンジンで制限時間をチェックするようにいたしました。
+	GUIからエンジンへ制限時間を設定した上で詰将棋エンジンを解かせる場合は、
+	USIプロトコル通り
+
+	go checkmate 60000
+
+	などと指定してください。
+	制限時間を越えた場合、USIプロトロルにある通り、エンジンからは
+
+	checkmate timeout
+
+	が返ってくるようになっています。
+
+
+
+■　2018/08/05
+
+
+- Buildfiles #82 (Mizarさんのプルリク)
+	* build batches update
+
+	- YANEURAOU_2018_OTAFUKU の評価関数タイプをMakefileから選択できるように
+	- NNUEやMATEエンジンでcleanしきれないゴミが残ってビルド失敗していた部分の対策
+	- USE_BLAS: tanuki-2018エンジンのevallearnビルドにてBLAS有効化
+
+
+- LineScannerでpeek_text()したときに文字列終端まで行くと、まだその文字列をget_text()していないのにIsEof()がtrueを返すの修正。
+
+
+■　2018/08/04
+
+
+-  詰将棋エンジンに、より長い詰み手順を返すMorePreciseMatePvオプションを追加した (#81)　tanuki-さんのプルリク
+
+
+■　2018/08/01
+
+
+- スレッドstack、100MBに設定してコンパイルしてあるのを25MBに変更。
+  - 協力詰めで手数が5万手ぐらいになるので大きめである100MBに設定したが、スレッドあたり100MBも消費するので32bit環境ではメモリ割り当て的に厳しい。
+  (4スレッドであれば待機スレッド含めて5スレッドあり、スタック用だけで500MB消費する。)
+  - Windows10だとメモリを確保しても、実際にそのメモリにアクセスするまで実メモリに割当てするのは遅延されるが、
+    Windows7ではそうでもないので馬鹿正直に500MB消費する。つまりは、この理由からWindows7×32bit環境でわりと苦労することになる。
+- 32bit環境でUSE_SHARED_MEMORY_IN_EVALを有効にする。
+
+
+■　2018/07/29
+
+
+- "engine_options.txt"で、optionとしてそのエンジンが持っていないものを指定すると先頭のoptionが破壊されるの修正。
+
+
+■　2018/07/28
+
+
+- usi.cpp clangでコンパイルしたときに警告が出ていたの修正。
+- 解説.txt にMSYS2環境でのNNUE評価関数のビルド方法追加。
+
+
+■　2018/07/27
+
+
+- 起動時に、"engine_options.txt"を読み込み、Optionsに反映するように。
+	- エンジンオプションのデフォルト値の変更について、解説.txtに追記
+
+
+- "BookDir" option追加。
+
+
+■　2018/05/27
+
+
+- Move omp_set_num_threads() call to worker threads (#80) (ynasu87さん)
+	- NNUEで学習のときにスレッドの分散が適切に出来ないことがある問題の修正。
+
+
+■　2018/05/24
+
+
+- * 連続王手の千日手のチェックを追加した
+  * 対局規定第8条第7項に従って修正した
+  * ソースコードのフォーマットを修正した
+	cf. https://github.com/yaneurao/YaneuraOu/pull/79
+	(tanuki-さん)
+
+
+- Mateエンジンで、探索が開始しないバグを修正した(tanuki-さん)
+
+
+■　2018/05/20
+
+- 祝！Android公式サポート (#76) (Mizarさん)
+- Support NEON for NNUE evaluation functions (#77) (ynasu87さん)
+	- NEON向けNNUE最適化。
+
+
+■　2018/05/17
+
+- StateInfo::capturedPcの説明が間違っていたの修正。
+
+
+■　2018/05/15
+
+- Add NNUE evaluation functions (#75) (ynasu87さん)
+	- この新時代の幕開けとも言える新型の評価関数をマージできることに心に喜悦を禁じえない。
+
+
+■　2018/05/07
+
+- MATE_ENGINEでgo mateに対してcheckmateで応答する。(kazu-nanohaさん)
+
+
+
+■　2018/05/03
+
+- 128GB超えの置換表を扱うのはデフォルトでは無効にする。
+	- config.hでUSE_HUGE_HASHをdefineしたときのみ有効に。
+
+
+■　2018/05/02
+
+- 置換表サイズの2^Nという制約を取り除く。(ただし、2MB単位で確保する)
+	- Allow for general transposition table sizes. (#1341) : https://github.com/official-stockfish/Stockfish/commit/2198cd0524574f0d9df8c0ec9aaf14ad8c94402b
+	- わずかに遅くなるがそれは棋力にはほぼ影響はないはず…。
+	- 16GBメモリの環境でHashの値として以前は14000(≒14GB)などと指定しても以前は8192(8GB)までしか使われなかったのが
+		今回の変更により14000ぴったりまで使われるようになったので、以前より置換表をめいいっぱい確保でき、このおかげで
+		探索効率が改善して強くなるという効果は期待できる。(長い持ち時間で置換表を使い尽くしているような状況ならば)
+
+	例) Hashとして3を指定して1秒対局。以前のバージョンでは置換表は2MBの確保になり、本バージョンでは、3MBの確保となる。)
+
+			// TTEntry*を求めるところ
+			return &table[(((uint32_t(key) * uint64_t(clusterCount)) >> 32) & ~1) | (key & 1)].entry[0];
+
+	engine1 = YaneuraOu-2018-OtafukuV482.exe , eval = Apery20171111
+	engine2 = YaneuraOu-2018-OtafukuV482a.exe , eval = Apery20171111
+	T1,b1000,618 - 51 - 941(39.64% R-73.04) win black : white = 51.57% : 48.43%
+
+			// これだとkeyのbit0が(uint32_t(key))に含まれているので、以下のように改良した
+			return &table[(((uint32_t(key >> 1) * uint64_t(clusterCount)) >> 32) & ~1) | (key & 1)].entry[0];
+
+	engine1 = YaneuraOu-2018-OtafukuV482.exe , eval = Apery20171111
+	engine2 = YaneuraOu-2018-OtafukuV482b.exe , eval = Apery20171111
+	T1,b1000,289 - 21 - 510(36.17% R-98.67) win black : white = 50.44% : 49.56%
+
+- 置換表の128GB制限を解除する
+	- 128 GB TT size limitation : https://github.com/official-stockfish/Stockfish/issues/1349
+		- このスレッドに書かれている修正案、いくつかの点においてよろしくない。
+			- cf. 置換表の128GB制限を取っ払う冴えない方法 : http://yaneuraou.yaneu.com/2018/05/03/%E7%BD%AE%E6%8F%9B%E8%A1%A8%E3%81%AE128gb%E5%88%B6%E9%99%90%E3%82%92%E5%8F%96%E3%81%A3%E6%89%95%E3%81%86%E5%86%B4%E3%81%88%E3%81%AA%E3%81%84%E6%96%B9%E6%B3%95/
+	- singular extension時のhash keyを求めるコード、改良。
+
+
+
+■　2018/05/01
+
+- _blsr_u64()をgccでインライン展開するには-mbmiが必要(-mbmi2ではやってくれない)
+	kazu-nanohaさんからのプルリクエスト
+
+■　2018/04/30 V4.82
+
+- ProbCutのパラメーター導入
+	- PARAM_PROBCUT_MARGIN1 , PARAM_PROBCUT_MARGIN2
+- ProbCutのマージン、手で調整する。
+	PARAM_DEFINE PARAM_PROBCUT_MARGIN1 = 194 + 16/2;
+	PARAM_DEFINE PARAM_PROBCUT_MARGIN2 = 48/2;
+- NUMA環境のマルチスレッド対策。
+	- 8スレッド未満だと異なるNUMAに割り振られることがあり、パフォーマンス激減するのでその回避策。
+	- Upon changing the number of threads, make sure all threads are bound : https://github.com/official-stockfish/Stockfish/commit/1c50d8cbf554733c0db6ab423b413d75cc0c1928
+- gccだとconstexprをつけたところでエラーになっていたのを修正。
+- V4.82リリース
+	engine1 = YaneuraOu-2018-OtafukuV480.exe , eval = Apery20171111
+	engine2 = YaneuraOu-2018-OtafukuV482.exe , eval = Apery20171111
+	T1,b1000,435 - 25 - 540(44.62% R-37.56) win black : white = 49.33% : 50.67%
+	T1,b2000,440 - 31 - 499(46.86% R-21.86) win black : white = 54.42% : 45.58%
+	T1,b4000,209 - 19 - 232(47.39% R-18.14) win black : white = 51.93% : 48.07%
+	T1,b8000,86 - 12 - 112(43.43% R-45.89) win black : white = 46.97% : 53.03%
+	T2,b2000,93 - 11 - 126(42.47% R-52.76) win black : white = 55.71% : 44.29%
+	// 時間なくてこれだけしか計測できていないが、V4.80と比べて弱くはなさそうなのでこれをV4.82とする。
+
+
+■　2018/04/29
+
+- futility_marginの計算にimproving導入。
+- futility_marginのパラメーターの値、変更。143→172
+- ProbCutにimproving導入
+- ProbCutの指し手の試行回数を3回に制限
+- Singular Extensionのコード、少し整理
+- IIDの条件式単純化
+	- Simplifiy IID condition : https://github.com/official-stockfish/Stockfish/commit/d6252ef202f43d42d05b80145f3014da4d22863e
+- "PARAM_IID_MARGIN_ALPHA"削除
+- Singular Extensionのフラグ変数削除
+	- Simplify Singular Extension condition : https://github.com/official-stockfish/Stockfish/commit/0cfb653eeca1bc44b9d331498a9ccb3e9b97a9c1
+- 置換表をcallocではなくmallocで確保するように変更。
+	- Explicitly zero TT upon resize. : https://github.com/official-stockfish/Stockfish/commit/2ba47416cbdd5db2c7c79257072cd8675b61721f
+- shogi.hなどの定数、可能なところはconstexprに変更。0.2%ぐらい速くなったかも。(計測誤差？)
+	- Use constexpr when makes sense : https://github.com/official-stockfish/Stockfish/commit/28b6a457c24d9202ba43a6d6703221250f0f8749
+
+
+■　2018/04/28 V4.81 (V4.80から+R15～25程度)
+
+- stat_bonus 32倍するの忘れてた。これで元の強さぐらいになった。
+- 探索部に、Eloに関するコメント追加。(これはStockfish 9のソースコードのそのまま)
+- IIDでttValue代入していなかったの修正。IIDのparameter 256→128に変更。
+- fail lowのときにstatScoreをゼロにするように変更。
+- RazorMarginのパラメータ、Stockfish 9に合せた。
+
+
+■　2018/04/27
+
+- Stockfish 9にキャッチアップのために準備
+ - 旧エンジン(探索部とmove_picker)をsource/old_enginesにコピー。
+
+- C++14でstd::tr2を使用するとwaring C4996が出るので抑制。
+
+- Visual Studio用の2017GOKUのソリューションを削除
+- 使用するWindows SDKのバージョンを10.0.16299.0に変更。
+
+- move_pickerをStockfish 9に準拠。R100ぐらい弱くなった。原因究明中。
+- search()、変数を整理した。Stockfish 9に変数宣言をする場所を極力合わせた。
+
+
+■　2018/01/25
+
+- ONE_PLYが1以外の場合のinfo depth等を修正(tttakさん)
+
+- やねうら王2018になって、makebookコマンドが有効になっていなかったの修正。
+- Makefile、gccがデフォルトになっていたのclangに修正。
+
 
 ■　2018/01/12 V4.80
 
@@ -45,7 +983,7 @@
 - gensfen2018コマンド追加準備。(現状、非公開)
 
 
-■　2017/11/17 
+■　2017/11/17
 
 - evaluate_kpptの高速化(yuk-toさん) : https://github.com/yaneurao/YaneuraOu/pull/69
 - EVAL_MATERIALのときのcompute_eval()やコメントがおかしかったの修正。(tanuki-さん)
@@ -94,7 +1032,7 @@
 	- cf. https://github.com/yaneurao/YaneuraOu/pull/67
 - gensfenコマンドで生成されるファイルの分割保存のためのsave_everyオプション追加。
 	- AWSのspot instanceのterminate対策。
-	
+
 
 ■　2017/11/02
 

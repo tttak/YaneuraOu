@@ -4,11 +4,13 @@
 docs/
 source/
   engine/
-	2017-early-engine/          やねうら王2017 Ealryの探索部
-	local-game-server/          自動対局フレームワーク
+	yaneuraou-engine/           やねうら王2019 探索部
+	mate-engine/                詰将棋エンジン
 	user-engine/                ユーザーが独自のエンジンを作るときの作業用フォルダ
 						     
-  shogi.h/.cpp                  コンパイル時の設定や、各種構造体の定義。
+  config.h                      各種コンパイルオプションに基づき、configurationを行なう。
+
+  types.h/.cpp                  コンパイル時の設定や、各種構造体の定義。
   bitboard.h/.cpp               Bitboard(盤面の駒のある場所や、ある駒による利きなどを表現するのに使う)
   evaluate.h/.cpp               評価関数
   misc.h/.cpp                   バージョン情報など
@@ -24,7 +26,6 @@ source/
     all.h                       すべてのheaderをincludeする横着なheader
     bitop.h                     SSE、AVXの命令をsoftwareでemulationするためのマクロ群
 	book.h/cpp                  定跡関連の処理
-    config.h                    shogi.hで設定されたコンパイルオプションに基づき、configurationを行なう。
 	entering_king_win.cpp       宣言勝ち(入玉判定)
     key128.h                    128bit,256bitのhash key。(実験用)
     long_effect.h/.cpp          遠方駒による長い利きとBitboardなどへの変換子
@@ -60,18 +61,19 @@ http://yaneuraou.yaneu.com/
 
 ■　コンパイル方法
 
-Visual Studio 2017 Community Edition(無料で使えます)でビルド一発で実行ファイルが出来るはずです。
+
+Visual Studio 2019 Community Edition(無料で使えます)でビルド一発で実行ファイルが出来るはずです。
 
 
 ★　思考エンジンの種類の選択
 
 ビルドする思考エンジンの種類として、
 
-・やねうら王2017Early
+・やねうら王2019(評価関数としてKPPT , KPP_KKPT , NNUEの3つのなかから1つ選択)
 ・詰め将棋エンジン
-・連続自動対局フレームワーク
+・ユーザーエンジン
 
-のなかから選択することが出来ます。詳しくはshogi.hをご覧ください。
+のなかから選択することが出来ます。詳しくはconfig.hをご覧ください。
 
 そのときの開発中のエンジンがdefineされていることが多いのでビルドしたいエンジンを選択してください。
 
@@ -80,7 +82,7 @@ Visual Studio 2017 Community Edition(無料で使えます)でビルド一発で
 
 ★　AVX2非対応のCPU用の実行ファイルの作り方。
 
-shogi.hで
+config.hで
 #define USE_AVX2
 をコメントアウトします。
 
@@ -98,7 +100,7 @@ AVX2用のコードを生成しますので、Visual Studioで以下のところ
 ★　SSE4.2非対応のCPU用の実行ファイルの作り方
 
 SSE4.2非対応ということはAVX2も非対応のはずなので、上のAVX2非対応のときの設定を行ない、
-さらに、shogi.hで
+さらに、config.hで
 #define USE_SSE42
 をコメントアウトします。
 
@@ -117,7 +119,7 @@ SSE4.2非対応ということはAVX2も非対応のはずなので、上のAVX2
 100MBなら大丈夫のようです。
 
 
-★　長手数の協力詰めで探索深さが深くなると実行中に落ちる。
+★　長手数の協力詰めで探索深さが深くなると実行中に落ちる問題。
 
 実行時のスタックが足りないためだと思います。
 
@@ -129,66 +131,28 @@ SSE4.2非対応ということはAVX2も非対応のはずなので、上のAVX2
 100MBなら大丈夫のようです。
 
 
+★ Makefileを使ったmake方法(この方法でUbuntuなどでもビルドできます)
+
+例) MSYS2でのmakeコマンドでのビルド
+make clean tournament TARGET_CPU=AVX2 YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE
+make -j8 tournament TARGET_CPU=AVX2 COMPILER=g++ YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE ENGINE_NAME="YaneuraOu\(tournament\)"
+
+	・TARGET_CPUでAVX2 ,SSE42 などターゲットCPUを指定します。
+	・YANEURAOU_EDITIONでビルドするエンジン名を指定します。
+	・ENGINE_NAMEでビルドされたときのエンジン名(表示名)を指定できます。
+		※　複雑な文字列の場合、ダブルコーテーションで囲んだほうが良いというのと、( )の手前では \ でのエスケープが必要です。
+	・ビルドターゲットはtournament(トーナメントモード用)、evallearn(評価関数の学習用)、normal(普通のもの)、gensfen(教師生成用。現状、非公開)から選びます。
+	詳しくはMakefileのなかを見てください。
+	
+
 ■  ShogiGUIの検討モードで使う方法
 
 ShogiGUIの検討モードで「定跡を使用する」のオプションはオフにします。
 (ここをオンにするとShogiGUI側の定跡が使用されます。)
 
-やねうら王2016Midでは、定跡にhitしたときにその指し手を" multipv "という文字列を付けて
-返すようにしています。ゆえに、ShogiGUIではこれがうまく処理されます。
-候補手を増やしたときにきちんと検討ウィンドウのところに表示されるはずです。
+やねうら王では、定跡にhitしたときにその指し手を" multipv "という文字列を付けて返すようにしています。
+ゆえに、ShogiGUIではこれがうまく処理されます。候補手を増やしたときにきちんと検討ウィンドウのところに表示されるはずです。
 
-
-■　連続自動対局フレームワークの使い方
-
-shogi.hの
-#define LOCAL_GAME_SERVER
-を有効にしてビルド。
-
-この実行ファイルと同じフォルダに次の2つのファイルを配置。
-
-  engine-config1.txt : 1つ目の思考エンジン
-  engine-config2.txt : 2つ目の思考エンジン
-  
-    1行目にengineの実行ファイル名(同じフォルダに配置)
-    2行目に思考時のコマンド
-    3行目以降にsetoption等、初期化時に思考エンジンに送りたいコマンドを書く。
-
-  例)
-    test.exe
-    go btime 100 wtime 100 byoyomi 0
-    setoption name Threads value 1
-    setoption name Hash value 1024
-
-  次に
-  goコマンドを打つ。(実行中、stopは利かない)
-
-	  O : engine1勝ち
-	  X : engine1負け
-	  . : 引き分け
-
-  ※　engine/local-game-server/local-game-server.cppで ONE_LINE_OUTPUT_MODE がdefineされているときは、
-		win,sfenで終局の局面図
-		lose,sfenで終局の局面図
-		draw,sfenで終局の局面図
-	という表記に変わる。
-    
-  対局回数の指定など)
-    go btime [対局回数] wtime [定跡の手数] byoyomi [予約]
-
-    定跡はbook.sfenとしてsfen形式のファイルを与える。1行に1局が書かれているものとする。
-    このなかからランダムに1行が選ばれてその手数は上のwtimeのところで指定した手数まで進められる。
-    デフォルトでは対局回数は100回。定跡の手数は32手目から。
-
-　コマンドラインから入力した文字列を連結して、USIコマンドとして実行する機能があるので、
-　これを用いて、次のような.batファイルを作ってそれを実行すれば連続自己対局が簡単に開始できる。
-
-	> local-game-server.exe go btime 500
-
-	例えば、
-	setoption name Threads value 6
-	のようにして実行すると6スレッド(×2プロセス)が起動して、6局並列で対局が進行する。
-	btimeで指定した数に達すると、対局中のものは打ち切られる。
 
 
 ■　定跡の作り方
@@ -220,6 +184,17 @@ shogi.hの
 	意味をなさないので、エンジンのバージョンを100倍したもの(V3.21なら321)を記入してあります。
 	これにより、「古いエンジンで思考させた指し手は採用しない」などの処理を行うことが出来るようになります。
 
+	補足)
+	ファイル形式はASCIIとする。BOMつきutf-8、将来的には対応させるかも知れないが現状やねうら王は対応していない。
+
+	参考)
+
+	将棋ソフト用の標準定跡ファイルフォーマットの提案
+	http://yaneuraou.yaneu.com/2016/02/05/%E5%B0%86%E6%A3%8B%E3%82%BD%E3%83%95%E3%83%88%E7%94%A8%E3%81%AE%E6%A8%99%E6%BA%96%E5%AE%9A%E8%B7%A1%E3%83%95%E3%82%A1%E3%82%A4%E3%83%AB%E3%83%95%E3%82%A9%E3%83%BC%E3%83%9E%E3%83%83%E3%83%88%E3%81%AE/
+	
+	やねうら王アップデート！テラショック定跡の生成に対応しました
+	http://yaneuraou.yaneu.com/2019/05/28/%E3%82%84%E3%81%AD%E3%81%86%E3%82%89%E7%8E%8B%E3%82%A2%E3%83%83%E3%83%97%E3%83%87%E3%83%BC%E3%83%88%EF%BC%81%E3%83%86%E3%83%A9%E3%82%B7%E3%83%A7%E3%83%83%E3%82%AF%E5%AE%9A%E8%B7%A1%E3%81%AE%E7%94%9F/
+
 	
 > makebook from_sfen book.sfen standard_book.db moves 16
 	※　	やねうら王2017Earlyなど、この機能に対応している思考エンジンが必要。
@@ -243,7 +218,9 @@ floodgateのよさ気な棋譜をsfenに変換してこのコマンドで定跡�
 
 
 > makebook think 2016.sfen yaneura_book.db moves 16 depth 32
-	※　	やねうら王2017Earlyなど、この機能に対応している思考エンジンが必要。
+	// nodes 100000000 のように、探索node数を指定することもできる。
+
+	※　	やねうら王2018 Otafukuなど、この機能に対応している思考エンジンが必要。
 
 	2016.sfenという棋譜を読みこみ、その16手目までをdepth 32で思考させて、
 	そのときの上位3手を定跡ファイルに書き出す。
@@ -256,6 +233,7 @@ floodgateのよさ気な棋譜をsfenに変換してこのコマンドで定跡�
 	中断するときはこの'S'マークが出たのを確認してから終了させると良い。
 	保存中に終了させるとファイルが破損する可能性がある。
 	前回から新たな指し手が追加されていないときは's'(小文字)を表示して、ファイルには書き出さない。
+	・Contemptの値は無視される。(0だとみなされる)
 
 	例)
 	Hashメモリ4096MB、スレッド数8(それぞれのスレッドが1局面ずつ担当して検討)、MultiPV 5(それぞれの局面で候補手5手書き出し)、
@@ -303,6 +281,71 @@ floodgateのよさ気な棋譜をsfenに変換してこのコマンドで定跡�
 
 	定跡をメモリに丸読みしたくないときには(BookOnTheFly機能)、並び変わっていないといけない。
 	(sfen文字列順でソートされていないとバイナリサーチが出来ないため。)
+
+	※　このコマンドでsortしなくとも、mergeコマンドなど、定跡DBファイルの書き出し時には
+		sortを強制するように変更しました。(V4.87以降)
+
+> makebook build_tree read_book.db write_book.db
+
+	read_book.dbには、thinkコマンドで実戦で出現した局面に評価値がついているものとして、
+	leaf nodeについている評価値を使ってmin-max探索のようなことをして、それぞれの局面での最善手を
+	write_book.dbに書き出す機能。
+
+> makebook build_tree read_book.db write_book.db black_contempt 50 white_contempt 150
+
+	build_treeで千日手に至るときにそのときのスコアを先手・後手個別に設定できる。
+	Optionのcontemptと同じ。black_contempt = 50を指定すると先手の千日手時のスコアを-50とみなす。
+
+
+> makebook extend_tree read_book.db read_sfen.txt write_sfen.txt
+
+	read_book.dbの定跡に対して、read_sfen.txtのsfenの局面から開始して延長する枝をwrite_sfen.txtに書き出します。
+	read_sfen.txtの局面から、評価値が先手で-50以上、後手で-150以上の値がついている枝だけを延長していきます。
+	
+	ここで書き出されたsfenファイルを、makebook thinkコマンドで思考させるのを繰り返すと定跡ツリーが成長していきます。
+
+	※　read_sfen.txtにはこの延長を行う開始局面を複数指定できます。(わからなければ、"startpos"とだけ書いたテキストを用意すれば、
+	　平手の開始局面からになるのでそれで問題ないはずです。)　"startpos moves.."の形で複数の局面を指定します。
+	※　"sfen ..."や、"sfen ... moves ..."のような形式で指定することもできます。
+
+> makebook extend_tree read_book.db read_sfen.txt write_sfen.txt black_eval_limit -200 white_eval_limit -300
+
+	extend_treeのときに展開する枝の評価値の下限を先手/後手個別に指定できます。
+
+> makebook extend_tree read_book.db read_sfen.txt write_sfen.txt extend_range -1 1
+
+	extend_rangeを指定すると、その範囲のleaf node(末端の局面)の候補手だけを延長対象とする。
+	(MultiPVで思考させ複数の指し手が登録されている場合、このextend_rangeの範囲内の候補手で進めた局面だけが延長される)
+	extend_range -1 1 と指定したならば、leaf nodeでextend_treeの引き分けのスコア(-1,0,+1)の局面だけを延長する。
+	// やねうら王のV4.84以降だとmakebook thinkのときのContempt = 0なので引き分けのスコアは0のはず。
+
+	(千日手局面に到達するまでの手順がbook上にないとbuild_treeコマンドのときに千日手が検出できず、build_treeのコマンドで指定している
+	black_contempt/white_contemptの値が千日手手順の評価値として反映されないため)
+
+	extend_rangeとblack_eval_limit,white_eval_limitの併用は可能です。
+	(leaf以外の局面で、そこを辿るかどうかをblack_eval_limit/white_eval_limitで制限しつつ、leafで延長するところをextend_rangeで制限する)
+
+
+> makebook endless_extend_tree book/user_book1.db book/kadai_sfen.txt book/think_sfen.txt depth 8 startmoves 1 moves 32 loop 100 black_eval_limit -50 white_eval_limit -150 nodes 1000000000
+
+	makebook extend_treeとthinkを合体させたコマンド。think_sfen.txtのところは、思考対象局面を書き出す一時ファイル。
+	このときbook/kadai_sfen.txtに "startpos" とだけ書いておけば、平手の初期局面が課題局面になるので、そこから自動的に定跡が掘られていきます。
+	loopの回数だけ繰り返されます。
+
+	max_game_plyの指定も可能。
+
+	検討用の局面をbook/kadai_sfen.txtに入れて、そこから定跡を掘るのに使えるかと思います。
+
+	例)
+	思考エンジンを起動して、
+		Hash 4096
+		Threads 8
+		makebook endless_extend_tree book/user_book1.db book/kadai_sfen.txt book/think_sfen.txt depth 36 startmoves 1 moves 70 loop 100 black_eval_limit -50 white_eval_limit -150 nodes 1000000000
+	みたいな感じで。
+
+> makebook endless_extend_tree book/user_book1.db book/kadai_sfen.txt book/think_sfen.txt depth 8 startmoves 1 moves 32 loop 100 black_eval_limit -50 white_eval_limit -150 nodes 1000000000 extend_range -1 1
+
+	endless_extendの千日手局面だけを延長する版。
 
 
 
@@ -383,10 +426,10 @@ NarrowBookは必ずオフにする必要があります。
 
 ■　対局・検討時の推奨設定
 
-例) やねうら王2017Earlyの場合
+例) やねうら王2019の場合
 
 スレッド数(Threads)                           : 論理コア数に(BIOSの設定でHyperThreadingを有効にしておくこと)
-置換表サイズ(Hash)                            : 物理メモリの半分ぐらいに。2のべき乗のほうが良い。例) 16GBのRAMなら8192[MB]を指定
+置換表サイズ(Hash)                            : 空き物理メモリを見ながら大きめに。例) 16GBのRAMなら14000[MB]ぐらいを指定
 最小思考時間[ms](MinimumThinkingTime)         : 1000。ただし、2秒以内に指すと計測1秒になるルールで指すなら2000。
 　　　　　　　　　　　　　　　　　　　　　　　　他のソフトと対局させるときは、そのソフトの最小思考時間も合わせておかないと公平ではない。
 出現確率の低い定跡を採用しない(NarrowBook)    : オフ(False)
@@ -396,22 +439,6 @@ NarrowBookは必ずオフにする必要があります。
 定跡の第一候補手との評価値の差（BookEvalDiff）:  0
 
 
-■　gcc/clangでのbuild
-
-Msys2環境下のgcc/clangで
-
-	gccの場合
-	> make avx2	(AVX2命令を使うときのbuild)
-	
-	clangの場合は、makefileのほうでコンパイラとしてclangを指定してください。
-
-とすればbuild出来て、これをWindows用の実行ファイルとして使えるところまでは確認しました。
-Ubuntu16.04、Mac OSでbuild出来ることも確認しました。
-
-やねうら王プロジェクトでは、local-game-server以外はWindows環境に依存するコードは混じっておらず、
-標準的なC++11/c++14コンパイラでコンパイル出来るはずです。
-
-	
 
 ■　教師局面からの学習のOpenMP対応について
 
@@ -426,18 +453,12 @@ weight配列の更新が並列化されるので、many coreでもmini batch siz
 
 この機能は、思考エンジン設定でオン/オフ切り替えられます。USI option名は"EvalShare"です。
 異種評価関数との自己対局のときにこの設定で引っかかる人が後を絶たないのでデフォルトでオフになっています。
+→　デフォルトでオンに変更になりました。(V4.90～)
 
 この機能をオンにすると、10個やねうら王を起動したとしても評価関数は共用されているので、1つ分しかメモリを
 消費しません。
 
-やねうら王のバージョンナンバーを識別子に使っていますので、異なるバージョンナンバーを持つやねうら王とは
-評価関数を共用しません。
-
-共有する条件は、YaneuraOu + やねうら王のバージョンナンバー + EvalDir名 が合致したときです。
-評価関数の配置しているフォルダの絶対pathが一致したときではないので注意してください。
-                                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-よくあるミスとして、EvalDirをevalフォルダにしている2つのやねうら王エンジンで対局させてしまうケースがあります。
-この場合、EvalShareがオンになっていると、評価関数が共有されてしまいます。
+共有する条件は、評価関数の格納フォルダ(エンジンオプションの"EvalDir"で決まる)のフルパス名が合致したときです。
 
 また、複数起動したとして、最初にisreadyコマンドを送った時点でそのやねうら王に評価関数ファイルを読み込みます。
 以降に立ち上げたやねうら王は、isreadyコマンドを送った時点で、1つ目にisreadyを送られた
@@ -451,19 +472,26 @@ isreadyコマンドに対して評価関数ファイルを読み込むときに�
 	　　　　　　　　　　　　　　　　その共有メモリ上にある評価関数パラメーターを利用させてもらうことにした。
 
 
-■　ShogiGUIの検討/棋譜解析モードで読み筋が途中までしか出力されない問題
-
-やねうら王、2017Early以降では、思考エンジン設定でPvIntervalを0にすればこの問題は解決されます。
-また、(思考時間無制限の)検討モードは
-	go infinite
-で思考が開始されるはずで、このとき、PvIntervalを強制的に0にみなすようになっています。
-
 
 ■　エンジン名の偽装方法について
 
 GUIで連続対局をさせる場合など、エンジン名として任意の名前をつけたいことがあります。
 思考エンジンのあるフォルダに"engine_name.txt"というファイルを用意しておけば、
 そこに書かれている1行目の内容をエンジン名、2行目をエンジン作者名としてGUIに返します。
+
+
+■　エンジンオプションのデフォルト値の変更
+
+"usi"に対して返すオプションリストのオプションのデフォルト値を変更する機能
+カレントフォルダに"engine_options.txt"というファイルを配置して、
+ここにOptionを構築するための文字列を書きます。(この"option"で始まる文字列は、
+"usi"に対して応答として返している文字列なので、コマンドプロンプト上でエンジンを
+実行して、"usi"とタイプして、返ってきた文字列一覧をコピペして編集すると良い)
+
+例)
+option name EvalDir type string default ../eval/YaneuraOu_2018
+option name EvalShare type check default true
+option name BookDir type string default ../book
 
 
 ■　Aperyの定跡DB / まふ定跡の読み込みについて
@@ -477,9 +505,19 @@ book/book.bin
 に定跡ファイルを配置すれば、思考エンジン設定の定跡として「book.bin(Apery用定跡DB)」を選択することで読み込めます。
 
 
+■　ShogiGUIの検討/棋譜解析モードで読み筋が途中のdepthからしか出力されない問題
+
+
+思考エンジン設定でPvIntervalを0にすればこの問題は解決されます。
+また、(思考時間無制限の)検討モードは
+	go infinite
+で思考が開始されるはずで、このとき、PvIntervalを強制的に0にみなすようになっています。
+
+
 ■　検討モード用オプションについて
 
-やねうら王2017Early以降では、思考エンジンのオプションとしてConsiderationModeを追加しました。
+思考エンジンのオプションとしてConsiderationModeを追加しました。
+
 これはShogiGUIなどの検討モードで用いるためのもので、このオプションをオンにすると中途半端な読み筋が
 出力されることが減ります。
 
@@ -555,3 +593,49 @@ Msys2では、たまさんの情報によると…。
   ２．（LLVMをインストールしたディレクトリ）/libにある「libomp.lib」をlibgomp.aが配置されているディレクトリに「libomp.a」としてコピーする→これがlibgomp.aの代わりになる
   ３．exeの格納ディレクトリと同じところに（LLVMをインストールしたディレクトリ）/bin/libomp.dllをコピーする
   これで動きます。が、libomp.dllを含めて配布するのは何かと問題になりそうです。あくまで解決の参考としてください。
+
+
+■　MSYS2上でNNUEのAVX2以外の評価関数の実行ファイルがビルドできない件
+
+toolchainの問題かと思います。例えば以下のようにすると32bit NO SSE版がビルドできるようです。
+
+(MSYS2 MinGW 32-bit上で)
+$ pacman -S mingw-w64-i686-clang mingw-w64-i686-toolchain
+$ pacman -Syuu
+$ mingw32-make -j8 nosse YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE 2>&1 | tee nnue_nosse.log｀
+
+64bit版
+$ pacman -S mingw-w64-x86_64-clang mingw-w64-x86_64-toolchain
+
+注意点)
+makefileを使ってcleanするときに、.oファイルを削除しないといけないが、そのときにYANEURAOU_EDITIONを指定していないと
+コンパイル対象のソースファイルとしてNNUE用の評価関数のソースコードファイルが追加されず、.oファイルが全部消えないので
+コンパイルに失敗することがある。cleanするときは、この点に注意すること。
+
+mingw32-make clean YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE
+
+
+■　MSYS2上でNNUE型の評価関数の実行ファイルがビルドできない件
+
+OpenBLASが必要なので、まずこれをpacmanで入れます。
+
+32bit版(32bit版のビルド時は、OpenBLASを用いていないので実はこの操作は不要)
+$ pacman -S mingw-w64-i686-clang mingw-w64-i686-toolchain mingw-w64-i686-openblas
+
+64bit版
+$ pacman -S mingw-w64-x86_64-clang mingw-w64-x86_64-toolchain mingw-w64-x86_64-openblas
+
+
+あとはMakefileでincludeフォルダを以下のところで指定していますが、これが違うフォルダであるなら適宜変更が必要となります。
+
+        ifeq ($(MSYSTEM),MINGW64)
+            BLAS += -I$(shell cygpath -aw /mingw64/include/OpenBLAS)
+        endif
+
+※　この部分は、MINGW64環境内でこうすると絶対パスが帰ってくるのを利用しています
+	$ cygpath -aw /mingw64/include/OpenBLAS
+	C:\msys64\mingw64\include\OpenBLAS
+
+※ pacmanでOpenBlasをインストールしたときに
+	Set the environment variable OPENBLAS_NUM_THREADS to the number of threads to use.
+と出ています。実行時に環境変数OPENBLAS_NUM_THREADSに使いたいスレッド数を設定すべき？

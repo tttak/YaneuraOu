@@ -1,5 +1,4 @@
-﻿#include "../../shogi.h"
-#include "book.h"
+﻿#include "book.h"
 #include "../../position.h"
 #include "../../misc.h"
 #include "../../search.h"
@@ -8,16 +7,21 @@
 #include "../../tt.h"
 #include "apery_book.h"
 
-#include <fstream>
 #include <sstream>
 #include <unordered_set>
-#include <iomanip>
+#include <iomanip>		// std::setprecision()
 
 using namespace std;
 using std::cout;
 
 namespace Book
 {
+	std::ostream& operator<<(std::ostream& os, BookPos c)
+	{
+		os << "bestMove " << c.bestMove << " , nextMove " << c.nextMove << " , value " << c.value << " , depth " << c.depth;
+		return os;
+	}
+
 	// Aperyの指し手の変換。
 	Move convert_move_from_apery(uint16_t apery_move) {
 		const uint16_t to = apery_move & 0x7f;
@@ -34,26 +38,27 @@ namespace Book
 		return make_move(static_cast<Square>(from), static_cast<Square>(to));
 	};
 
-#ifdef ENABLE_MAKEBOOK_CMD
+#if defined (ENABLE_MAKEBOOK_CMD)
 	// ----------------------------------
 	// USI拡張コマンド "makebook"(定跡作成)
 	// ----------------------------------
 
-	// 局面を与えて、その局面で思考させるために、やねうら王2017Earlyが必要。
-#if defined(EVAL_LEARN) && (defined(YANEURAOU_2017_EARLY_ENGINE) || defined(YANEURAOU_2017_GOKU_ENGINE))
+	// 局面を与えて、その局面で思考させるために、やねうら王2018が必要。
+#if defined(EVAL_LEARN) && defined(YANEURAOU_ENGINE)
 
 	struct MultiThinkBook : public MultiThink
 	{
-		MultiThinkBook(int search_depth_, MemoryBook & book_)
-			: search_depth(search_depth_), book(book_), appended(false) {}
+		MultiThinkBook(MemoryBook & book_ , int search_depth_, u64 nodes_ = 0)
+			: search_depth(search_depth_), book(book_), appended(false) , search_nodes(nodes_) {}
 
 		virtual void thread_worker(size_t thread_id);
 
 		// 定跡を作るために思考する局面
 		vector<string> sfens;
 
-		// 定跡を作るときの通常探索の探索深さ
+		// 定跡を作るときの通常探索の探索深さと探索ノード数
 		int search_depth;
+		u64 search_nodes;
 
 		// メモリ上の定跡ファイル(ここに追加していく)
 		MemoryBook& book;
@@ -61,7 +66,6 @@ namespace Book
 		// 前回から新たな指し手が追加されたかどうかのフラグ。
 		bool appended;
 	};
-
 
 	//  thread_id    = 0..Threads.size()-1
 	//  search_depth = 通常探索の探索深さ
@@ -86,7 +90,7 @@ namespace Book
 			// depth手読みの評価値とPV(最善応手列)を取得。
 			// 内部的にはLearner::search()を呼び出す。
 			// Learner::search()は、現在のOptions["MultiPV"]の値に従い、MultiPVで思考することが保証されている。
-			Learner::search(pos, search_depth , multi_pv);
+			Learner::search(pos, search_depth , multi_pv , search_nodes);
 
 			// MultiPVで局面を足す、的な
 			size_t m = std::min(multi_pv, th->rootMoves.size());
@@ -121,11 +125,14 @@ namespace Book
 			// 思考、極めて遅いのでログにタイムスタンプを出力して残しておいたほうが良いのでは…。
 			// id番号(連番)とthread idと現在の時刻を出力する。
 			sync_cout << "[" << get_done_count() << "/" << get_loop_max() << ":" << thread_id << "] "
-				      << now_string() << " : " << sfen << sync_endl;
+				      << Tools::now_string() << " : " << sfen << sync_endl;
 #endif
 		}
 	}
 #endif
+
+	// 定跡生成コマンド2019年度版。makebook2019.cppで定義されている。
+	int makebook2019(Position& pos, istringstream& is, const string& token);
 
 	// フォーマット等についてはdoc/解説.txt を見ること。
 	void makebook_cmd(Position& pos, istringstream& is)
@@ -143,14 +150,26 @@ namespace Book
 		bool book_sort = token == "sort";
 		// 定跡の変換
 		bool convert_from_apery = token == "convert_from_apery";
+		
+		// 評価関数を読み込まないとPositionのset()が出来ないのでis_ready()の呼び出しが必要。
+		// ただし、このときに定跡ファイルを読み込まれると読み込みに時間がかかって嫌なので一時的にno_bookに変更しておく。
+		auto original_book_file = Options["BookFile"];
+		Options["BookFile"] = string("no_book");
+		SCOPE_EXIT( Options["BookFile"] = original_book_file; );
 
-#if !(defined(EVAL_LEARN) && (defined(YANEURAOU_2017_EARLY_ENGINE) || defined(YANEURAOU_2017_GOKU_ENGINE)))
+		is_ready();
+
+#if !(defined(EVAL_LEARN) && defined(YANEURAOU_ENGINE))
 		if (from_thinking)
 		{
-			cout << "Error!:define EVAL_LEARN and YANEURAOU_2017_EARLY_ENGINE/YANEURAOU_2017_GOKU_ENGINE " << endl;
+			cout << "Error!:define EVAL_LEARN and YANEURAOU_ENGINE" << endl;
 			return;
 		}
 #endif
+
+		// 2019年以降に作ったmakebook拡張コマンド
+		if (makebook2019(pos, is, token))
+			return;
 
 		if (from_sfen || from_thinking)
 		{
@@ -179,14 +198,15 @@ namespace Book
 			}
 
 			// 定跡ファイル名
-			// Option["book_file"]ではなく、ここで指定したものが処理対象である。
+			// Option["BookFile"]ではなく、ここで指定したものが処理対象である。
 			string book_name;
 			is >> book_name;
 
-			// 開始手数、終了手数、探索深さ
+			// 開始手数、終了手数、探索深さ、node数の指定
 			int start_moves = 1;
 			int moves = 16;
 			int depth = 24;
+			u64 nodes = 0;
 
 			// 分散生成用。
 			// 2/7なら、7個に分けて分散生成するときの2台目のPCの意味。
@@ -208,6 +228,8 @@ namespace Book
 					is >> moves;
 				else if (token == "depth")
 					is >> depth;
+				else if (token == "nodes")
+					is >> nodes;
 				else if (from_thinking && token == "startmoves")
 					is >> start_moves;
 				else if (from_thinking && token == "cluster")
@@ -230,6 +252,7 @@ namespace Book
 			if (from_thinking)
 				cout << "read sfen moves from " << start_moves << " to " << moves
 				<< " , depth = " << depth
+				<< " , nodes = " << nodes
 				<< " , cluster = " << cluster_id << "/" << cluster_num << endl;
 
 			// 解析対象とするsfen集合。
@@ -244,7 +267,7 @@ namespace Book
 			if (! bw_files)
 			{
 				vector<string> tmp_sfens;
-				read_all_lines(sfen_file_name[0], tmp_sfens);
+				FileOperator::ReadAllLines(sfen_file_name[0], tmp_sfens);
 
 				// こちらは先後、どちらの手番でも解析対象とするのでCOLOR_NBを指定しておく。
 				for (auto& sfen : tmp_sfens)
@@ -263,7 +286,7 @@ namespace Book
 						continue;
 
 					vector<string> tmp_sfens;
-					read_all_lines(filename, tmp_sfens);
+					FileOperator::ReadAllLines(filename, tmp_sfens);
 					for (auto& sfen : tmp_sfens)
 						sfens.push_back(SfenAndColor(sfen, c));
 				}
@@ -277,16 +300,13 @@ namespace Book
 			{
 				cout << "read book..";
 				// 初回はファイルがないので読み込みに失敗するが無視して続行。
-				if (book.read_book(book_name) != 0)
+				if (book.read_book(book_name).is_not_ok())
 				{
 					cout << "..failed but , create new file." << endl;
 				}
 				else
 					cout << "..done" << endl;
 			}
-
-			// この時点で評価関数を読み込まないとKPPTはPositionのset()が出来ないので…。
-			is_ready();
 
 			cout << "parse..";
 
@@ -369,7 +389,8 @@ namespace Book
 				typedef pair<string, bool /*is_valid*/> SfenAndBool;
 				vector<SfenAndBool> sf;		// 初手から(moves+0)手までのsfen文字列格納用
 
-				StateInfo si[MAX_PLY];
+				// これより長い棋譜、食わせない＆思考対象としないやろ
+				std::vector<StateInfo> states(1024);
 
 				// 変数sfに解析対象局面としてpush_backする。
 				// ただし、
@@ -399,7 +420,7 @@ namespace Book
 						break;
 					}
 
-					Move move = move_from_usi(pos, token);
+					Move move = USI::to_move(pos, token);
 					// illigal moveであるとMOVE_NONEが返る。
 					if (move == MOVE_NONE)
 					{
@@ -414,7 +435,7 @@ namespace Book
 					append_to_sf();
 					m.push_back(move);
 
-					pos.do_move(move, si[i]);
+					pos.do_move(move, states[i]);
 				}
 
 				for (int i = 0; i < (int)sf.size() - (from_sfen ? 1 : 0); ++i)
@@ -447,7 +468,7 @@ namespace Book
 			}
 			cout << "done." << endl;
 
-#if defined(EVAL_LEARN) && (defined(YANEURAOU_2017_EARLY_ENGINE) || defined(YANEURAOU_2017_GOKU_ENGINE))
+#if defined(EVAL_LEARN) && defined(YANEURAOU_ENGINE)
 
 			if (from_thinking)
 			{
@@ -456,14 +477,16 @@ namespace Book
 				size_t multi_pv = (size_t)Options["MultiPV"];
 
 				// 思考する局面をsfensに突っ込んで、この局面数をg_loop_maxに代入しておき、この回数だけ思考する。
-				MultiThinkBook multi_think(depth, book);
+				MultiThinkBook multi_think(book , depth, nodes);
 
 				auto& sfens_ = multi_think.sfens;
 				for (auto& s : thinking_sfens)
 				{
-
 					// この局面のいま格納されているデータを比較して、この局面を再考すべきか判断する。
 					auto it = book.book_body.find(s);
+
+					// →　手数違いの同一局面がある場合、こちらのほうが手数が大きいなら思考しても無駄なのだが…。
+					// その局面の情報は、write_book()で書き出されないのでまあいいか…。
 
 					// MemoryBookにエントリーが存在しないなら無条件で、この局面について思考して良い。
 					if (it == book.book_body.end())
@@ -514,9 +537,15 @@ namespace Book
 					// 前回書き出し時からレコードが追加された？
 					if (multi_think.appended)
 					{
-						sync_cout << "Save start : " << now_string() << sync_endl;
-						book.write_book(book_name);
-						sync_cout << "Save done  : " << now_string() << sync_endl;
+						// 連番つけて保存する。
+						//　(いつ中断してもファイルが残っているように)
+						static int book_number = 1;
+						string write_book_name = book_name + "-" + to_string(book_number++) + ".db";
+
+						sync_cout << "Save start : " << Tools::now_string() << " , book_name = " << write_book_name << sync_endl;
+
+						book.write_book(write_book_name);
+						sync_cout << "Save done  : " << Tools::now_string() << sync_endl;
 						multi_think.appended = false;
 					}
 					else {
@@ -527,9 +556,7 @@ namespace Book
 					}
 
 					// 置換表が同じ世代で埋め尽くされるとまずいのでこのタイミングで世代カウンターを足しておく。
-					//TT.new_search();
-
-					// →　EVAL_LEARNモードなら、Learner::new_search()のほうで行っているのでここではやらなくて良い。
+					TT.new_search();
 
 				};
 
@@ -539,10 +566,7 @@ namespace Book
 
 #endif
 
-			cout << "write..";
 			book.write_book(book_name);
-			cout << "finished." << endl;
-
 		}
 		else if (book_merge) {
 
@@ -558,7 +582,7 @@ namespace Book
 			cout << "book merge from " << book_name[0] << " and " << book_name[1] << " to " << book_name[2] << endl;
 			for (int i = 0; i < 2; ++i)
 			{
-				if (book[i].read_book(book_name[i]) != 0)
+				if (book[i].read_book(book_name[i]).is_not_ok())
 					return;
 			}
 
@@ -620,9 +644,7 @@ namespace Book
 			cout << "same nodes = " << same_nodes
 				<< " , different nodes =  " << diffrent_nodes1 << " + " << diffrent_nodes2 << endl;
 
-			cout << "write..";
 			book[2].write_book(book_name[2]);
-			cout << "..done!" << endl;
 
 		}
 		else if (book_sort) {
@@ -633,9 +655,7 @@ namespace Book
 			cout << "book sort from " << book_src << " , write to " << book_dst << endl;
 			book.read_book(book_src);
 
-			cout << "write..";
-			book.write_book(book_dst, true);
-			cout << "..done!" << endl;
+			book.write_book(book_dst);
 
 		}
 		else if (convert_from_apery) {
@@ -645,10 +665,7 @@ namespace Book
 			cout << "convert apery book from " << book_src << " , write to " << book_dst << endl;
 			book.read_apery_book(book_src);
 
-			cout << "write..";
-			book.write_book(book_dst, true);
-			cout << "..done!" << endl;
-
+			book.write_book(book_dst);
 		}
 		else {
 			cout << "usage" << endl;
@@ -657,38 +674,26 @@ namespace Book
 			cout << "> makebook merge book_src1.db book_src2.db book_merged.db" << endl;
 			cout << "> makebook sort book_src.db book_sorted.db" << endl;
 			cout << "> makebook convert_from_apery book_src.bin book_converted.db" << endl;
+			cout << "> makebook build_tree book2019.db user_book1.db" << endl;
 		}
 	}
+
 #endif
 
 	// ----------------------------------
 	//			MemoryBook
 	// ----------------------------------
 
-	// sfen文字列から末尾のゴミを取り除いて返す。
-	// ios::binaryでopenした場合などには'\r'なども入っていると思われる。
-	string trim_sfen(string sfen)
+	static std::unique_ptr<AperyBook> apery_book;
+	static const constexpr char* kAperyBookName = "book.bin";
+
+	std::string MemoryBook::trim(std::string input)
 	{
-		string s = sfen;
-		int cur = (int)s.length() - 1;
-		while (cur >= 0)
-		{
-			char c = s[cur];
-			// 改行文字、スペース、数字(これはgame ply)ではないならループを抜ける。
-			// これらの文字が出現しなくなるまで末尾を切り詰める。
-			if (c != '\r' && c != '\n' && c != ' ' && !('0' <= c && c <= '9'))
-				break;
-			cur--;
-		}
-		s.resize((int)(cur + 1));
-		return s;
+		return Options["IgnoreBookPly"] ? StringExtension::trim_number(input) : StringExtension::trim(input);
 	}
 
-	static std::unique_ptr<AperyBook> apery_book;
-	static const constexpr char* kAperyBookName = "book/book.bin";
-
 	// 定跡ファイルの読み込み(book.db)など。
-	int MemoryBook::read_book(const std::string& filename, bool on_the_fly_)
+	Tools::Result MemoryBook::read_book(const std::string& filename, bool on_the_fly_)
 	{
 		// 読み込み済であるかの判定
 		// 一度read_book()が呼び出されたなら、そのときに読み込んだ定跡ファイル名が
@@ -698,25 +703,35 @@ namespace Book
 		// 　ならないので、ここで終了してしまってはまずい。また逆に、前回はon_the_fly == falseだったものが
 		// 　今回はtrueになった場合、本来ならメモリにすでに読み込まれているのだから読み直しは必要ないが、
 		//　 何らかの目的で変更したのであろうから、この場合もきちんと反映しないとまずい。)
-		if (book_name == filename && this->on_the_fly == on_the_fly_)
-			return 0;
+		bool ignore_book_ply_ = Options["IgnoreBookPly"];
+		if (this->book_name == filename && this->on_the_fly == on_the_fly_ && this->ignoreBookPly == ignore_book_ply_)
+			return Tools::Result::Ok();
+
+		// 一度このクラスのメンバーが保持しているファイル名はクリアする。(何も読み込んでいない状態になるので)
+		this->book_name = "";
+		this->pure_book_name = "";
 
 		// 別のファイルを開こうとしているので前回メモリに丸読みした定跡をクリアしておかないといけない。
 		book_body.clear();
 		this->on_the_fly = false;
+		this->ignoreBookPly = ignore_book_ply_;
+
+		// フォルダ名を取り去ったものが"no_book"(定跡なし)もしくは"book.bin"(Aperyの定跡ファイル)であるかを判定する。
+		auto pure_filename = Path::GetFileName(filename);
 
 		// 読み込み済み、もしくは定跡を用いない(no_book)であるなら正常終了。
-		if (filename == "book/no_book")
+		if (pure_filename == "no_book")
 		{
-			book_name = filename;
-			return 0;
+			this->book_name = filename;
+			this->pure_book_name = pure_filename;
+			return Tools::Result::Ok();
 		}
 
-		if (filename == kAperyBookName) {
+		if (pure_filename == kAperyBookName) {
 			// Apery定跡データベースを読み込む
 			//	apery_book = std::make_unique<AperyBook>(kAperyBookName);
 			// これ、C++14の機能。C++11用に以下のように書き直す。
-			apery_book = std::unique_ptr<AperyBook>(new AperyBook(kAperyBookName));
+			apery_book = std::unique_ptr<AperyBook>(new AperyBook(filename));
 		}
 		else {
 			// やねうら王定跡データベースを読み込む
@@ -730,41 +745,66 @@ namespace Book
 				fs.open(filename, ios::in);
 				if (fs.fail())
 				{
-					cout << "info string Error! : can't read " + filename << endl;
-					return 1;
+					sync_cout << "info string Error! : can't read file : " + filename << sync_endl;
+					return Tools::Result(Tools::ResultCode::FileOpenError);
 				}
 
 				// 定跡ファイルのopenにも成功したし、on the flyできそう。
 				// このときに限りこのフラグをtrueにする。
 				this->on_the_fly = true;
-				book_name = filename;
-				return 0;
+				this->book_name = filename;
+				return Tools::Result::Ok();
 			}
 
-			vector<string> lines;
-			if (read_all_lines(filename, lines))
+			sync_cout << "info string read book file : " << filename << sync_endl;
+
+			TextFileReader reader;
+			auto result = reader.Open(filename);
+			if (result.is_not_ok())
 			{
-				cout << "info string Error! : can't read " + filename << endl;
+				sync_cout << "info string Error! : can't read file : " + filename << sync_endl;
 				//      exit(EXIT_FAILURE);
-				return 1; // 読み込み失敗
+				return result; // 読み込み失敗
 			}
 
-			uint64_t num_sum = 0;
 			string sfen;
 
+			// 手数違いの重複エントリーは、手数の一番若いほうだけをMemoryBook::write_book()で書き出すようにしたので、
+			// 以下のコードは不要(のはず)
+#if 0
+			// 一つ前のsfen文字列と、同一sfenエントリー内の手数の最小値
+			string last_sfen;
+			int last_sfen_ply = 0;
+			bool ignore_book_ply = Options["IgnoreBookPly"];
+#endif
+
 			auto calc_prob = [&] {
-				if (book_body.count(sfen) == 0)
+				// 空のsfen文字列(既存のエントリーすなわち重複エントリー)であるならこの計算を行わない。
+				if (sfen.size()==0)
 					return;
+
 				auto& move_list = *book_body[sfen];
 				std::stable_sort(move_list.begin(), move_list.end());
+
+				// 出現率の正規化
+
+				u64 num_sum = 0;
+				for (auto& it : move_list)
+					num_sum += it.num;
 				num_sum = std::max(num_sum, UINT64_C(1)); // ゼロ除算対策
-				for (auto& bp : move_list)
-					bp.prob = float(bp.num) / num_sum;
+				for (auto& it : move_list)
+					it.prob = float(it.num) / num_sum;
 				num_sum = 0;
 			};
 
-			for (auto line : lines)
+			// 定跡に登録されている手数を無視するのか？
+			// (これがtrueならばsfenから手数を除去しておく)
+			bool ignoreBookPly = Options["IgnoreBookPly"];
+
+			while(!reader.Eof())
 			{
+				auto line = reader.ReadLine(/* trim = */true);
+
 				// バージョン識別文字列(とりあえず読み飛ばす)
 				if (line.length() >= 1 && line[0] == '#')
 					continue;
@@ -780,18 +820,59 @@ namespace Book
 					// (sortはされてるはずだが他のソフトで生成した定跡DBではそうとも限らないので)。
 					calc_prob();
 
-					sfen = line.substr(5, line.length() - 5); // 新しいsfen文字列を"sfen "を除去して格納
+					// 5文字目から末尾までをくり抜く。
+					// 末尾のゴミは除去されているはずなので、Options["IgnoreBookPly"] == trueのときは、手数(数字)を除去。
+
+					sfen = line.substr(5); // 新しいsfen文字列を"sfen "を除去して格納
+					if (ignoreBookPly)
+						StringExtension::trim_number_inplace(sfen); // 末尾の数字除去
+
+#if 0
+					if (ignore_book_ply)
+					{
+						int ply = StringExtension::to_int(StringExtension::mid(line, sfen.length() + 5), 0);
+
+						// Options["IgnoreBookPly"] == trueのときに手数違いの重複エントリーがある場合がある。
+						// すでに見つけたentryなら、このentryに対して一切の操作を行わない。
+						// 若い手数のほうの局面情報を優先すべき。
+						// ※　定跡DBはsfen文字列順にソートされているので、手数違いのエントリーは連続していると仮定できる。
+
+						if (last_sfen != sfen)
+							last_sfen_ply = INT_MAX;
+						else if (last_sfen_ply < ply)
+							sfen = "";
+
+						last_sfen_ply = std::min(last_sfen_ply,ply); // 同一sfenエントリーのなかでの最小値にする
+						last_sfen = sfen;
+					}
+#endif
+
 					continue;
 				}
 
-				Move best, next;
-				int value;
-				int depth;
+				// Options["IgnoreBookPly"]==true絡みでskipするエントリーであるかの判定
+				if (sfen.size() == 0)
+					continue;
 
-				istringstream is(line);
+				Move best, next;
+
 				string bestMove, nextMove;
-				uint64_t num;
-				is >> bestMove >> nextMove >> value >> depth >> num;
+				int value = 0;
+				int depth = 0;
+				uint64_t num = 1;
+
+				//istringstream is(line);
+				// value以降は、元データに欠落してるかもですよ。
+				//is >> bestMove >> nextMove >> value >> depth >> num;
+
+				// → istringstream、げろげろ遅いので、自前でparseする。
+
+				LineScanner scanner(line);
+				bestMove = scanner.get_text();
+				nextMove = scanner.get_text();
+				value = (int)scanner.get_number(value);
+				depth = (int)scanner.get_number(depth);
+				num = (uint64_t)scanner.get_number(num);
 
 #if 0
 				// 思考した指し手に対しては指し手の出現頻度のところを強制的にエンジンバージョンを100倍したものに変更する。
@@ -803,37 +884,71 @@ namespace Book
 				if (bestMove == "none" || bestMove == "resign")
 					best = MOVE_NONE;
 				else
-					best = move_from_usi(bestMove);
+					best = USI::to_move(bestMove);
 
 				if (nextMove == "none" || nextMove == "resign")
 					next = MOVE_NONE;
 				else
-					next = move_from_usi(nextMove);
+					next = USI::to_move(nextMove);
 
 				BookPos bp(best, next, value, depth, num);
 				insert(sfen, bp);
-				num_sum += num;
+
+				// このinsert()、この関数の40%ぐらいの時間を消費している。
+				// 他の部分をせっかく高速化したのに…。
+
+				// これ、ファイルから読み込んだ文字列のまま保存しておき、
+				// アクセスするときに解凍するほうが良かったか…。
+
+				// unorderedmapなのでこれ以上どうしようもないな…。
+
+				// テキストそのまま持っておいて、メモリ上で二分探索する実装のほうが良かったか。
+				// (定跡がsfen文字列でソート済みであることが保証されているなら。保証されてないんだけども。)
+
 			}
 			// ファイルが終わるときにも最後の局面に対するcalc_probが必要。
 			calc_prob();
 		}
 
 		// 読み込んだファイル名を保存しておく。二度目のread_book()はskipする。
-		book_name = filename;
+		this->book_name = filename;
+		this->pure_book_name = pure_filename;
 
-		return 0;
+		sync_cout << "info string read book done." << sync_endl;
+
+		return Tools::Result::Ok();
 	}
 
 	// 定跡ファイルの書き出し
-	int MemoryBook::write_book(const std::string& filename, bool sort) const
+	Tools::Result MemoryBook::write_book(const std::string& filename /*, bool sort*/) const
 	{
+		// Position::set()で評価関数の読み込みが必要。
+		//is_ready();
+
+		// →　この関数はbookコマンドからしか呼び出さず、bookコマンドの処理の先頭付近でis_ready()を
+		// 呼び出しているため、この関数のなかでのis_ready()は呼び出さないことにする。
+
 		fstream fs;
 		fs.open(filename, ios::out);
+
+		if (fs.fail())
+			return Tools::Result(Tools::ResultCode::FileOpenError);
+
+		cout << endl << "write " + filename;
 
 		// バージョン識別用文字列
 		fs << "#YANEURAOU-DB2016 1.00" << endl;
 
 		vector<pair<string, PosMoveListPtr> > vectored_book;
+		
+		// 重複局面の手数違いを除去するのに用いる。
+		// 手数違いの重複局面はOptions["IgnoreBookPly"]==trueのときに有害であるため、plyが最小のもの以外を削除する必要がある。
+		// (Options["BookOnTheFly"]==true かつ Options["IgnoreBookPly"] == true のときに、手数違いのものがヒットするだとか、そういう問題と、
+		// Options["IgnoreBookPly"]==trueのときにMemoryBook::read_book()で読み込むときに重複エントリーがあって何か地雷を踏んでしまう的な問題を回避。
+
+		// sfenの手数の手前までの文字列とそのときの手数
+		std::unordered_map<string, int> book_ply;
+
 		for (auto& it : book_body)
 		{
 			// 指し手のない空っぽのentryは書き出さないように。
@@ -842,27 +957,47 @@ namespace Book
 			vectored_book.push_back(it);
 		}
 
-		if (sort)
-		{
 			// sfen文字列は手駒の表記に揺れがある。
 			// (USI原案のほうでは規定されているのだが、将棋所が採用しているUSIプロトコルではこの規定がない。)
 			// sortするタイミングで、一度すべての局面を読み込み、sfen()化しなおすことで
 			// やねうら王が用いているsfenの手駒表記(USI原案)に統一されるようにする。
 
+		// 進捗の出力
+		u64 counter = 0;
+		auto output_progress = [&]()
+		{
+			if ((counter % 1000) == 0)
 			{
-				// Position::set()で評価関数の読み込みが必要。
-				is_ready();
+				if ((counter % 80000) == 0) // 80文字ごとに改行
+					cout << endl;
+				cout << ".";
+			}
+			counter++;
+		};
+
+			{
 				Position pos;
 
 				// std::vectorにしてあるのでit.firstを書き換えてもitは無効にならないはず。
 				for (auto& it : vectored_book)
 				{
+				output_progress();
+
 					StateInfo si;
 					pos.set(it.first,&si,Threads.main());
-					it.first = pos.sfen();
+					auto sfen = pos.sfen();
+					it.first = sfen;
+
+					auto sfen_left = StringExtension::trim_number(sfen); // 末尾にplyがあるはずじゃろ
+				int ply = StringExtension::to_int(sfen.substr(sfen_left.length()), 0);
+
+					auto it2 = book_ply.find(sfen_left);
+					if (it2 == book_ply.end())
+						book_ply[sfen_left] = ply; // エントリーが見つからなかったので何も考えずに追加
+					else
+						it2->second = std::min(it2->second, ply); // 手数の短いほうを代入しておく。
 				}
 			}
-
 
 			// ここvectored_bookが、sfen文字列でsortされていて欲しいのでsortする。
 			// アルファベットの範囲ではlocaleの影響は受けない…はず…。
@@ -870,10 +1005,21 @@ namespace Book
 				[](const pair<string, PosMoveListPtr>&lhs, const pair<string, PosMoveListPtr>&rhs) {
 				return lhs.first < rhs.first;
 			});
-		}
 
 		for (auto& it : vectored_book)
 		{
+			output_progress();
+
+			// -- 重複局面の手数違いの局面はスキップする(ファイルに書き出さない)
+
+			auto sfen = it.first;
+			auto sfen_left = StringExtension::trim_number(sfen); // 末尾にplyがあるはずじゃろ
+			int ply = StringExtension::to_int(sfen.substr(sfen_left.length()), 0);
+			if (book_ply[sfen_left] != ply)
+				continue;
+
+			// -- このentryを書き出す
+
 			fs << "sfen " << it.first /* is sfen string */ << endl; // sfen
 
 			auto& move_list = *it.second;
@@ -884,14 +1030,19 @@ namespace Book
 			for (auto& bp : move_list)
 				fs << bp.bestMove << ' ' << bp.nextMove << ' ' << bp.value << " " << bp.depth << " " << bp.num << endl;
 			// 指し手、相手の応手、そのときの評価値、探索深さ、採択回数
+
+			if (fs.fail())
+				return Tools::Result(Tools::ResultCode::FileWriteError);
 		}
 
 		fs.close();
 
-		return 0;
+		cout << endl << "done!" << endl;
+
+		return Tools::Result::Ok();
 	}
 
-	void MemoryBook::insert(const std::string sfen, const BookPos& bp)
+	void MemoryBook::insert(const std::string sfen, const BookPos& bp , bool overwrite)
 	{
 		auto it = book_body.find(sfen);
 		if (it == book_body.end())
@@ -908,10 +1059,14 @@ namespace Book
 			for (auto& b : move_list)
 				if (b == bp)
 				{
+					// 上書きモードなのか？
+					if (overwrite)
+					{
 					// すでに存在していたのでエントリーを置換。ただし採択回数はインクリメント
 					auto num = b.num;
 					b = bp;
 					b.num += num;
+					}
 					goto FOUND_THE_SAME_MOVE;
 				}
 
@@ -924,10 +1079,10 @@ namespace Book
 	PosMoveListPtr MemoryBook::find(const Position& pos)
 	{
 		// "no_book"は定跡なしという意味なので定跡の指し手が見つからなかったことにする。
-		if (book_name == "no_book")
+		if (pure_book_name == "no_book")
 			return PosMoveListPtr();
 
-		if (book_name == kAperyBookName) {
+		if (pure_book_name == kAperyBookName) {
 
 			PosMoveListPtr pml_entry(new PosMoveList());
 
@@ -958,16 +1113,22 @@ namespace Book
 				return PosMoveListPtr();
 
 			auto sfen = pos.sfen();
+
 			BookType::iterator it;
+
+			// "sfen lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1"のような文字列である。
+			// IgnoreBookPlyがtrueのときは、
+			// "sfen lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b -"まで一致したなら一致したとみなせば良い。
+			// これはStringExtension::trim_number()でできる。
 
 			if (on_the_fly)
 			{
 				// ディスクから読み込むなら、いずれにせよ、新規エントリーを作成してそれを返す必要がある。
 				PosMoveListPtr pml_entry(new PosMoveList());
 
-				// 末尾の手数は取り除いておく。
+				// IgnoreBookPlyのときは末尾の手数は取り除いておく。
 				// read_book()で取り除くと、そのあと書き出すときに手数が消失するのでまずい。(気がする)
-				sfen = trim_sfen(sfen);
+				sfen = trim(sfen);
 
 				// ファイル自体はオープンされてして、ファイルハンドルはfsだと仮定して良い。
 
@@ -975,24 +1136,28 @@ namespace Book
 				// C++的には未定義動作だが、これのためにsys/stat.hをincludeしたくない。
 				// ここでfs.clear()を呼ばないとeof()のあと、tellg()が失敗する。
 				fs.clear();
-				fs.seekg(0, std::ios::end);
-				auto file_end = fs.tellg();
-
-				fs.clear();
 				fs.seekg(0, std::ios::beg);
 				auto file_start = fs.tellg();
 
-				auto file_size = u64(file_end - file_start);
+				// 現在のファイルのシーク位置を返す関数(ファイルの先頭位置を0とする)
+				auto current_pos = [&]() { return s64(fs.tellg() - file_start); };
+
+				fs.clear();
+				fs.seekg(0, std::ios::end);
+
+				// ファイルサイズ(現在、ファイルの末尾を指しているはずなので..)
+				auto file_size = current_pos();
 
 				// 与えられたseek位置から"sfen"文字列を探し、それを返す。どこまでもなければ""が返る。
 				// hackとして、seek位置は-2しておく。(1行読み捨てるので、seek_fromぴったりのところに
 				// "sfen"から始まる文字列があるとそこを読み捨ててしまうため。-2してあれば、そこに
 				// CR+LFがあるはずだから、ここを読み捨てても大丈夫。)
-				auto next_sfen = [&](u64 seek_from)
+				auto next_sfen = [&](s64 seek_from)
 				{
 					string line;
 
-					fs.seekg(max(s64(0), (s64)seek_from - 2), fstream::beg);
+					seek_from = std::max( s64(0), seek_from - 2);
+					fs.seekg(seek_from , fstream::beg);
 
 					// --- 1行読み捨てる
 
@@ -1004,10 +1169,13 @@ namespace Book
 					while (getline(fs, line))
 					{
 						if (!line.compare(0, 4, "sfen"))
-							return trim_sfen(line.substr(5));
+						{
+							// ios::binaryつけているので末尾に'\r'が付与されている。禿げそう。
+							// →　trim()で吸収する。(trimがStringExtension::trim_number()を呼び出すがそちらで吸収される)
+							return trim(line.substr(5));
 						// "sfen"という文字列は取り除いたものを返す。
-						// 手数の表記も取り除いて比較したほうがいい。
-						// ios::binaryつけているので末尾に'\R'が付与されている。禿げそう。
+							// IgnoreBookPly == trueのときは手数の表記も取り除いて比較したほうがいい。
+						}
 					}
 					return string();
 				};
@@ -1015,7 +1183,9 @@ namespace Book
 				// バイナリサーチ
 				// [s,e) の範囲で求める。
 
-				u64 s = 0, e = file_size, m;
+				s64 s = 0, e = file_size, m;
+				// s,eは無符号型だと、s - 2のような式が負にならないことを保証するのが面倒くさい。
+				// こういうのを無符号型で扱うのは筋が悪い。
 
 				while (true)
 				{
@@ -1028,20 +1198,20 @@ namespace Book
 					}
 					else if (sfen > sfen2)
 					{ // 右(それより大きいところ)を探す
-						s = u64(fs.tellg() - file_start);
+						s = current_pos();
 					}
 					else {
 						// 見つかった！
 						break;
 					}
 
-					// 40バイトより小さなsfenはありえないので探索範囲がこれより小さいなら終了。
-					// s,eは無符号型であることに注意。if (s-40 < e) と書くとs-40がマイナスになりかねない。
+					// 40バイトより小さなsfenはありえないので、この範囲に２つの"sfen"で始まる文字列が
+					// 入っていないことは保証されている。
+					// ゆえに、探索範囲がこれより小さいなら先頭から調べて("sfen"と書かれている文字列を探して)終了。
 					if (s + 40 > e)
 					{
-						// ただしs = 0のままだと先頭要素が探索されていないということなので
-						// このケースに限り先頭要素を再探索
-						if (s == 0 && next_sfen(s) == sfen)
+						if ( next_sfen(s) == sfen)
+							// 見つかった！
 							break;
 
 						// 見つからなかった
@@ -1087,24 +1257,35 @@ namespace Book
 					}
 
 					Move best, next;
-					int value;
-					int depth;
 
-					istringstream is(line);
 					string bestMove, nextMove;
-					uint64_t num;
-					is >> bestMove >> nextMove >> value >> depth >> num;
+					int value = 0;
+					int depth = 0;
+					uint64_t num = 1;
+
+					//istringstream is(line);
+					// value以降は、元データに欠落してるかもですよ。
+					//is >> bestMove >> nextMove >> value >> depth >> num;
+
+					// → istringstream、げろげろ遅いので、自前でparseする。
+
+					LineScanner scanner(line);
+					bestMove = scanner.get_text();
+					nextMove = scanner.get_text();
+					value = (int)scanner.get_number(value);
+					depth = (int)scanner.get_number(depth);
+					num = (uint64_t)scanner.get_number(num);
 
 					// 起動時なので変換に要するオーバーヘッドは最小化したいので合法かのチェックはしない。
 					if (bestMove == "none" || bestMove == "resign")
 						best = MOVE_NONE;
 					else
-						best = move_from_usi(bestMove);
+						best = USI::to_move(bestMove);
 
 					if (nextMove == "none" || nextMove == "resign")
 						next = MOVE_NONE;
 					else
-						next = move_from_usi(nextMove);
+						next = USI::to_move(nextMove);
 
 					// 定跡のMoveは16bitであり、rootMovesは32bitのMoveであるからこのタイミングで補正する。
 					BookPos bp(pos.move16_to_move(best), next, value, depth, num);
@@ -1115,11 +1296,11 @@ namespace Book
 				calc_prob();
 
 				return pml_entry;
-			}
-			else {
+
+			} else {
 
 				// on the flyではない場合
-				it = book_body.find(sfen);
+				it = book_body.find(trim(sfen));
 				if (it != book_body.end())
 				{
 					// 定跡のMoveは16bitであり、rootMovesは32bitのMoveであるからこのタイミングで補正する。
@@ -1137,11 +1318,11 @@ namespace Book
 	}
 
 	// Apery用定跡ファイルの読み込み
-	int MemoryBook::read_apery_book(const std::string& filename)
+	Tools::Result MemoryBook::read_apery_book(const std::string& filename)
 	{
 		// 読み込み済であるかの判定
 		if (book_name == filename)
-			return 0;
+			return Tools::Result::Ok();
 
 		AperyBook apery_book(filename.c_str());
 		cout << "size of apery book = " << apery_book.size() << endl;
@@ -1157,7 +1338,7 @@ namespace Book
 
 		function<void(Position&)> search = [&](Position& pos) {
 			const string sfen = pos.sfen();
-			const string sfen_for_key = trim_sfen(sfen);
+			const string sfen_for_key = trim(sfen);
 			if (seen.count(sfen_for_key)) return;
 			seen.insert(sfen_for_key);
 
@@ -1215,7 +1396,7 @@ namespace Book
 		// 読み込んだファイル名を保存しておく。二度目のread_book()はskipする。
 		book_name = filename;
 
-		return 0;
+		return Tools::Result::Ok();
 	}
 
 	// ----------------------------------
@@ -1226,6 +1407,11 @@ namespace Book
 
 	void BookMoveSelector::init(USI::OptionsMap & o)
 	{
+		// エンジン側の定跡を有効化するか
+		// USI原案にこのオプションがあり、ShogiGUI、ShogiDroidで対応しているらしいので
+		// このオプションを追加。[2020/3/9]
+		o["USI_OwnBook"] << Option(true);
+
 		// 実現確率の低い狭い定跡を選択しない
 		o["NarrowBook"] << Option(false);
 
@@ -1252,8 +1438,9 @@ namespace Book
 			, "yaneura_book1.db" , "yaneura_book2.db" , "yaneura_book3.db", "yaneura_book4.db"
 			, "user_book1.db", "user_book2.db", "user_book3.db", "book.bin" };
 
-		o["BookFile"] << Option(book_list, book_list[1], [&](const Option& o){ this->book_name = string(o); });
-		book_name = book_list[1];
+		o["BookFile"] << Option(book_list, book_list[1]);
+
+		o["BookDir"] << Option("book");
 
 		//  BookEvalDiff: 定跡の指し手で1番目の候補の指し手と、2番目以降の候補の指し手との評価値の差が、
 		//    この範囲内であれば採用する。(1番目の候補の指し手しか選ばれて欲しくないときは0を指定する)
@@ -1272,27 +1459,72 @@ namespace Book
 		// 定跡データベースの採択率に比例して指し手を選択するオプション
 		o["ConsiderBookMoveCount"] << Option(false);
 
+		// 定跡にヒットしたときにPVを何手目まで表示するか。あまり長いと時間がかかりうる。
+		o["BookPvMoves"] << Option(8, 1, MAX_PLY);
+
+		// 定跡データベース上のply(開始局面からの手数)を無視するオプション。
+		// 例) 局面図が同じなら、DBの36手目の局面に40手目でもヒットする。
+		// これ変更したときに定跡ファイルの読み直しが必要になるのだが…(´ω｀)
+		o["IgnoreBookPly"] << Option(false);
+	}
+
+	// 与えられたmで進めて定跡のpv文字列を生成する。
+	string BookMoveSelector::pv_builder(Position& pos, Move m , int depth)
+	{
+		// 千日手検出
+		auto rep = pos.is_repetition(MAX_PLY);
+		if (rep != REPETITION_NONE)
+		{
+			// 千日手でPVを打ち切るときはその旨を表示(USI拡張)
+			return " " + to_usi_string(rep);
+		}
+
+		string result = "";
+
+		if (pos.pseudo_legal(m) && pos.legal(m))
+		{
+			StateInfo si;
+			pos.do_move(m, si);
+
+			Move bestMove, ponderMove;
+			if (!probe_impl(pos, true, bestMove, ponderMove , true /* 強制的にhitさせる */))
+				goto UNDO;
+
+			if (depth > 0)
+				result = pv_builder(pos, bestMove , depth - 1); // さらにbestMoveで指し手を進める。
+			result = " " + to_usi_string(bestMove) + ((result == "" /* is leaf node? */) ? (" " + to_usi_string(ponderMove)) : result);
+
+		UNDO:;
+			pos.undo_move(m);
+		}
+		return result;
 	}
 
 	// probe()の下請け
-	bool BookMoveSelector::probe_impl(Position& rootPos, bool silent , Move& bestMove , Move& ponderMove)
+	bool BookMoveSelector::probe_impl(Position& rootPos, bool silent , Move& bestMove , Move& ponderMove , bool forceHit)
 	{
-		// 一定確率で定跡を無視
-	        if ( (int)Options["BookIgnoreRate"] > (int)prng.rand(100)){
-			return false;		 
-	        }
-	  
-		// 定跡を用いる手数
-		int book_ply = (int)Options["BookMoves"];
-		if (rootPos.game_ply() > book_ply)
-			return false;
+		if (!forceHit)
+		{
+			// 一定確率で定跡を無視
+			if ((int)Options["BookIgnoreRate"] > (int)prng.rand(100)) {
+				return false;
+			}
+
+			// 定跡を用いる手数
+			int book_ply = (int)Options["BookMoves"];
+			if (!forceHit && rootPos.game_ply() > book_ply)
+				return false;
+		}
 
 		auto it = memory_book.find(rootPos);
-		if (it == nullptr)
+		if (it == nullptr || it->size()==0)
 			return false;
 
 		// 定跡にhitした。逆順で出力しないと将棋所だと逆順にならないという問題があるので逆順で出力する。
-		// また、it->second->size()!=0をチェックしておかないと指し手のない定跡が登録されていたときに困る。
+		// →　将棋所、updateでMultiPVに対応して改良された
+		// 　ShogiGUIでの表示も問題ないようなので正順に変更する。
+		
+		// また、it->size()!=0をチェックしておかないと指し手のない定跡が登録されていたときに困る。
 
 		// 1) やねうら標準定跡のように評価値なしの定跡DBにおいては
 		// 出現頻度の高い順で並んでいることが保証されている。
@@ -1308,15 +1540,43 @@ namespace Book
 
 		if (!silent)
 		{
-			// 将棋所では対応していないが、ShogiGUIの検討モードで使うときに
-			// 定跡の指し手に対してmultipvを出力しておかないとうまく表示されないので
-			// これを出力しておく。
-			auto i = move_list.size();
-			for (auto it = move_list.rbegin(); it != move_list.rend(); ++it, --i)
-				sync_cout << "info pv " << it->bestMove << " " << it->nextMove
-				<< " (" << fixed << std::setprecision(2) << (100 * it->prob) << "%)" // 採択確率
-				<< " score cp " << it->value << " depth " << it->depth
-				<< " multipv " << i << sync_endl;
+			int pv_moves = (int)Options["BookPvMoves"];
+			for (size_t i = 0; i < move_list.size() ; ++ i)
+			{
+				// PVを構築する。pv_movesで指定された手数分だけ表示する。
+				// bestMoveを指した局面でさらに定跡のprobeを行なって…。
+				auto& it = move_list[i];
+
+				string pv_string;
+				if (pv_moves <= 1)
+					pv_string = to_usi_string(it.bestMove);
+				else if (pv_moves == 2)
+					pv_string = to_usi_string(it.bestMove) + " " + to_usi_string(it.nextMove);
+				else {
+					// 次の局面で定跡にhitしない場合があって、その場合、この局面のnextMoveを出力してやる必要がある。
+					auto rest = pv_builder(rootPos, it.bestMove, pv_moves - 3);
+					pv_string = (rest != "") ?
+						(to_usi_string(it.bestMove) + rest) :
+						(to_usi_string(it.bestMove) + " " + to_usi_string(it.nextMove));
+				}
+
+				// USIの"info"で読み筋を出力するときは"pv"サブコマンドはサブコマンドの一番最後にしなければならない。
+				// 複数出力するときに"multipv"は連番なのでこれが先頭に来ているほうが見やすいと思うので先頭に"multipv"を出力する。
+				sync_cout << "info"
+#if !defined(NICONICO)
+					<< " multipv " << (i + 1)
+#endif					
+					<< " score cp " << it.value << " depth " << it.depth
+					<< " pv " << pv_string
+					<< " (" << fixed << std::setprecision(2) << (100 * it.prob) << "%)" // 採択確率
+					<< sync_endl;
+
+				// 電王盤はMultiPV非対応なので1番目の読み筋だけを"multipv"をつけずに送信する。
+				// ("multipv"を出力してはならない)
+#if defined(NICONICO)
+				break;
+#endif
+			}
 		}
 
 		// このなかの一つをランダムに選択
@@ -1325,57 +1585,73 @@ namespace Book
 		// 無難な指し手が選びたければ、採択回数が一番多い、最初の指し手(move_list[0])を選ぶべし。
 		// 評価値ベースで選ぶときは、NarrowBookはオンにすべきではない。
 
-		// 狭い定跡を用いるのか？
-		bool narrowBook = Options["NarrowBook"];
-
-		// この局面における定跡の指し手のうち、条件に合わないものを取り除いたあとの指し手の数
-		if (narrowBook)
+		if (forceHit)
 		{
-			auto n = move_list.size();
-
-			// 出現確率10%未満のものを取り除く。
-			auto it_end = std::remove_if(move_list.begin(), move_list.end(), [](Book::BookPos& m) { return m.prob < 0.1; });
-			move_list.erase(it_end, move_list.end());
-
-			// 1手でも取り除いたなら、定跡から取り除いたことをGUIに出力
-			if (!silent && (n != move_list.size()))
-				sync_cout << "info string NarrowBook : " << n << " moves to " << move_list.size() << " moves." << sync_endl;
-		}
-
-		if (move_list.size() == 0)
-			return false;
-
-		// 評価値の差などを反映。
-
-		// 定跡として採用するdepthの下限。0 = 無視。
-		auto depth_limit = (int)Options["BookDepthLimit"];
-		if (depth_limit != 0 && move_list[0].depth < depth_limit)
-		{
-			if (!silent)
-				sync_cout << "info string BookDepthLimit is lower than the depth of this node." << sync_endl;
-			move_list.clear();
-		}
-		else {
-			// ベストな評価値の候補手から、この差に収まって欲しい。
-			auto eval_diff = (int)Options["BookEvalDiff"];
-			auto value_limit1 = move_list[0].value - eval_diff;
-			// 先手・後手の評価値下限の指し手を採用するわけにはいかない。
-			auto stm_string = (rootPos.side_to_move() == BLACK) ? "BookEvalBlackLimit" : "BookEvalWhiteLimit";
-			auto value_limit2 = (int)Options[stm_string];
-			auto value_limit = max(value_limit1, value_limit2);
-
-			auto n = move_list.size();
+			// ベストな評価値のもののみを残す
+			auto value_limit = move_list[0].value;
 
 			// 評価値がvalue_limitを下回るものを削除
-			auto it_end = std::remove_if(move_list.begin(), move_list.end(), [&](Book::BookPos& m) { return m.value < value_limit; });
+			auto it_end = std::remove_if(move_list.begin(), move_list.end(), [&](Book::BookPos & m) { return m.value < value_limit; });
 			move_list.erase(it_end, move_list.end());
 
-			// 候補手が1手でも減ったなら減った理由を出力
-			if (!silent && n != move_list.size())
-				sync_cout << "info string BookEvalDiff = " << eval_diff << " ,  " << stm_string << " = " << value_limit2
-				<< " , " << n << " moves to " << move_list.size() << " moves." << sync_endl;
-		}
+		} else {
 
+			// 狭い定跡を用いるのか？
+			bool narrowBook = Options["NarrowBook"];
+
+			// この局面における定跡の指し手のうち、条件に合わないものを取り除いたあとの指し手の数
+			if (narrowBook)
+			{
+				auto n = move_list.size();
+
+				// 出現確率10%未満のものを取り除く。
+				auto it_end = std::remove_if(move_list.begin(), move_list.end(), [](Book::BookPos & m) { return m.prob < 0.1; });
+				move_list.erase(it_end, move_list.end());
+
+				// 1手でも取り除いたなら、定跡から取り除いたことをGUIに出力
+				if (!silent && (n != move_list.size()))
+					sync_cout << "info string NarrowBook : " << n << " moves to " << move_list.size() << " moves." << sync_endl;
+			}
+
+			if (move_list.size() == 0)
+				return false;
+
+			// 評価値の差などを反映。
+
+			// 定跡として採用するdepthの下限。0 = 無視。
+			auto depth_limit = (int)Options["BookDepthLimit"];
+			if ((depth_limit != 0 && move_list[0].depth < depth_limit))
+			{
+				if (!silent)
+					sync_cout << "info string BookDepthLimit is lower than the depth of this node." << sync_endl;
+				move_list.clear();
+			}
+			else {
+				// ベストな評価値の候補手から、この差に収まって欲しい。
+				auto eval_diff = (int)Options["BookEvalDiff"];
+				auto value_limit1 = move_list[0].value - eval_diff;
+				// 先手・後手の評価値下限の指し手を採用するわけにはいかない。
+				auto stm_string = (rootPos.side_to_move() == BLACK) ? "BookEvalBlackLimit" : "BookEvalWhiteLimit";
+				auto value_limit2 = (int)Options[stm_string];
+				auto value_limit = max(value_limit1, value_limit2);
+
+				auto n = move_list.size();
+
+				// 評価値がvalue_limitを下回るものを削除
+				auto it_end = std::remove_if(move_list.begin(), move_list.end(), [&](Book::BookPos & m) { return m.value < value_limit; });
+				move_list.erase(it_end, move_list.end());
+
+				// これを出力するとShogiGUIの棋譜解析で読み筋として表示されてしまう…。
+				// 棋譜解析でinfo stringの文字列を拾う実装になっているのがおかしいのだが。
+				// ShogiGUIの作者に要望を出す。[2019/06/20]
+				// →　対応してもらえるらしい。[2019/06/22]
+
+				// 候補手が1手でも減ったなら減った理由を出力
+				if (!silent && n != move_list.size())
+					sync_cout << "info string BookEvalDiff = " << eval_diff << " ,  " << stm_string << " = " << value_limit2
+					<< " , " << n << " moves to " << move_list.size() << " moves." << sync_endl;
+			}
+		}
 		if (move_list.size() == 0)
 			return false;
 
@@ -1385,7 +1661,7 @@ namespace Book
 			auto bestPos = move_list[prng.rand(move_list.size())];
 
 			// 定跡ファイルの採択率に応じて指し手を選択するか
-			if (Options["ConsiderBookMoveCount"])
+			if (forceHit || Options["ConsiderBookMoveCount"])
 			{
 				// 1-passで採択率に従って指し手を決めるオンラインアルゴリズム
 				// http://yaneuraou.yaneu.com/2015/01/03/stockfish-dd-book-%E5%AE%9A%E8%B7%A1%E9%83%A8/
@@ -1445,6 +1721,10 @@ namespace Book
 	// 定跡の指し手の選択
 	bool BookMoveSelector::probe(Thread& th, Search::LimitsType& Limits)
 	{
+		// エンジン側の定跡を有効化されていないなら、probe()に失敗する。
+		if (!Options["USI_OwnBook"])
+			return false;
+
 		Move bestMove, ponderMove;
 		if (probe_impl(th.rootPos, Limits.silent, bestMove, ponderMove))
 		{

@@ -1,14 +1,13 @@
 ﻿#ifndef _EVALUATE_H_
 #define _EVALUATE_H_
 
-#include "shogi.h"
+#include "types.h"
 
 // -------------------------------------
 //   評価関数に対応するheaderの読み込み
 // -------------------------------------
 
-#if defined(EVAL_KPPT) || defined(EVAL_KPP_KKPT) || defined(EVAL_KPPPT) || defined(EVAL_KPPP_KKPT) || defined(EVAL_KKPP_KKPT) || \
-	defined(EVAL_KKPPT) || defined(EVAL_KPP_KKPT_FV_VAR) || defined(EVAL_HELICES) || defined(EVAL_NABLA)
+#if defined(EVAL_KPPT) || defined(EVAL_KPP_KKPT)
 #include "eval/evalsum.h"
 #endif
 
@@ -17,8 +16,6 @@
 #define EVAL_EXPERIMENTAL_HEADER
 #include "eval/experimental/evaluate_experimental.h"
 #undef EVAL_EXPERIMENTAL_HEADER
-#elif defined(EVAL_NABLA)
-#define BonaPieceExpansion (6*6*6 * 6)
 #else
 #define BonaPieceExpansion 0
 #endif
@@ -81,8 +78,7 @@ namespace Eval {
 	void is_valid_nabra_eval_list(const Position& pos);
 #endif
 
-#if defined (EVAL_MATERIAL) || defined (EVAL_KPPT) || defined(EVAL_KPP_KKPT) || defined(EVAL_KPPPT) || defined(EVAL_KPPP_KKPT) || \
-	defined(EVAL_KKPP_KKPT) || defined(EVAL_KKPPT) || defined(EVAL_KPP_KKPT_FV_VAR) || defined(EVAL_HELICES) || defined(EVAL_NABLA)
+#if defined (EVAL_MATERIAL) || defined (EVAL_KPPT) || defined(EVAL_KPP_KKPT) || defined(EVAL_NNUE)
 
 	// Apery(WCSC26)の駒割り
 	enum {
@@ -135,8 +131,7 @@ namespace Eval {
 
 		// --- 手駒
 
-#if defined (EVAL_MATERIAL) || defined (EVAL_KPPT) || defined(EVAL_KPP_KKPT) || defined(EVAL_KPPPT) || defined(EVAL_KPPP_KKPT) || defined(EVAL_KKPP_KKPT) || defined(EVAL_KKPPT) || \
-	defined(EVAL_KPP_KKPT_FV_VAR) || defined(EVAL_HELICES) || defined(EVAL_NABLA)
+#if defined (EVAL_MATERIAL) || defined (EVAL_KPPT) || defined(EVAL_KPP_KKPT) || defined(EVAL_NNUE)
 		// Apery(WCSC26)方式。0枚目の駒があるので少し隙間がある。
 		// 定数自体は1枚目の駒のindexなので、EVAL_KPPの時と同様の処理で問題ない。
 		// 例)
@@ -209,10 +204,13 @@ namespace Eval {
 
 	// BonaPieceを後手から見たとき(先手の39の歩を後手から見ると後手の71の歩)の番号とを
 	// ペアにしたものをExtBonaPiece型と呼ぶことにする。
-	struct ExtBonaPiece
+	union ExtBonaPiece
 	{
-		BonaPiece fb; // from black
-		BonaPiece fw; // from white
+		struct {
+			BonaPiece fb; // from black
+			BonaPiece fw; // from white
+		};
+		BonaPiece from[2];
 
 		ExtBonaPiece() {}
 		ExtBonaPiece(BonaPiece fb_, BonaPiece fw_) : fb(fb_) , fw(fw_){}
@@ -278,6 +276,7 @@ namespace Eval {
 		void clear()
 		{
 #if defined(USE_FV38)
+
 			for (auto& p : pieceListFb)
 				p = BONA_PIECE_ZERO;
 
@@ -549,6 +548,15 @@ namespace Eval {
 	// EvalIO::eval_convert()の引数として渡される。
 	extern std::vector<u16 /*BonaPiece*/> eval_mapper;
 #endif
+
+#if defined(USE_EVAL_HASH)
+	// EvalHashのリサイズ
+	extern void EvalHash_Resize(size_t mbSize);
+
+	// EvalHashのクリア
+	extern void EvalHash_Clear();
+#endif
+
 }
 
 #endif // #ifndef _EVALUATE_H_
