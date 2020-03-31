@@ -20,9 +20,13 @@
 #include "evaluate_nnue_learner.h"
 #include "trainer/features/factorizer_feature_set.h"
 
-// NNUE-HalfKPE9
-//#include "trainer/features/factorizer_half_kp.h"
+#if defined(EVAL_NNUE_HALFKPE9)
 #include "trainer/features/factorizer_half_kpe9.h"
+#elif defined(EVAL_NNUE_HALFKP_PP)
+#include "trainer/features/factorizer_pp.h"
+#else
+#include "trainer/features/factorizer_half_kp.h"
+#endif
 
 #include "trainer/trainer_feature_transformer.h"
 #include "trainer/trainer_input_slice.h"

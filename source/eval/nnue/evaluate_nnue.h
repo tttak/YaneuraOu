@@ -57,6 +57,12 @@ bool ReadParameters(std::istream& stream);
 // 評価関数パラメータを書き込む
 bool WriteParameters(std::ostream& stream);
 
+#if defined(EVAL_NNUE_HALFKP_PP)
+// フィボナッチ数列
+// ・PPの学習時の次元下げで使用する。（factorizer_pp.h）
+extern int fibonacci[fe_end + 1];
+#endif
+
 }  // namespace NNUE
 
 }  // namespace Eval

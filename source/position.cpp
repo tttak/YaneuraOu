@@ -1222,7 +1222,7 @@ void Position::do_move_impl(Move m, StateInfo& new_st, bool givesCheck)
 	st->accumulator.computed_score = false;
 #endif
 
-#if defined(LONG_EFFECT_LIBRARY)
+#if defined(USE_BOARD_EFFECT_PREV)
 	// NNUE-HalfKPE9
 	// 現局面のboard_effectをコピー
 	std::memcpy(board_effect_prev, board_effect, sizeof(board_effect));

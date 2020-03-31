@@ -246,8 +246,23 @@ namespace Eval {
   }
     }
 
+#if defined(EVAL_NNUE_HALFKP_PP)
+    // フィボナッチ数列の初期化
+    void init_fibonacci() {
+      int n = 0;
+      for (int i = 0; i <= fe_end; i++) {
+        n += i;
+        Eval::NNUE::fibonacci[i] = n;
+      }
+    }
+#endif
+
     // 初期化
     void init() {
+#if defined(EVAL_NNUE_HALFKP_PP)
+      // フィボナッチ数列の初期化
+      init_fibonacci();
+#endif
     }
 
     // 評価関数。差分計算ではなく全計算する。

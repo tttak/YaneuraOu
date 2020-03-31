@@ -290,9 +290,6 @@
 // パラメーターの自動調整絡み
 #define USE_GAMEOVER_HANDLER
 
-// NNUE-HalfKPE9
-#define LONG_EFFECT_LIBRARY
-
 // GlobalOptionsは有効にしておく。
 #define USE_GLOBAL_OPTIONS
 
@@ -326,6 +323,30 @@
 // KP256を用いる場合これをdefineする。
 // ※　これをdefineしていなければNNUE標準のhalfKP256になる。
 // #define EVAL_NNUE_KP256
+
+// どれか一つをdefineする。
+#define EVAL_NNUE_HALFKPE9
+//#define EVAL_NNUE_MATERIAL1
+//#define EVAL_NNUE_MATERIAL2
+//#define EVAL_NNUE_MATERIAL2_GAMEPLY
+//#define EVAL_NNUE_HALFKP_KK
+//#define EVAL_NNUE_HALFKP_PP
+//#define EVAL_NNUE_HALFKP_GSGS
+//#define EVAL_NNUE_HALFKP_DISTINGUISH_GOLDS
+//#define EVAL_NNUE_HALFKP_GAMEPLY40x4
+//#define EVAL_NNUE_HALFKP_KINGSAFETY
+
+
+#if defined(EVAL_NNUE_HALFKPE9)
+#define LONG_EFFECT_LIBRARY
+#define USE_BOARD_EFFECT_PREV
+#elif defined(EVAL_NNUE_HALFKP_DISTINGUISH_GOLDS)
+// BonaPieceで金と小駒の成り駒を区別する
+#define DISTINGUISH_GOLDS
+#elif defined(EVAL_NNUE_HALFKP_KINGSAFETY)
+#define LONG_EFFECT_LIBRARY
+#endif
+
 #endif
 
 #endif // defined(YANEURAOU_ENGINE_KPPT) || ...
@@ -570,6 +591,28 @@ constexpr bool Is64Bit = false;
 #define EVAL_TYPE_NAME "KPPT"
 #elif defined(EVAL_KPP_KKPT)
 #define EVAL_TYPE_NAME "KPP_KKPT"
+#elif defined(EVAL_NNUE_HALFKPE9)
+#define EVAL_TYPE_NAME "NNUE HalfKPE9"
+#elif defined(EVAL_NNUE_MATERIAL1)
+#define EVAL_TYPE_NAME "NNUE Material1"
+#elif defined(EVAL_NNUE_MATERIAL2)
+#define EVAL_TYPE_NAME "NNUE Material2"
+#elif defined(EVAL_NNUE_MATERIAL2_GAMEPLY)
+#define EVAL_TYPE_NAME "NNUE Material2-GamePly"
+#elif defined(EVAL_NNUE_HALFKP_KK)
+#define EVAL_TYPE_NAME "NNUE HalfKP-KK"
+#elif defined(EVAL_NNUE_HALFKP_PP)
+#define EVAL_TYPE_NAME "NNUE HalfKP-PP"
+#elif defined(EVAL_NNUE_HALFKP_GSGS)
+#define EVAL_TYPE_NAME "NNUE HalfKP-GSGS"
+#elif defined(EVAL_NNUE_HALFKP_DISTINGUISH_GOLDS)
+#define EVAL_TYPE_NAME "NNUE HalfKP Distinguish Golds"
+#elif defined(EVAL_NNUE_HALFKP_GAMEPLY40x4)
+#define EVAL_TYPE_NAME "NNUE HalfKP GamePly40x4"
+#elif defined(EVAL_NNUE_HALFKP_KINGSAFETY)
+#define EVAL_TYPE_NAME "NNUE HalfKP-KingSafety"
+
+
 #elif defined(EVAL_NNUE_KP256)
 #define EVAL_TYPE_NAME "NNUE KP256"
 #elif defined(EVAL_NNUE) // 標準NNUE halfKP256

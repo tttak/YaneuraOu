@@ -195,6 +195,9 @@ public:
 	// 平手の開始局面なら1が返る。(0ではない)
 	int game_ply() const { return gamePly; }
 
+	// 開始局面からの手数をセットする。
+	void set_game_ply(int ply) { gamePly = ply; }
+
 	// この局面クラスを用いて探索しているスレッドを返す。 
 	Thread* this_thread() const { return thisThread; }
 
@@ -576,9 +579,10 @@ public:
   // 各升の利きの数
 	LongEffect::ByteBoard board_effect[COLOR_NB];
 
-	// NNUE-HalfKPE9
+#if defined(USE_BOARD_EFFECT_PREV)
 	// 前局面のboard_effect（評価値の差分計算用）
 	LongEffect::ByteBoard board_effect_prev[COLOR_NB];
+#endif
 
 	// 長い利き(これは先後共用)
 	LongEffect::WordBoard long_effect;
