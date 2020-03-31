@@ -13,6 +13,8 @@ namespace NNUE {
 
 namespace Features {
 
+// TODO perspectiveが後手の場合が考慮されていない。要修正。
+
 // 特徴量のインデックスを求める
 inline IndexType KingSafety::MakeIndex(int index24, Piece pc, int effect1, int effect2) {
   return ((static_cast<IndexType>(index24)
