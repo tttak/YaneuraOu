@@ -325,7 +325,7 @@
 // #define EVAL_NNUE_KP256
 
 // どれか一つをdefineする。
-#define EVAL_NNUE_HALFKPE9
+//#define EVAL_NNUE_HALFKPE9
 //#define EVAL_NNUE_MATERIAL1
 //#define EVAL_NNUE_MATERIAL2
 //#define EVAL_NNUE_MATERIAL2_GAMEPLY
@@ -335,6 +335,7 @@
 //#define EVAL_NNUE_HALFKP_DISTINGUISH_GOLDS
 //#define EVAL_NNUE_HALFKP_GAMEPLY40x4
 //#define EVAL_NNUE_HALFKP_KINGSAFETY
+#define EVAL_NNUE_HALFKPKFILE
 
 
 #if defined(EVAL_NNUE_HALFKPE9)
@@ -611,6 +612,8 @@ constexpr bool Is64Bit = false;
 #define EVAL_TYPE_NAME "NNUE HalfKP GamePly40x4"
 #elif defined(EVAL_NNUE_HALFKP_KINGSAFETY)
 #define EVAL_TYPE_NAME "NNUE HalfKP-KingSafety"
+#elif defined(EVAL_NNUE_HALFKPKFILE)
+#define EVAL_TYPE_NAME "NNUE HalfKPKfile"
 
 
 #elif defined(EVAL_NNUE_KP256)

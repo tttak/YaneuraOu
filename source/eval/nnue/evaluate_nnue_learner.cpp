@@ -20,6 +20,7 @@
 #include "evaluate_nnue_learner.h"
 #include "trainer/features/factorizer_feature_set.h"
 
+// TODO 他の特徴量のfactorizer作成（次元下げ）
 #if defined(EVAL_NNUE_HALFKPE9)
 #include "trainer/features/factorizer_half_kpe9.h"
 #elif defined(EVAL_NNUE_HALFKP_PP)

@@ -32,6 +32,8 @@
 #include "architectures/halfkp_gameply40x4_256x2-32-32.h"
 #elif defined(EVAL_NNUE_HALFKP_KINGSAFETY)
 #include "architectures/halfkp-kingsafety_256x2-32-32.h"
+#elif defined(EVAL_NNUE_HALFKPKFILE)
+#include "architectures/halfkpkfile_256x2-32-32.h"
 
 // KP256型を使いたいときは、これを事前にdefineする。
 #elif defined(EVAL_NNUE_KP256)

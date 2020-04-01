@@ -259,6 +259,7 @@ ifeq ($(findstring YANEURAOU_ENGINE_NNUE,$(YANEURAOU_EDITION)),YANEURAOU_ENGINE_
 		eval/nnue/features/gsgs.cpp                                            \
 		eval/nnue/features/half_kp_gameply40x4.cpp                             \
 		eval/nnue/features/king_safety.cpp                                     \
+		eval/nnue/features/half_kpkfile.cpp                                    \
 		engine/yaneuraou-engine/yaneuraou-search.cpp
 endif
 
