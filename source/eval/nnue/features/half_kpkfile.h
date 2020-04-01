@@ -17,7 +17,7 @@ namespace NNUE {
 namespace Features {
 
 // 特徴量HalfKPKfile：自玉または敵玉の位置と、玉以外の駒の位置と、他方の玉の位置の筋（File）の組み合わせ
-// ・普通にHalfKKPにすると評価関数ファイルのサイズがHalfKPの81倍と巨大になるので、玉の位置の筋のみに絞る（玉の位置の段は使用しない）ことで9倍に抑える。
+// ・普通にHalfKKPにすると評価関数ファイルのサイズがHalfKPの81倍と巨大になるので、他方の玉の位置は筋のみに絞る（段は使用しない）ことで9倍に抑える。
 template <Side AssociatedKing>
 class HalfKPKfile {
  public:
