@@ -35,11 +35,17 @@ class KingSafety {
   // ・駒はNO_PIECE、PIECE_WALLを含む
   // ・利き数は先手と後手を同時に評価する
   // ・利き数は0～3に制限する
-  static constexpr IndexType kDimensions = Effect24::DIRECT_NB * static_cast<IndexType>(PIECE_WALL_NB) * 4 * 4;
+  static constexpr IndexType kDimensions = static_cast<IndexType>(Effect24::DIRECT_NB) * static_cast<IndexType>(PIECE_WALL_NB) * 4 * 4;
   // 特徴量のうち、同時に値が1となるインデックスの数の最大値
   static constexpr IndexType kMaxActiveDimensions = Effect24::DIRECT_NB;
+
   // 差分計算の代わりに全計算を行うタイミング
   // ・とりあえず差分計算なし
+  //   → 特徴量にPieceを含めているので、通常の方法では差分計算できない。
+  //      動いた駒の前局面のBonaPieceは取得できるが、BonaPieceからPieceを取得できない。BonaPieceは金と小駒の成り駒を区別していないので。
+  //      以下のいずれかの方法をとれば差分計算できるかもしれないが...
+  //        ・KingSafetyで使うPieceで金と小駒の成り駒を区別しないようにする。
+  //        ・BonaPieceで金と小駒の成り駒を区別するようにする。
   static constexpr TriggerEvent kRefreshTrigger = TriggerEvent::kAnyPieceMoved;
 
   // 特徴量のうち、値が1であるインデックスのリストを取得する
@@ -51,7 +57,13 @@ class KingSafety {
                                    IndexList* removed, IndexList* added);
 
   // 特徴量のインデックスを求める
-  static IndexType MakeIndex(int index24, Piece pc, int effect1, int effect2);
+  static IndexType MakeIndex(Color perspective, Effect24::Direct dir, Piece pc, int effect1, int effect2);
+
+  // Pieceの先後反転
+  static Piece Inv(Piece pc);
+
+  // Effect24::Directの先後反転
+  static Effect24::Direct Inv(Effect24::Direct dir);
 };
 
 }  // namespace Features
