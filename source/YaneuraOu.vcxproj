@@ -442,6 +442,7 @@
     <ClInclude Include="eval\nnue\trainer\features\factorizer_feature_set.h" />
     <ClInclude Include="eval\nnue\trainer\features\factorizer_half_kp.h" />
     <ClInclude Include="eval\nnue\trainer\features\factorizer_half_kpe9.h" />
+    <ClInclude Include="eval\nnue\trainer\features\factorizer_half_kp_gameply40x4.h" />
     <ClInclude Include="eval\nnue\trainer\features\factorizer_pp.h" />
     <ClInclude Include="eval\nnue\trainer\trainer.h" />
     <ClInclude Include="eval\nnue\trainer\trainer_affine_transform.h" />

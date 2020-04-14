@@ -339,6 +339,9 @@
     <ClInclude Include="eval\nnue\architectures\halfkp-kingsafety_distinguishgolds_256x2-32-32.h">
       <Filter>リソース ファイル\eval\nnue\architectures</Filter>
     </ClInclude>
+    <ClInclude Include="eval\nnue\trainer\features\factorizer_half_kp_gameply40x4.h">
+      <Filter>リソース ファイル\eval\nnue\trainer\features</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="movegen.cpp">
