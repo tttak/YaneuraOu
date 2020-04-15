@@ -28,6 +28,8 @@
 #include "trainer/features/factorizer_pp.h"
 #elif defined(EVAL_NNUE_HALFKP_GAMEPLY40x4)
 #include "trainer/features/factorizer_half_kp_gameply40x4.h"
+#elif defined(EVAL_NNUE_HALFKPKFILE)
+#include "trainer/features/factorizer_half_kpkfile.h"
 #else
 #include "trainer/features/factorizer_half_kp.h"
 #endif

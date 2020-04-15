@@ -342,6 +342,9 @@
     <ClInclude Include="eval\nnue\trainer\features\factorizer_half_kp_gameply40x4.h">
       <Filter>リソース ファイル\eval\nnue\trainer\features</Filter>
     </ClInclude>
+    <ClInclude Include="eval\nnue\trainer\features\factorizer_half_kpkfile.h">
+      <Filter>リソース ファイル\eval\nnue\trainer\features</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="movegen.cpp">
