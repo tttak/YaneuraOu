@@ -30,6 +30,9 @@
 #include "trainer/features/factorizer_half_kp_gameply40x4.h"
 #elif defined(EVAL_NNUE_HALFKPKFILE)
 #include "trainer/features/factorizer_half_kpkfile.h"
+#elif defined(EVAL_NNUE_HALFKP_KINGSAFETY_DISTINGUISH_GOLDS)
+#include "trainer/features/factorizer_half_kp.h"
+#include "trainer/features/factorizer_king_safety_distinguishgolds.h"
 #else
 #include "trainer/features/factorizer_half_kp.h"
 #endif

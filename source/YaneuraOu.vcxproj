@@ -405,6 +405,7 @@
     <ClInclude Include="eval\nnue\architectures\halfkp_256x2-32-32.h" />
     <ClInclude Include="eval\nnue\architectures\halfkp_gameply40x4_256x2-32-32.h" />
     <ClInclude Include="eval\nnue\architectures\k-p_256x2-32-32.h" />
+    <ClInclude Include="eval\nnue\architectures\kingsafety_distinguishgolds_factorizertest_256x2-32-32.h" />
     <ClInclude Include="eval\nnue\architectures\material1_256x2-32-32.h" />
     <ClInclude Include="eval\nnue\architectures\material2_256x2-32-32.h" />
     <ClInclude Include="eval\nnue\architectures\material2-gameply_256x2-32-32.h" />
@@ -421,6 +422,9 @@
     <ClInclude Include="eval\nnue\features\half_relative_kp.h" />
     <ClInclude Include="eval\nnue\features\index_list.h" />
     <ClInclude Include="eval\nnue\features\k.h" />
+    <ClInclude Include="eval\nnue\features\king24_defenseeffect.h" />
+    <ClInclude Include="eval\nnue\features\king24_piece_distinguishgolds.h" />
+    <ClInclude Include="eval\nnue\features\king24_attackeffect.h" />
     <ClInclude Include="eval\nnue\features\king_safety.h" />
     <ClInclude Include="eval\nnue\features\king_safety_distinguishgolds.h" />
     <ClInclude Include="eval\nnue\features\kk.h" />
@@ -444,6 +448,7 @@
     <ClInclude Include="eval\nnue\trainer\features\factorizer_half_kpe9.h" />
     <ClInclude Include="eval\nnue\trainer\features\factorizer_half_kpkfile.h" />
     <ClInclude Include="eval\nnue\trainer\features\factorizer_half_kp_gameply40x4.h" />
+    <ClInclude Include="eval\nnue\trainer\features\factorizer_king_safety_distinguishgolds.h" />
     <ClInclude Include="eval\nnue\trainer\features\factorizer_pp.h" />
     <ClInclude Include="eval\nnue\trainer\trainer.h" />
     <ClInclude Include="eval\nnue\trainer\trainer_affine_transform.h" />
@@ -499,6 +504,9 @@
     <ClCompile Include="eval\nnue\features\half_kp_gameply40x4.cpp" />
     <ClCompile Include="eval\nnue\features\half_relative_kp.cpp" />
     <ClCompile Include="eval\nnue\features\k.cpp" />
+    <ClCompile Include="eval\nnue\features\king24_defenseeffect.cpp" />
+    <ClCompile Include="eval\nnue\features\king24_piece_distinguishgolds.cpp" />
+    <ClCompile Include="eval\nnue\features\king24_attackeffect.cpp" />
     <ClCompile Include="eval\nnue\features\king_safety.cpp" />
     <ClCompile Include="eval\nnue\features\king_safety_distinguishgolds.cpp" />
     <ClCompile Include="eval\nnue\features\kk.cpp" />

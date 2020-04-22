@@ -345,6 +345,21 @@
     <ClInclude Include="eval\nnue\trainer\features\factorizer_half_kpkfile.h">
       <Filter>リソース ファイル\eval\nnue\trainer\features</Filter>
     </ClInclude>
+    <ClInclude Include="eval\nnue\features\king24_piece_distinguishgolds.h">
+      <Filter>リソース ファイル\eval\nnue\features</Filter>
+    </ClInclude>
+    <ClInclude Include="eval\nnue\architectures\kingsafety_distinguishgolds_factorizertest_256x2-32-32.h">
+      <Filter>リソース ファイル\eval\nnue\architectures</Filter>
+    </ClInclude>
+    <ClInclude Include="eval\nnue\trainer\features\factorizer_king_safety_distinguishgolds.h">
+      <Filter>リソース ファイル\eval\nnue\trainer\features</Filter>
+    </ClInclude>
+    <ClInclude Include="eval\nnue\features\king24_attackeffect.h">
+      <Filter>リソース ファイル\eval\nnue\features</Filter>
+    </ClInclude>
+    <ClInclude Include="eval\nnue\features\king24_defenseeffect.h">
+      <Filter>リソース ファイル\eval\nnue\features</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="movegen.cpp">
@@ -519,6 +534,15 @@
       <Filter>リソース ファイル\eval\nnue\features</Filter>
     </ClCompile>
     <ClCompile Include="eval\nnue\features\king_safety_distinguishgolds.cpp">
+      <Filter>リソース ファイル\eval\nnue\features</Filter>
+    </ClCompile>
+    <ClCompile Include="eval\nnue\features\king24_piece_distinguishgolds.cpp">
+      <Filter>リソース ファイル\eval\nnue\features</Filter>
+    </ClCompile>
+    <ClCompile Include="eval\nnue\features\king24_attackeffect.cpp">
+      <Filter>リソース ファイル\eval\nnue\features</Filter>
+    </ClCompile>
+    <ClCompile Include="eval\nnue\features\king24_defenseeffect.cpp">
       <Filter>リソース ファイル\eval\nnue\features</Filter>
     </ClCompile>
   </ItemGroup>
