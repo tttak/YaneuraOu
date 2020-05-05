@@ -38,6 +38,8 @@
 #include "architectures/halfkp-kingsafety_distinguishgolds_256x2-32-32.h"
 #elif defined(EVAL_NNUE_HALFKP_KINGSAFETY_DISTINGUISH_GOLDS_FACTORIZER_TEST)
 #include "architectures/kingsafety_distinguishgolds_factorizertest_256x2-32-32.h"
+#elif defined(EVAL_NNUE_HALFKPE4)
+#include "architectures/halfkpe4_256x2-32-32.h"
 
 // KP256型を使いたいときは、これを事前にdefineする。
 #elif defined(EVAL_NNUE_KP256)

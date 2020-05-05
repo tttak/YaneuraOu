@@ -33,6 +33,8 @@
 #elif defined(EVAL_NNUE_HALFKP_KINGSAFETY_DISTINGUISH_GOLDS)
 #include "trainer/features/factorizer_half_kp.h"
 #include "trainer/features/factorizer_king_safety_distinguishgolds.h"
+#elif defined(EVAL_NNUE_HALFKPE4)
+#include "trainer/features/factorizer_half_kpe4.h"
 #else
 #include "trainer/features/factorizer_half_kp.h"
 #endif

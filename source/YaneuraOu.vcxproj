@@ -400,6 +400,7 @@
     <ClInclude Include="eval\nnue\architectures\halfkp-kingsafety_distinguishgolds_256x2-32-32.h" />
     <ClInclude Include="eval\nnue\architectures\halfkp-kk_256x2-32-32.h" />
     <ClInclude Include="eval\nnue\architectures\halfkp-pp_256x2-32-32.h" />
+    <ClInclude Include="eval\nnue\architectures\halfkpe4_256x2-32-32.h" />
     <ClInclude Include="eval\nnue\architectures\halfkpe9_256x2-32-32.h" />
     <ClInclude Include="eval\nnue\architectures\halfkpkfile_256x2-32-32.h" />
     <ClInclude Include="eval\nnue\architectures\halfkp_256x2-32-32.h" />
@@ -416,6 +417,7 @@
     <ClInclude Include="eval\nnue\features\gameply.h" />
     <ClInclude Include="eval\nnue\features\gsgs.h" />
     <ClInclude Include="eval\nnue\features\half_kp.h" />
+    <ClInclude Include="eval\nnue\features\half_kpe4.h" />
     <ClInclude Include="eval\nnue\features\half_kpe9.h" />
     <ClInclude Include="eval\nnue\features\half_kpkfile.h" />
     <ClInclude Include="eval\nnue\features\half_kp_gameply40x4.h" />
@@ -431,6 +433,7 @@
     <ClInclude Include="eval\nnue\features\material1.h" />
     <ClInclude Include="eval\nnue\features\material2.h" />
     <ClInclude Include="eval\nnue\features\p.h" />
+    <ClInclude Include="eval\nnue\features\pe4.h" />
     <ClInclude Include="eval\nnue\features\pe9.h" />
     <ClInclude Include="eval\nnue\features\pp.h" />
     <ClInclude Include="eval\nnue\layers\affine_transform.h" />
@@ -445,6 +448,7 @@
     <ClInclude Include="eval\nnue\trainer\features\factorizer.h" />
     <ClInclude Include="eval\nnue\trainer\features\factorizer_feature_set.h" />
     <ClInclude Include="eval\nnue\trainer\features\factorizer_half_kp.h" />
+    <ClInclude Include="eval\nnue\trainer\features\factorizer_half_kpe4.h" />
     <ClInclude Include="eval\nnue\trainer\features\factorizer_half_kpe9.h" />
     <ClInclude Include="eval\nnue\trainer\features\factorizer_half_kpkfile.h" />
     <ClInclude Include="eval\nnue\trainer\features\factorizer_half_kp_gameply40x4.h" />
@@ -499,6 +503,7 @@
     <ClCompile Include="eval\nnue\features\gameply.cpp" />
     <ClCompile Include="eval\nnue\features\gsgs.cpp" />
     <ClCompile Include="eval\nnue\features\half_kp.cpp" />
+    <ClCompile Include="eval\nnue\features\half_kpe4.cpp" />
     <ClCompile Include="eval\nnue\features\half_kpe9.cpp" />
     <ClCompile Include="eval\nnue\features\half_kpkfile.cpp" />
     <ClCompile Include="eval\nnue\features\half_kp_gameply40x4.cpp" />
@@ -513,6 +518,7 @@
     <ClCompile Include="eval\nnue\features\material1.cpp" />
     <ClCompile Include="eval\nnue\features\material2.cpp" />
     <ClCompile Include="eval\nnue\features\p.cpp" />
+    <ClCompile Include="eval\nnue\features\pe4.cpp" />
     <ClCompile Include="eval\nnue\features\pe9.cpp" />
     <ClCompile Include="eval\nnue\features\pp.cpp" />
     <ClCompile Include="eval\nnue\nnue_test_command.cpp" />

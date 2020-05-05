@@ -264,6 +264,8 @@ ifeq ($(findstring YANEURAOU_ENGINE_NNUE,$(YANEURAOU_EDITION)),YANEURAOU_ENGINE_
 		eval/nnue/features/king24_piece_distinguishgolds.cpp                   \
 		eval/nnue/features/king24_defenseeffect.cpp                            \
 		eval/nnue/features/king24_attackeffect.cpp                             \
+		eval/nnue/features/half_kpe4.cpp                                       \
+		eval/nnue/features/pe4.cpp                                             \
 		engine/yaneuraou-engine/yaneuraou-search.cpp
 endif
 
