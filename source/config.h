@@ -323,8 +323,8 @@
 // ※　これをdefineしていなければNNUE標準のhalfKP256になる。
 // #define EVAL_NNUE_KP256
 
-// どれか一つをdefineする。
-//#define EVAL_NNUE_HALFKPE9
+// どれか一つをdefineする。（どれもdefineしない場合はHalfKP）
+#define EVAL_NNUE_HALFKPE9
 //#define EVAL_NNUE_MATERIAL1
 //#define EVAL_NNUE_MATERIAL2
 //#define EVAL_NNUE_MATERIAL2_GAMEPLY
@@ -336,7 +336,7 @@
 //#define EVAL_NNUE_HALFKP_KINGSAFETY
 //#define EVAL_NNUE_HALFKPKFILE
 //#define EVAL_NNUE_HALFKP_KINGSAFETY_DISTINGUISH_GOLDS
-#define EVAL_NNUE_HALFKPE4
+//#define EVAL_NNUE_HALFKPE4
 
 // テスト用
 //#define EVAL_NNUE_HALFKP_KINGSAFETY_DISTINGUISH_GOLDS_FACTORIZER_TEST
@@ -360,7 +360,14 @@
 #define DISTINGUISH_GOLDS
 #endif
 
-#endif
+
+// Statsに駒の利きを使う場合
+#define LONG_EFFECT_LIBRARY
+#define USE_BOARD_EFFECT_PREV
+#define USE_LONG_EFFECT_PREV
+
+
+#endif // defined(YANEURAOU_ENGINE_NNUE)
 
 #endif // defined(YANEURAOU_ENGINE_KPPT) || ...
 

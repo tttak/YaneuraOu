@@ -1228,6 +1228,11 @@ void Position::do_move_impl(Move m, StateInfo& new_st, bool givesCheck)
 	std::memcpy(board_effect_prev, board_effect, sizeof(board_effect));
 #endif
 
+#if defined(USE_LONG_EFFECT_PREV)
+	// 現局面のlong_effectをコピー
+	std::memcpy(&long_effect_prev, &long_effect, sizeof(long_effect));
+#endif
+
 	// 直前の指し手を保存するならばここで行なう。
 
 #if defined (KEEP_LAST_MOVE)
@@ -2151,6 +2156,105 @@ bool Position::pos_is_ok() const
 	// 二歩のチェックなど云々かんぬん..面倒くさいので省略。
 
 	return true;
+}
+
+// Stats用の駒の利きのインデックスを算出して返す
+// ・0～15を返す。
+// ・fromとtoのマスへの駒の利きの有無（手番側/相手側）を元に算出する。
+int Position::calcEffectIndexOfStats(Move move, bool previous) const {
+	bool hasEffect_from_us;
+	bool hasEffect_from_them;
+	bool hasEffect_to_us;
+	bool hasEffect_to_them;
+
+	Color perspective = previous ? ~sideToMove : sideToMove;
+	Square toSq = to_sq(move);
+
+	if (previous) {
+		if (is_drop(move)) {
+			hasEffect_from_us   = false;
+			hasEffect_from_them = false;
+			hasEffect_to_us     = (this->board_effect     [ perspective].effect(toSq  ) > 0);
+			hasEffect_to_them   = (this->board_effect     [~perspective].effect(toSq  ) > 0);
+		}
+		else {
+			Square fromSq = from_sq(move);
+			hasEffect_from_us   = (this->board_effect_prev[ perspective].effect(fromSq) > 0);
+			hasEffect_from_them = (this->board_effect_prev[~perspective].effect(fromSq) > 0);
+			hasEffect_to_us     = (this->board_effect     [ perspective].effect(toSq  ) > 0);
+			hasEffect_to_them   = (this->board_effect     [~perspective].effect(toSq  ) > 0);
+		}
+	}
+	else {
+		if (is_drop(move)) {
+			hasEffect_from_us   = false;
+			hasEffect_from_them = false;
+			hasEffect_to_us     = (this->board_effect     [ perspective].effect(toSq  ) > 0);
+			hasEffect_to_them   = (this->board_effect     [~perspective].effect(toSq  ) > 0);
+		}
+		else {
+			Square fromSq = from_sq(move);
+			hasEffect_from_us   = (this->board_effect     [ perspective].effect(fromSq) > 0);
+			hasEffect_from_them = (this->board_effect     [~perspective].effect(fromSq) > 0);
+
+			// ----- hasEffect_to_usの導出
+			if (this->board_effect[perspective].effect(toSq) > 1) {
+				hasEffect_to_us = true;
+			}
+			else {
+				Directions dirs_long_effect = this->long_effect.directions_of(perspective, fromSq);
+
+				if (dirs_long_effect == 0) {
+					hasEffect_to_us = false;
+				}
+				else {
+					Directions dirs_from_to(directions_of(fromSq, toSq));
+					Direct dir_from_to = pop_directions(dirs_from_to);
+
+					hasEffect_to_us = false;
+					while (dirs_long_effect) {
+						Direct dir_long_effect = pop_directions(dirs_long_effect);
+						if (dir_long_effect == dir_from_to) {
+							hasEffect_to_us = true;
+							break;
+						}
+					}
+				}
+			}
+
+			// ----- hasEffect_to_themの導出
+			if (this->board_effect[~perspective].effect(toSq) > 0) {
+				hasEffect_to_them = true;
+			}
+			else {
+				Directions dirs_long_effect = this->long_effect.directions_of(~perspective, fromSq);
+
+				if (dirs_long_effect == 0) {
+					hasEffect_to_them = false;
+				}
+				else {
+					Directions dirs_from_to(directions_of(fromSq, toSq));
+					Direct dir_from_to = pop_directions(dirs_from_to);
+
+					hasEffect_to_them = false;
+					while (dirs_long_effect) {
+						Direct dir_long_effect = pop_directions(dirs_long_effect);
+
+						if (dir_long_effect == dir_from_to) {
+							hasEffect_to_them = true;
+							break;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return         hasEffect_from_us
+			+ 2 * (hasEffect_from_them
+			+ 2 * (hasEffect_to_us
+			+ 2 * (hasEffect_to_them
+			)));
 }
 
 // 明示的な実体化

@@ -586,6 +586,12 @@ public:
 
 	// 長い利き(これは先後共用)
 	LongEffect::WordBoard long_effect;
+
+#if defined(USE_LONG_EFFECT_PREV)
+	// 前局面の長い利き(これは先後共用)
+	LongEffect::WordBoard long_effect_prev;
+#endif
+
 #endif
 
 	// --- デバッグ用の出力
@@ -603,6 +609,9 @@ public:
 	// MoveGenerator(指し手生成器)からは盤面・手駒にアクセス出来る必要があるのでfriend
 	template <MOVE_GEN_TYPE gen_type, bool gen_all>
 	friend struct MoveGenerator;
+
+	// Stats用の駒の利きのインデックスを算出して返す
+	int calcEffectIndexOfStats(Move move, bool previous) const;
 
 private:
 	// StateInfoの初期化(初期化するときに内部的に用いる)

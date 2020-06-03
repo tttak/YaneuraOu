@@ -182,7 +182,7 @@ void MovePicker::score()
 			// TODO:歩の成りは別途考慮してもいいような気はするのだが…。
 
 			m.value = (int)Eval::CapturePieceValue[pos.piece_on(to_sq(m))] * 6
-					+ (*captureHistory)[to_sq(m)][pos.moved_piece_after(m)][type_of(pos.piece_on(to_sq(m)))];
+					+ (*captureHistory)[to_sq(m)][pos.moved_piece_after(m)][type_of(pos.piece_on(to_sq(m)))][pos.calcEffectIndexOfStats(m, false)];
 		}
 		else if (Type == QUIETS)
 		{
@@ -190,13 +190,14 @@ void MovePicker::score()
 
 			Piece movedPiece = pos.moved_piece_after(m);
 			Square movedSq = to_sq(m);
+			int effectIndexOfStats = pos.calcEffectIndexOfStats(m, false);
 
-			m.value = (*mainHistory)[from_to(m)][pos.side_to_move()]
+			m.value = (*mainHistory)[from_to(m)][pos.side_to_move()][effectIndexOfStats]
 				+ 2 * (*continuationHistory[0])[movedSq][movedPiece]
 				+ 2 * (*continuationHistory[1])[movedSq][movedPiece]
 				+ 2 * (*continuationHistory[3])[movedSq][movedPiece]
 				+     (*continuationHistory[5])[movedSq][movedPiece]
-				+ (ply < MAX_LPH ? 4 * (*lowPlyHistory)[ply][from_to(m)] : 0);;
+				+ (ply < MAX_LPH ? 4 * (*lowPlyHistory)[ply][from_to(m)][effectIndexOfStats] : 0);
 		}
 		else // Type == EVASIONS
 		{
@@ -228,7 +229,7 @@ void MovePicker::score()
 				        - (Value)(LVA(type_of(pos.moved_piece_before(m))));
 			else
 				// 捕獲しない指し手に関してはhistoryの値の順番
-				m.value = (*mainHistory)[from_to(m)][pos.side_to_move()] 
+				m.value = (*mainHistory)[from_to(m)][pos.side_to_move()][pos.calcEffectIndexOfStats(m, false)]
 				+ (*continuationHistory[0])[to_sq(m)][pos.moved_piece_after(m)]
 				- (1 << 28);
 

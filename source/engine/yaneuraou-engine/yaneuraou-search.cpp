@@ -1364,7 +1364,7 @@ namespace {
 		formerPv = ttPv && !PvNode;
 
 		if (ttPv && depth > 12 && ss->ply - 1 < MAX_LPH && !pos.captured_piece() && is_ok((ss - 1)->currentMove))
-			thisThread->lowPlyHistory[ss->ply - 1][from_to((ss - 1)->currentMove)] << stat_bonus(depth - 5);
+			thisThread->lowPlyHistory[ss->ply - 1][from_to((ss - 1)->currentMove)][pos.calcEffectIndexOfStats((ss - 1)->currentMove, true)] << stat_bonus(depth - 5);
 
 		// thisThread->ttHitAverage can be used to approximate the running average of ttHit
 		thisThread->ttHitAverage = (ttHitAverageWindow - 1) * thisThread->ttHitAverage / ttHitAverageWindow
@@ -1423,7 +1423,7 @@ namespace {
 #endif
 				{
 					int penalty = -stat_bonus(depth);
-					thisThread->mainHistory[from_to(ttMove)][us] << penalty;
+					thisThread->mainHistory[from_to(ttMove)][us][pos.calcEffectIndexOfStats(ttMove, false)] << penalty;
 					update_continuation_histories(ss, pos.moved_piece_after(ttMove), to_sq(ttMove), penalty);
 				}
 			}
@@ -1783,7 +1783,7 @@ namespace {
 											  nullptr, (ss - 4)->continuationHistory,
 											  nullptr, (ss - 6)->continuationHistory };
 		Piece prevPc = pos.piece_on(prevSq);
-		Move countermove = thisThread->counterMoves[prevSq][prevPc];
+		Move countermove = thisThread->counterMoves[prevSq][prevPc][pos.calcEffectIndexOfStats((ss - 1)->currentMove, true)];
 
 		MovePicker mp(pos, ttMove, depth, &thisThread->mainHistory, 
 					  &thisThread->lowPlyHistory, 
@@ -1946,7 +1946,7 @@ namespace {
 					// Capture history based pruning when the move doesn't give check
 					if (!givesCheck
 						&& lmrDepth < 1
-						&& captureHistory[movedSq][movedPiece][type_of(pos.piece_on(to_sq(move)))] < 0)
+						&& captureHistory[movedSq][movedPiece][type_of(pos.piece_on(to_sq(move)))][pos.calcEffectIndexOfStats(move, false)] < 0)
 						continue;
 
 #if 0
@@ -2217,7 +2217,7 @@ namespace {
 #endif
 
 					// 【計測資料 11.】statScoreの計算でcontHist[3]も調べるかどうか。
-					ss->statScore = thisThread->mainHistory[from_to(move)][us]
+					ss->statScore = thisThread->mainHistory[from_to(move)][us][pos.calcEffectIndexOfStats(move, true)]
 						+ (*contHist[0])[movedSq][movedPiece]
 						+ (*contHist[1])[movedSq][movedPiece]
 						+ (*contHist[3])[movedSq][movedPiece]
@@ -2928,12 +2928,12 @@ namespace {
 			// Decrease all the non-best quiet moves
 			for (int i = 0; i < quietCount; ++i)
 			{
-				thisThread->mainHistory[from_to(quietsSearched[i])][us] << -bonus2;
+				thisThread->mainHistory[from_to(quietsSearched[i])][us][pos.calcEffectIndexOfStats(quietsSearched[i], false)] << -bonus2;
 				update_continuation_histories(ss, pos.moved_piece_after(quietsSearched[i]), to_sq(quietsSearched[i]), -bonus2);
 			}
 		}
 		else
-			captureHistory[to_sq(bestMove)][moved_piece][captured] << bonus1;
+			captureHistory[to_sq(bestMove)][moved_piece][captured][pos.calcEffectIndexOfStats(bestMove, false)] << bonus1;
 
 		// Extra penalty for a quiet TT or main killer move in previous ply when it gets refuted
 		if (((ss - 1)->moveCount == 1 || ((ss - 1)->currentMove == (ss - 1)->killers[0]))
@@ -2945,7 +2945,7 @@ namespace {
 		{
 			moved_piece = pos.moved_piece_after(capturesSearched[i]);
 			captured = type_of(pos.piece_on(to_sq(capturesSearched[i])));
-			captureHistory[to_sq(capturesSearched[i])][moved_piece][captured] << -bonus1;
+			captureHistory[to_sq(capturesSearched[i])][moved_piece][captured][pos.calcEffectIndexOfStats(capturesSearched[i], false)] << -bonus1;
 		}
 	}
 
@@ -2987,7 +2987,7 @@ namespace {
 		Color us = pos.side_to_move();
 
 		Thread* thisThread = pos.this_thread();
-		thisThread->mainHistory[from_to(move)][us] << bonus;
+		thisThread->mainHistory[from_to(move)][us][pos.calcEffectIndexOfStats(move, false)] << bonus;
 		update_continuation_histories(ss, pos.moved_piece_after(move), to_sq(move), bonus);
 
 #if 0
@@ -2999,11 +2999,11 @@ namespace {
 		{
 			// 直前に移動させた升(その升に移動させた駒がある。今回の指し手はcaptureではないはずなので)
 			Square prevSq = to_sq((ss - 1)->currentMove);
-			thisThread->counterMoves[prevSq][pos.piece_on(prevSq)] = move;
+			thisThread->counterMoves[prevSq][pos.piece_on(prevSq)][pos.calcEffectIndexOfStats((ss - 1)->currentMove, true)] = move;
 		}
 
 		if (depth > 12 && ss->ply < MAX_LPH)
-			thisThread->lowPlyHistory[ss->ply][from_to(move)] << stat_bonus(depth - 7);
+			thisThread->lowPlyHistory[ss->ply][from_to(move)][pos.calcEffectIndexOfStats(move, false)] << stat_bonus(depth - 7);
 	}
 
 	// 手加減が有効であるなら、best moveを'level'に依存する統計ルールに基づくRootMovesの集合から選ぶ。

@@ -80,23 +80,27 @@ enum StatsType { NoCaptures, Captures };
 // やねうら王では、ここで用いられるfromは、駒打ちのときに特殊な値になっていて、盤上のfromとは区別される。
 // そのため、(SQ_NB + 7)まで移動元がある。
 // ※　Stockfishとは、添字の順番を入れ替えてあるので注意。
-typedef Stats<int16_t, 10692, int(SQ_NB + 7) * int(SQ_NB), COLOR_NB> ButterflyHistory;
+// 駒の利きで16種類に細分化（fromとtoのマスへの駒の利きの有無（手番側/相手側））
+typedef Stats<int16_t, 10692, int(SQ_NB + 7) * int(SQ_NB), COLOR_NB, 2 * 2 * 2 * 2> ButterflyHistory;
 
 /// LowPlyHistory at higher depths records successful quiet moves on plies 0 to 3
 /// and quiet moves which are/were in the PV (ttPv)
 /// It get cleared with each new search and get filled during iterative deepening
+// 駒の利きで16種類に細分化（fromとtoのマスへの駒の利きの有無（手番側/相手側））
 constexpr int MAX_LPH = 4;
-typedef Stats<int16_t, 10692, MAX_LPH, int(SQ_NB + 7) * int(SQ_NB)> LowPlyHistory;
+typedef Stats<int16_t, 10692, MAX_LPH, int(SQ_NB + 7) * int(SQ_NB), 2 * 2 * 2 * 2> LowPlyHistory;
 
 /// CounterMoveHistoryは、直前の指し手の[to][piece]によってindexされるcounter moves(応手)を格納する。
 /// cf. http://chessprogramming.wikispaces.com/Countermove+Heuristic
 // ※　Stockfishとは、添字の順番を入れ替えてあるので注意。
-typedef Stats<Move, NOT_USED, SQ_NB , PIECE_NB> CounterMoveHistory;
+// 駒の利きで16種類に細分化（fromとtoのマスへの駒の利きの有無（手番側/相手側））
+typedef Stats<Move, NOT_USED, SQ_NB , PIECE_NB, 2 * 2 * 2 * 2> CounterMoveHistory;
 
 /// CapturePieceToHistoryは、指し手の[to][piece][captured piece type]で示される。
 // ※　Stockfishとは、添字の順番を変更してあるので注意。
 //    Stockfishでは、[piece][to][captured piece type]の順。
-typedef Stats<int16_t, 10692, SQ_NB, PIECE_NB , PIECE_TYPE_NB> CapturePieceToHistory;
+// 駒の利きで16種類に細分化（fromとtoのマスへの駒の利きの有無（手番側/相手側））
+typedef Stats<int16_t, 10692, SQ_NB, PIECE_NB , PIECE_TYPE_NB, 2 * 2 * 2 * 2> CapturePieceToHistory;
 
 /// PieceToHistoryは、ButterflyHistoryに似たものだが、指し手の[to][piece]で示される。
 // ※　Stockfishとは、添字の順番を入れ替えてあるので注意。
