@@ -364,7 +364,7 @@
 // Statsに駒の利きを使う場合
 #define LONG_EFFECT_LIBRARY
 #define USE_BOARD_EFFECT_PREV
-#define USE_LONG_EFFECT_PREV
+//#define USE_LONG_EFFECT_PREV
 
 
 #endif // defined(YANEURAOU_ENGINE_NNUE)
