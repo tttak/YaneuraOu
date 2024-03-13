@@ -84,8 +84,8 @@ DEBUG = OFF
 
 # 使用するコンパイラ (compiler)
 # ※ clangでコンパイルしたほうがgccより数%速いっぽい。
-COMPILER = g++
-#COMPILER = clang++
+#COMPILER = g++
+COMPILER = clang++
 #COMPILER = em++
 
 
