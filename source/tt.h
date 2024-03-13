@@ -1,123 +1,94 @@
-﻿#ifndef _TT_H_
-#define _TT_H_
+﻿#ifndef TT_H_INCLUDED
+#define TT_H_INCLUDED
 
-#include "shogi.h"
+//#include <cstddef>
+//#include <cstdint>
+#include "types.h"
+#include "misc.h"
+
+struct Key128;
+struct Key256;
+
+// cf.【決定版】コンピュータ将棋のHASHの概念について詳しく : http://yaneuraou.yaneu.com/2018/11/18/%E3%80%90%E6%B1%BA%E5%AE%9A%E7%89%88%E3%80%91%E3%82%B3%E3%83%B3%E3%83%94%E3%83%A5%E3%83%BC%E3%82%BF%E5%B0%86%E6%A3%8B%E3%81%AEhash%E3%81%AE%E6%A6%82%E5%BF%B5%E3%81%AB%E3%81%A4%E3%81%84%E3%81%A6/
 
 // --------------------
 //       置換表
 // --------------------
 
-// 置換表エントリー
-// 本エントリーは10bytesに収まるようになっている。3つのエントリーを並べたときに32bytesに収まるので
-// CPUのcache lineに一発で載るというミラクル。
+/// 置換表エントリー
+/// 本エントリーは10bytesに収まるようになっている。3つのエントリーを並べたときに32bytesに収まるので
+/// CPUのcache lineに一発で載るというミラクル。
+///
+/// ※ cache line sizeは、IntelだとPentium4やPentiumMからでPentiumⅢ(3)までは32byte。
+///    そこ以降64byte。AMDだとK8のときには既に64byte。
+///
+/// key        16 bit : hash keyの下位16bit(bit0は除くのでbit16..1)
+/// depth       8 bit : 格納されているvalue値の探索深さ
+/// move       16 bit : このnodeの最善手(指し手16bit ≒ Move16 , Moveの上位16bitは無視される)
+/// generation  5 bit : このエントリーにsave()された時のTTの世代カウンターの値
+/// pv node     1 bit : PV nodeで調べた値であるかのフラグ
+/// bound type  2 bit : 格納されているvalue値の性質(fail low/highした時の値であるだとか)
+/// value      16 bit : このnodeでのsearch()の返し値
+/// eval value 16 bit : このnodeでのevaluate()の返し値
 struct TTEntry {
 
-	Move move() const { return (Move)move16; }
-	Value value() const { return (Value)value16; }
-	void set_value(Value v) { value16 = v; }
-
-#if !defined (NO_EVAL_IN_TT)
-	// この局面でevaluate()を呼び出したときの値
-	Value eval() const { return (Value)eval16; }
-#endif
-
-	Depth depth() const { return (Depth)(depth8 * int(ONE_PLY)); }
-	Bound bound() const { return (Bound)(genBound8 & 0x3); }
-
-	uint8_t generation() const { return genBound8 & 0xfc; }
-	void set_generation(uint8_t g) { genBound8 = bound() | g; }
+	Move16 move()  const { return Move16(move16); }
+	Value  value() const { return Value(value16); }
+	Value  eval()  const { return Value(eval16 ); }
+	Depth  depth() const { return Depth(depth8 + DEPTH_OFFSET); }
+	bool   is_pv() const { return bool (genBound8 & 0x4); }
+	Bound  bound() const { return Bound(genBound8 & 0x3); }
 
 	// 置換表のエントリーに対して与えられたデータを保存する。上書き動作
 	//   v    : 探索のスコア
-	//   eval : 評価関数 or 静止探索の値
+	//   ev   : 評価関数 or 静止探索の値
+	//   pv   : PV nodeであるか
+	//   d    : その時の探索深さ
 	//   m    : ベストな指し手
-	//   gen  : TT.generation()
-	void save(Key k, Value v, Bound b, Depth d, Move m,
-#if !defined (NO_EVAL_IN_TT)
-		Value eval,
+	// ※ KeyとしてKey(64 bit)以外に 128,256bitのhash keyにも対応。(やねうら王独自拡張)
+	void save(Key     k, Value v, bool pv , Bound b, Depth d, Move m, Value ev);
+	void save(Key128& k, Value v, bool pv , Bound b, Depth d, Move m, Value ev);
+	void save(Key256& k, Value v, bool pv , Bound b, Depth d, Move m, Value ev);
+
+	// -- やねうら王独自拡張
+
+	// やねうら王では、TTClusterSizeを変更できて、これが2の時は、TTEntryに格納するhash keyは64bit。(Stockfishのように)3の時は16bit。
+#if TT_CLUSTER_SIZE == 3
+	typedef uint16_t KEY_TYPE;
+#else // TT_CLUSTER_SIZEが2,4,6,8の時は64bit。5,7は選択する意味がないと思うので考えない。
+	typedef uint64_t KEY_TYPE;
 #endif
-		uint8_t gen)
-	{
-		// ASSERT_LV3((-VALUE_INFINITE < v && v < VALUE_INFINITE) || v == VALUE_NONE);
-
-		// 置換表にVALUE_INFINITE以上の値を書き込んでしまうのは本来はおかしいが、
-		// 実際には置換表が衝突したときにqsearch()から書き込んでしまう。
-		//
-		// 例えば、3手詰めの局面で、置換表衝突により1手詰めのスコアが返ってきた場合、VALUE_INFINITEより
-		// 大きな値を書き込む。
-		//
-		// 逆に置換表をprobe()したときにそのようなスコアが返ってくることがある。
-		// しかしこのようなスコアは、mate distance pruningで補正されるので問題ない。
-		// (ように、探索部を書くべきである。)
-		//
-		// Stockfishで、VALUE_INFINITEを32001(int16_tの最大値よりMAX_PLY以上小さな値)にしてあるのは
-		// そういった理由から。
-
-
-		// このif式だが、
-		// A = m!=MOVE_NONE
-		// B = (k >> 48) != key16)
-		// として、ifが成立するのは、
-		// a)  A && !B
-		// b)  A &&  B
-		// c) !A &&  B
-		// の3パターン。b),c)は、B == trueなので、その下にある次のif式が成立して、この局面のhash keyがkey16に格納される。
-		// a)は、B == false すなわち、(k >> 48) == key16であり、この局面用のentryであるから、その次のif式が成立しないとしても
-		// 整合性は保てる。
-		// a)のケースにおいても、指し手の情報は格納しておいたほうがいい。
-		// これは、このnodeで、TT::probeでhitして、その指し手は試したが、それよりいい手が見つかって、枝刈り等が発生しているような
-		// ケースが考えられる。ゆえに、今回の指し手のほうが、いまの置換表の指し手より価値があると考えられる。
-
-		if (m != MOVE_NONE || (k >> 48) != key16)
-			move16 = (uint16_t)m;
-
-		// このエントリーの現在の内容のほうが価値があるなら上書きしない。
-		// 1. hash keyが違うということはTT::probeでここを使うと決めたわけだから、このEntryは無条件に潰して良い
-		// 2. hash keyが同じだとしても今回の情報のほうが残り探索depthが深い(新しい情報にも価値があるので
-		// 　少しの深さのマイナスなら許容)
-		// 3. BOUND_EXACT(これはPVnodeで探索した結果で、とても価値のある情報なので無条件で書き込む)
-		// 1. or 2. or 3.
-		if (  (k >> 48) != key16
-			|| (d / ONE_PLY > depth8 - 4)
-			/*|| g != generation() // probe()において非0のkeyとマッチした場合、その瞬間に世代はrefreshされている。　*/
-			|| b == BOUND_EXACT
-			)
-		{
-			key16 = (uint16_t)(k >> 48);
-			value16 = (int16_t)v;
-#if !defined (NO_EVAL_IN_TT)
-			eval16 = (int16_t)eval;
-#endif
-			genBound8 = (uint8_t)(gen | b);
-			depth8 = (int8_t)(d / ONE_PLY);
-		}
-	}
 
 private:
 	friend struct TranspositionTable;
 
-	// hash keyの上位16bit。下位48bitはこのエントリー(のアドレス)に一致しているということは
-	// そこそこ合致しているという前提のコード
-	uint16_t key16;
+	// save()の内部実装用
+	void save_(TTEntry::KEY_TYPE key_for_ttentry, Value v, bool pv , Bound b, Depth d, Move m, Value ev);
 
-	// 指し手
+	// hash keyの下位bit16(bit0は除く)
+	// Stockfishの最新版[2020/11/03]では、key16はhash_keyの下位16bitに変更になったが(取り出しやすいため)
+	// やねうら王ではhash_keyのbit0を先後フラグとして用いるので、bit16..1を使う。
+	// hash keyの上位bitは、TTClusterのindexの算出に用いるので、下位を格納するほうが理にかなっている。
+	TTEntry::KEY_TYPE key;
+
+	// 指し手(の下位16bit。Moveの上位16bitには移動させる駒種などが格納される)
 	uint16_t move16;
 
-	// このnodeでの探索の結果スコア
+	// このnodeでのsearch()の値
 	int16_t value16;
 
-#if !defined (NO_EVAL_IN_TT)
-	// 評価関数の評価値
+	// このnodeでのevaluate()の値
 	int16_t eval16;
-#endif
 
-	// entryのgeneration上位6bit + Bound下位2bitのpackしたもの。
-	// generationはエントリーの世代を表す。TranspositionTableで新しい探索ごとに+4されていく。
+	// entryのgeneration上位5bit + PVであるか1bit + Bound下位2bitのpackしたもの。
+	// generationはエントリーの世代を表す。TranspositionTableで新しい探索ごとに+8されていく。
 	uint8_t genBound8;
 
 	// そのときの残り深さ(これが大きいものほど価値がある)
 	// 1バイトに収めるために、DepthをONE_PLYで割ったものを格納する。
-	int8_t depth8;
+	// 符号付き8bitだと+127までしか表現できないので、符号なしにして、かつ、
+	// DEPTH_NONEが-6なのでこの分だけ下駄履きさせてある。(+6して格納してある)
+	uint8_t depth8;
 };
 
 // --- 置換表本体
@@ -126,153 +97,165 @@ private:
 // このクラスターが、clusterCount個だけ確保されている。
 struct TranspositionTable {
 
+	// 1クラスターにおけるTTEntryの数
+	// TT_CLUSTER_SIZE == 2のとき、TTEntry 10bytes×3つ + 2(padding) =  32bytes
+	// TT_CLUSTER_SIZE == 3のとき、TTEntry 16bytes×2つ + 0(padding) =  32bytes
+	// TT_CLUSTER_SIZE == 4のとき、TTEntry 16bytes×4つ + 0(padding) =  64bytes
+	// TT_CLUSTER_SIZE == 6のとき、TTEntry 16bytes×6つ + 0(padding) =  96bytes
+	// TT_CLUSTER_SIZE == 8のとき、TTEntry 16bytes×8つ + 0(padding) = 128bytes
+	static constexpr int ClusterSize = TT_CLUSTER_SIZE;
+
+	struct Cluster {
+		TTEntry entry[TT_CLUSTER_SIZE];
+#if TT_CLUSTER_SIZE == 3
+		u8 padding[2]; // 全体を32byteぴったりにするためのpadding
+#endif
+	};
+
+	static_assert((sizeof(Cluster) % 32) == 0, "Unexpected Cluster size");
+
+	// --- Constants used to refresh the hash table periodically
+
+	// nb of bits reserved for other things
+	// generation8の下位↓bitは、generation用ではなく、別の情報を格納するのに用いる。
+	// (PV nodeかどうかのフラグとBoundに用いている。)
+	static constexpr unsigned GENERATION_BITS = 3;
+	
+	// increment for generation field
+	// 次のgenerationにするために加算する定数。2の↑乗。
+	static constexpr int      GENERATION_DELTA = (1 << GENERATION_BITS);
+
+	// cycle length
+	// generationを加算していき、1周して戻ってくるまでの長さ。
+	static constexpr int      GENERATION_CYCLE = 255 + (1 << GENERATION_BITS);
+
+	// mask to pull out generation number
+	// generationを取り出す時のmask。
+	static constexpr int      GENERATION_MASK = (0xFF << GENERATION_BITS) & 0xFF;
+
+public:
+	//~TranspositionTable() { aligned_ttmem_free(mem); }
+	// メモリの開放は、LargeMemoryクラスが勝手にやってくれるので、やねうら王では、
+	// このclassのデストラクタでメモリを明示的に開放しなくて良い。
+
+	// 新しい探索ごとにこの関数を呼び出す。(generationを加算する。)
+	// USE_GLOBAL_OPTIONSが有効のときは、このタイミングで、Options["Threads"]の値を
+	// キャプチャして、探索スレッドごとの置換表と世代カウンターを用意する。
+	void new_search() { generation8 += GENERATION_DELTA; } // 下位3bitはPV nodeかどうかのフラグとBoundに用いている。
+
 	// 置換表のなかから与えられたkeyに対応するentryを探す。
 	// 見つかったならfound == trueにしてそのTT_ENTRY*を返す。
 	// 見つからなかったらfound == falseで、このとき置換表に書き戻すときに使うと良いTT_ENTRY*を返す。
-	// GlobalOptions.use_per_thread_tt == trueのときはスレッドごとに置換表の異なるエリアに属するTTEntryを
-	// 渡す必要があるので、引数としてthread_idを渡す。
-	TTEntry* probe(const Key key, bool& found
-#if defined(USE_GLOBAL_OPTIONS)
-		, size_t thread_id = -1
-#endif
-		) const;
+	// ※ KeyとしてKey(64 bit)以外に 128,256bitのhash keyにも対応。(やねうら王独自拡張)
+	TTEntry* probe(const Key     key, bool& found) const;
+	TTEntry* probe(const Key128& key, bool& found) const;
+	TTEntry* probe(const Key256& key, bool& found) const;
 
-	// keyの下位bitをClusterのindexにしてその最初のTTEntry*を返す。
-	TTEntry* first_entry(const Key key) const {
-		return &table[(size_t)key & (clusterCount - 1)].entry[0];
-	}
+	// probe()の、置換表を一切書き換えないことが保証されている版。(やねうら王独自拡張)
+	// ConsiderationMode時のPVの出力時は置換表をprobe()したいが、hitしないときに空きTTEntryを作る挙動が嫌なので、
+	// こちらを用いる。
+	// ※ KeyとしてKey(64 bit)以外に 128,256bitのhash keyにも対応。(やねうら王独自拡張)
+	TTEntry* read_probe(const Key     key, bool& found) const;
+	TTEntry* read_probe(const Key128& key, bool& found) const;
+	TTEntry* read_probe(const Key256& key, bool& found) const;
+
+	// 置換表の使用率を1000分率で返す。(USIプロトコルで統計情報として出力するのに使う)
+	int hashfull() const;
 
 	// 置換表のサイズを変更する。mbSize == 確保するメモリサイズ。MB単位。
 	void resize(size_t mbSize);
 
 	// 置換表のエントリーの全クリア
-	void clear() { memset(table, 0, clusterCount * sizeof(Cluster)); }
+	// 並列化してクリアするので高速。
+	// 備考)
+	// LEARN版のときは、
+	// 単一スレッドでメモリをクリアする。(他のスレッドは仕事をしているので..)
+	// 教師生成を行う時は、対局の最初にスレッドごとのTTに対して、
+	// このclear()が呼び出されるものとする。
+	// 例) th->tt.clear();
+	void clear();
 
-	// 新しい探索ごとにこの関数を呼び出す。(generationを加算する。)
-	// USE_GLOBAL_OPTIONSが有効のときは、このタイミングで、Options["Threads"]の値を
-	// キャプチャして、探索スレッドごとの置換表と世代カウンターを用意する。
-	void new_search() {
-		generation8 += 4;
+	// keyを元にClusterのindexを求めて、その最初のTTEntry*を返す。
+	// ※　ここで渡されるkeyのbit 0は局面の手番フラグ(Position::side_to_move())であると仮定している。
+	TTEntry* first_entry(const Key     key) const;
+	TTEntry* first_entry(const Key128& key) const;
+	TTEntry* first_entry(const Key256& key) const;
 
-#if defined(USE_GLOBAL_OPTIONS)
-		size_t m = Options["Threads"];
-		if (m != max_thread)
-		{
-			max_thread = m;
-			// スレッドごとの世代カウンター用の配列もこのタイミングで確保。
-			a_generation8.resize(m);
-		}
+#if defined(EVAL_LEARN)
+	// スレッド数が変更になった時にThread.set()から呼び出される。
+	// これに応じて、スレッドごとに保持しているTTを初期化する。
+	void init_tt_per_thread();
 #endif
-	} // 下位2bitはTTEntryでBoundに使っているので4ずつ加算。
-
-	// 世代を返す。これはTTEntry.save()のときに使う。
-	uint8_t generation() const { return generation8; }
-
-#if defined(USE_GLOBAL_OPTIONS)
-
-	// --- スレッドIDごとにgenerationを持っているとき用の処理。
-
-	uint8_t generation(size_t thread_id) const {
-		if (GlobalOptions.use_per_thread_tt)
-			return a_generation8[thread_id];
-		else
-			return generation8;
-	}
-
-	void new_search(size_t thread_id) {
-		if (GlobalOptions.use_per_thread_tt)
-			a_generation8[thread_id] += 4;
-		else
-			generation8 += 4;
-	}
-
-#endif
-
-	// 置換表の使用率を1000分率で返す。(USIプロトコルで統計情報として出力するのに使う)
-	int hashfull() const;
-
-	TranspositionTable() { mem = nullptr; clusterCount = 0; }
-	~TranspositionTable() { free(mem); }
 
 private:
+	friend struct TTEntry;
 
-	// TTEntryはこのサイズでalignされたメモリに配置する。(される)
-	static const int CacheLineSize = 64;
+	// keyを元にClusterのindexを求めて、その最初のTTEntry*を返す。内部実装用。
+	// ※　ここで渡されるkeyのbit 0は局面の手番フラグ(Position::side_to_move())であると仮定している。
+	TTEntry* _first_entry(const Key key) const {
+		// Stockfishのコード
+		// mul_hi64は、64bit * 64bitの掛け算をして下位64bitを取得する関数。
+		//return &table[mul_hi64(key, clusterCount)].entry[0];
 
-#if !defined (NO_EVAL_IN_TT)
-	// 1クラスターにおけるTTEntryの数
-	// TTEntry 10bytes×3つ + 2(padding) = 32bytes
-	static const int ClusterSize = 3;
-#else
-	// TTEntry 8bytes×4つ = 32bytes
-	static const int ClusterSize = 4;
-#endif
+		// key(64bit) × clusterCount / 2^64 の値は 0 ～ clusterCount - 1 である。
+		// 掛け算が必要にはなるが、こうすることで custerCountを2^Nで確保しないといけないという制約が外れる。
+		// cf. Allow for general transposition table sizes. : https://github.com/official-stockfish/Stockfish/commit/2198cd0524574f0d9df8c0ec9aaf14ad8c94402b
 
-#if defined(USE_GLOBAL_OPTIONS)
-	// スレッド数
-	// スレッドごとに置換表を分けたいときのために現在のスレッド数を保持しておき、
-	// 異なるエリアのなかのTTEntryを返すようにする。
-	static size_t max_thread;
+		// ※　以下、やねうら王独自拡張
 
-	// スレッドごとに世代を持っている必要がある。
-	std::vector<u8> a_generation8;
-#endif
+		// やねうら王では、keyのbit0(先後フラグ)がindexのbit0に反映される必要がある。
+		// このときclusterCountが奇数だと、(index & ~(u64)1) | (key & 1) のようにしたときに、
+		// (clusterCount - 1)が上限であるべきなのにclusterCountになりかねない。
+		// そこでclusterCountは偶数であるという制約を課す。
+		ASSERT_LV3((clusterCount & 1) == 0);
 
-	struct Cluster {
-		TTEntry entry[ClusterSize];
-#if !defined (NO_EVAL_IN_TT)
-		u8 padding[2]; // 全体を32byteぴったりにするためのpadding
-#endif
-	};
+		// indexのbit0は、keyのbit0(先後フラグ)が反映されなければならない。
+		// →　次のindexの計算ではbit0を潰して計算するためにkeyを2で割ってからmul_hi64()している。
 
-	static_assert(sizeof(Cluster) == CacheLineSize / 2, "Cluster size incorrect");
+		// (key/2) * clusterCount / 2^64 をするので、indexは 0 ～ (clusterCount/2)-1 の範囲となる。
+		uint64_t index = mul_hi64((u64)key >> 1, clusterCount);
 
-	// この置換表が保持しているクラスター数。2の累乗。
-	size_t clusterCount;
+		// indexは0～(clusterCount/2)-1の範囲にあるのでこれを2倍すると、0～clusterCount-2の範囲。
+		// clusterCountは偶数で、ここにkeyのbit0がbit-orされるので0～clusterCount-1の範囲の値が得られる。
+		return &table[(index << 1) | ((u64)key & 1)].entry[0];
+	}
 
-	// 確保されているクラスターの先頭(alignされている)
-	Cluster* table;
+	// この置換表が保持しているクラスター数。
+	// Stockfishはresize()ごとに毎回新しく置換表を確保するが、やねうら王では
+	// そこは端折りたいので、毎回は確保しない。そのため前回サイズがここに格納されていないと
+	// 再確保すべきかどうかの判定ができない。ゆえに0で初期化しておく。
+	size_t clusterCount = 0;
+
+	// 確保されているClusterの先頭(alignされている)
+	// Stockfishではmemをコンストラクタで初期化していないが、初期化しておいたほうが
+	// 不用意に使った場合に確実にアクセス保護違反で落ちるので都合が良い。
+	Cluster* table = nullptr;
 
 	// 確保されたメモリの先頭(alignされていない)
-	void* mem;
+	//void* mem;
+	// →　やねうら王では、LargeMemoryで確保するのでこれは不要
 
-	uint8_t generation8; // TT_ENTRYのset_gen()で書き込む
+	// 世代カウンター。new_search()のごとに8ずつ加算する。TTEntry::save()で用いる。
+	uint8_t generation8;
+
+	// --- やねうら王独自拡張
+
+	// 置換表テーブルのメモリ確保用のhelpper
+	LargeMemory tt_memory;
+
+	// probe()の内部実装用。
+	// key_for_index   : first_entry()で使うためのkey
+	// key_for_ttentry : TTEntryに格納するためのkey
+	TTEntry* probe     (const Key key_for_index, const TTEntry::KEY_TYPE key_for_ttentry, bool& found) const;
+	
+	// read_probe()の内部実装用
+	// key_for_index   : first_entry()で使うためのkey
+	// key_for_ttentry : TTEntryに格納するためのkey
+	TTEntry* read_probe(const Key key_for_index, const TTEntry::KEY_TYPE key_for_ttentry, bool& found) const;
+
 };
 
-// 詰みのスコアは置換表上は、このnodeからあと何手で詰むかというスコアを格納する。
-// しかし、search()の返し値は、rootからあと何手で詰むかというスコアを使っている。
-// (こうしておかないと、do_move(),undo_move()するごとに詰みのスコアをインクリメントしたりデクリメントしたり
-// しないといけなくなってとても面倒くさいからである。)
-// なので置換表に格納する前に、この変換をしなければならない。
-// 詰みにまつわるスコアでないなら関係がないので何の変換も行わない。
-// ply : root node からの手数。(ply_from_root)
-inline Value value_to_tt(Value v, int ply) {
-
-	ASSERT_LV3(-VALUE_INFINITE < v && v < VALUE_INFINITE);
-
-	return  v >= VALUE_MATE_IN_MAX_PLY ? v + ply
-		  : v <= VALUE_MATED_IN_MAX_PLY ? v - ply : v;
-}
-
-// value_to_tt()の逆関数
-// ply : root node からの手数。(ply_from_root)
-inline Value value_from_tt(Value v, int ply) {
-
-	return  v == VALUE_NONE ? VALUE_NONE
-		: v >= VALUE_MATE_IN_MAX_PLY ? v - ply
-		: v <= VALUE_MATED_IN_MAX_PLY ? v + ply : v;
-}
-
-// PV lineをコピーする。
-// pv に move(1手) + childPv(複数手,末尾MOVE_NONE)をコピーする。
-// 番兵として末尾はMOVE_NONEにすることになっている。
-inline void update_pv(Move* pv, Move move, Move* childPv) {
-
-	for (*pv++ = move; childPv && *childPv != MOVE_NONE; )
-		*pv++ = *childPv++;
-	*pv = MOVE_NONE;
-}
-
+// global object。探索部からこのinstanceを参照する。
 extern TranspositionTable TT;
 
-#endif // _TT_H_
+#endif // #ifndef TT_H_INCLUDED

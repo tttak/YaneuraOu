@@ -1,13 +1,13 @@
-#ifndef __HALF_FLOAT_H__
+ï»¿#ifndef __HALF_FLOAT_H__
 #define __HALF_FLOAT_H__
 
 // Half Float Library by yaneurao
 // (16-bit float)
 
-// 16bitŒ^‚É‚æ‚é•‚“®¬”“_‰‰Z
-// ƒRƒ“ƒpƒCƒ‰‚Ì¶¬‚·‚éfloatŒ^‚ÌƒR[ƒh‚ªIEEE 754‚ÌŒ`®‚Å‚ ‚é‚Æ‰¼’è‚µ‚ÄA‚»‚ê‚ğ—˜—p‚·‚éB
+// 16bitå‹ã«ã‚ˆã‚‹æµ®å‹•å°æ•°ç‚¹æ¼”ç®—
+// ã‚³ãƒ³ãƒ‘ã‚¤ãƒ©ã®ç”Ÿæˆã™ã‚‹floatå‹ã®ã‚³ãƒ¼ãƒ‰ãŒIEEE 754ã®å½¢å¼ã§ã‚ã‚‹ã¨ä»®å®šã—ã¦ã€ãã‚Œã‚’åˆ©ç”¨ã™ã‚‹ã€‚
 
-#include "../shogi.h"
+#include "../types.h"
 
 namespace HalfFloat
 {
@@ -99,7 +99,7 @@ namespace HalfFloat
 			return c.f;
 		}
 
-		// unit test‚É‚È‚Á‚Ä‚È‚¢‚ªAˆê‰ŒvZ‚ªo—ˆ‚é‚±‚Æ‚ÍŠm‚©‚ß‚½BƒR[ƒh‚Í‚ ‚Æ‚Å‚È‚¨‚·(‚©‚à)B
+		// unit testã«ãªã£ã¦ãªã„ãŒã€ä¸€å¿œè¨ˆç®—ãŒå‡ºæ¥ã‚‹ã“ã¨ã¯ç¢ºã‹ã‚ãŸã€‚ã‚³ãƒ¼ãƒ‰ã¯ã‚ã¨ã§ãªãŠã™(ã‹ã‚‚)ã€‚
 		static void unit_test()
 		{
 			float16 a, b, c, d;

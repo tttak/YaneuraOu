@@ -8,8 +8,10 @@
 #include "../eval/evaluate_mir_inv_tools.h"
 
 #if defined(SGD_UPDATE) || defined(USE_KPPP_MIRROR_WRITE)
-#include "../misc.h"  // PRNG , my_insertion_sort
+#include "../misc.h"  // PRNG , Tools::insertion_sort
 #endif
+
+#include <cmath>	// std::sqrt()
 
 namespace EvalLearningTools
 {
@@ -38,21 +40,14 @@ namespace EvalLearningTools
 	//       勾配等を格納している学習用の配列
 	// -------------------------------------------------
 
-#if defined(_MSC_VER)
-#pragma pack(push,2)
-#elif defined(__GNUC__)
-#pragma pack(2)
-#endif
 	struct Weight
 	{
 		// mini-batch 1回分の勾配の累積値
 		LearnFloatType g = LearnFloatType(0);
 
 		// ADA_GRAD_UPDATEのとき。LearnFloatType == floatとして、
-		// 合計 4*2 + 4*2 + 1*2 = 18 bytes
+		// 合計 4*2 + 4*2 + 1*2 = 18 bytes →　20 bytes確保されるかも。
 		// 1GBの評価関数パラメーターに対してその4.5倍のサイズのWeight配列が確保できれば良い。
-		// ただし、構造体のアライメントが4バイト単位になっているとsizeof(Weight)==20なコードが生成されるので
-		// pragma pack(2)を指定しておく。
 
 		// SGD_UPDATE の場合、この構造体はさらに10バイト減って、8バイトで済む。
 
@@ -193,11 +188,6 @@ namespace EvalLearningTools
 
 		LearnFloatType get_grad() const { return g; }
 	};
-#if defined(_MSC_VER)
-#pragma pack(pop)
-#elif defined(__GNUC__)
-#pragma pack(0)
-#endif
 
 	// 手番つきのweight配列
 	// 透過的に扱えるようにするために、Weightと同じメンバを持たせておいてやる。
@@ -713,7 +703,7 @@ namespace EvalLearningTools
 #if KPPP_LOWER_COUNT > 1
 			// mir_pieceするとsortされてない状態になる。sortするコードが必要。
 			Eval::BonaPiece p_list[3] = { mir_piece(piece2_), mir_piece(piece1_), mir_piece(piece0_) };
-			my_insertion_sort(p_list, 0, 3);
+			Tools::insertion_sort(p_list, 0, 3);
 			kppp_[1] = fromKPPP((int)Mir((Square)king_), p_list[2] , p_list[1], p_list[0]);
 #endif
 		}

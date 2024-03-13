@@ -1,11 +1,17 @@
 ﻿#ifndef _BITOP_H_
 #define _BITOP_H_
 
-#include "../shogi.h"
-
 //
 //   bit operation library
 //
+
+#include <cstddef> // std::size_t
+#include <cstdint> // uint64_tなどの定義
+
+#if defined(_MSC_VER)
+#include <stdlib.h> // _byteswap_uint64
+#include <intrin.h> // __popcnt, __popcnt64
+#endif
 
 // ターゲット環境でSSE,AVX,AVX2が搭載されていない場合はこれらの命令をsoftware emulationにより実行する。
 // software emulationなので多少遅いが、SSE2,SSE4.1,SSE4.2,AVX,AVX2,AVX-512の使えない環境でそれに合わせたコードを書く労力が省ける。
@@ -15,24 +21,29 @@
 // ----------------------------
 
 #if defined(USE_AVX512)
-#include <zmmintrin.h>
+// immintrin.h から AVX512 関連の intrinsic は読み込まれる
+// intel: https://software.intel.com/sites/landingpage/IntrinsicsGuide/#techs=AVX_512
+// gcc: https://github.com/gcc-mirror/gcc/blob/master/gcc/config/i386/immintrin.h
+// clang: https://github.com/llvm-mirror/clang/blob/master/lib/Headers/immintrin.h
+#include <immintrin.h>
 #elif defined(USE_AVX2)
 #include <immintrin.h>
 #elif defined(USE_SSE42)
 #include <nmmintrin.h>
 #elif defined(USE_SSE41)
 #include <smmintrin.h>
-#elif defined (USE_SSE2)
+#elif defined(USE_SSSE3)
+#include <tmmintrin.h>
+#elif defined(USE_SSE2)
 #include <emmintrin.h>
-#else
-#if defined (__GNUC__) 
-#include <mm_malloc.h> // for _mm_alloc()
-#endif
+#elif defined(__ARM_NEON)
+#include <arm_neon.h>
 #endif
 
 // ----------------------------
-//      type define(uint)
+//      type define(uint , sint)
 // ----------------------------
+
 typedef  uint8_t  u8;
 typedef   int8_t  s8;
 typedef uint16_t u16;
@@ -60,11 +71,15 @@ typedef  int64_t s64;
 //      PEXT(AVX2の命令)
 // ----------------------------
 
-#ifdef USE_AVX2
+#if defined(USE_AVX2) && defined(USE_BMI2)
 
-// for AVX2 : hardwareによるpext実装
+// for BMI2 : hardwareによるpext実装
+
+// ZEN/ZEN2では、PEXT命令はμOPでのemulationで実装されているらしく、すこぶる遅いらしい。
+// PEXT命令を使わず、この下にあるsoftware emulationによるPEXT実装を用いたほうがまだマシらしい。(どうなってんの…)
+
 #define PEXT32(a,b) _pext_u32((u32)(a),(u32)(b))
-#ifdef IS_64BIT
+#if defined (IS_64BIT)
 #define PEXT64(a,b) _pext_u64(a,b)
 #else
 // PEXT32を2回使った64bitのPEXTのemulation
@@ -73,7 +88,8 @@ typedef  int64_t s64;
 
 #else
 
-// for non-AVX2 : software emulationによるpext実装(やや遅い。とりあえず動くというだけ。)
+// for non-BMI2 : software emulationによるpext実装(やや遅い。とりあえず動くというだけ。)
+// ただし64-bitでもまとめて処理できる点や、magic bitboardのような巨大テーブルを用いない点において優れている(かも)
 inline uint64_t pext(uint64_t val, uint64_t mask)
 {
   uint64_t res = 0;
@@ -92,16 +108,26 @@ inline uint64_t PEXT64(uint64_t a, uint64_t b) { return pext(a, b); }
 
 #endif
 
+
 // ----------------------------
 //     POPCNT(SSE4.2の命令)
 // ----------------------------
 
-#ifdef USE_SSE42
+#if defined(_MSC_VER)
 
-// for SSE4.2
-#include <nmmintrin.h>
+inline s32 POPCNT32(u32 a) { return (s32)__popcnt(a); }
+inline s32 POPCNT64(u64 a) { return (s32)__popcnt64(a); }
 
-#ifdef IS_64BIT
+#elif defined(__GNUC__)
+
+inline s32 POPCNT32(u32 a) { return __builtin_popcount(a); }
+inline s32 POPCNT64(u64 a) { return __builtin_popcountll(a); }
+
+#elif defined (USE_SSE42)
+
+// SSE4.2有効でもPOPCNTが無効かもしれない環境のため、実装順位は下げる
+// 例: MacOS Apple M1 向けソフトウェアエミュレータ、AMD Bulldozer Family 15h core based CPU など
+#if defined (IS_64BIT)
 #define POPCNT32(a) _mm_popcnt_u32(a)
 #define POPCNT64(a) _mm_popcnt_u64(a)
 #else
@@ -137,9 +163,8 @@ inline int32_t POPCNT64(uint64_t a) {
 // ----------------------------
 
 #if defined(_MSC_VER) && !defined(__INTEL_COMPILER) // && defined(_WIN64)
-#include <intrin.h>
 
-#ifdef IS_64BIT
+#if defined (IS_64BIT)
 // 1である最下位のbitのbit位置を得る。0を渡してはならない。
 FORCE_INLINE int LSB32(uint32_t v) { ASSERT_LV3(v != 0); unsigned long index; _BitScanForward(&index, v); return index; }
 FORCE_INLINE int LSB64(uint64_t v) { ASSERT_LV3(v != 0); unsigned long index; _BitScanForward64(&index, v); return index; }
@@ -158,12 +183,39 @@ FORCE_INLINE int MSB32(uint32_t v) { ASSERT_LV3(v != 0); unsigned long index; _B
 FORCE_INLINE int MSB64(uint64_t v) { ASSERT_LV3(v != 0); return uint32_t(v >> 32) ? 32 + MSB32(uint32_t(v >> 32)) : MSB32(uint32_t(v)); }
 #endif
 
-#elif defined(__GNUC__) && ( defined(__i386__) || defined(__x86_64__) )
+#elif defined(__GNUC__)
 
-FORCE_INLINE int LSB32(const u32 v) { ASSERT_LV3(v != 0); return __builtin_ctzll(v); }
+FORCE_INLINE int LSB32(const u32 v) { ASSERT_LV3(v != 0); return __builtin_ctz(v); }
 FORCE_INLINE int LSB64(const u64 v) { ASSERT_LV3(v != 0); return __builtin_ctzll(v); }
-FORCE_INLINE int MSB32(const u32 v) { ASSERT_LV3(v != 0); return 63 ^ __builtin_clzll(v); }
+FORCE_INLINE int MSB32(const u32 v) { ASSERT_LV3(v != 0); return 31 ^ __builtin_clz(v); }
 FORCE_INLINE int MSB64(const u64 v) { ASSERT_LV3(v != 0); return 63 ^ __builtin_clzll(v); }
+
+#else
+
+// software emulationによるbitscan forward(やや遅い)
+FORCE_INLINE s32 LSB32(u32 v) { ASSERT_LV3(v != 0); return POPCNT32((v & (-v)) - 1); }
+FORCE_INLINE s32 LSB64(u64 v) { ASSERT_LV3(v != 0); return POPCNT64((v & (-v)) - 1); }
+
+// software emulationによるbitscan reverse(やや遅い)
+FORCE_INLINE s32 MSB32(u32 v) {
+  ASSERT_LV3(v != 0);
+  v = v | (v >>  1);
+  v = v | (v >>  2);
+  v = v | (v >>  4);
+  v = v | (v >>  8);
+  v = v | (v >> 16);
+  return POPCNT32(v);
+}
+FORCE_INLINE s32 MSB64(u64 v) {
+  ASSERT_LV3(v != 0);
+  v = v | (v >>  1);
+  v = v | (v >>  2);
+  v = v | (v >>  4);
+  v = v | (v >>  8);
+  v = v | (v >> 16);
+  v = v | (v >> 32);
+  return POPCNT64(v);
+}
 
 #endif
 
@@ -171,7 +223,7 @@ FORCE_INLINE int MSB64(const u64 v) { ASSERT_LV3(v != 0); return 63 ^ __builtin_
 //  ymm(256bit register class)
 // ----------------------------
 
-#ifdef USE_AVX2
+#if defined (USE_AVX2)
 
 // Byteboardの直列化で使うAVX2命令
 struct alignas(32) ymm
@@ -272,48 +324,13 @@ extern ymm ymm_zero;  // all packed bytes are 0.
 extern ymm ymm_one;   // all packed bytes are 1.
 
 // ----------------------------
-//    custom allocator
-// ----------------------------
-
-inline void* aligned_malloc(size_t size, size_t align)
-{
-	void* p = _mm_malloc(size, align);
-	if (p == nullptr)
-	{
-		std::cout << "info string can't allocate memory. sise = " << size << std::endl;
-		exit(1);
-	}
-	return p;
-}
-inline void aligned_free(void* ptr) { _mm_free(ptr); }
-
-// alignasを指定しているのにnewのときに無視される＆STLのコンテナがメモリ確保するときに無視するので、
-// そのために用いるカスタムアロケーター。
-template <typename T>
-class AlignedAllocator {
-public:
-	using value_type = T;
-
-	AlignedAllocator() {}
-	AlignedAllocator(const AlignedAllocator&) {}
-	AlignedAllocator(AlignedAllocator&&) {}
-
-	template <typename U> AlignedAllocator(const AlignedAllocator<U>&) {}
-
-	T* allocate(std::size_t n) { return (T*)aligned_malloc(n * sizeof(T), alignof(T)); }
-	void deallocate(T* p, std::size_t n) { aligned_free(p); }
-};
-
-// ----------------------------
 //    BSLR
 // ----------------------------
 
 // 最下位bitをresetする命令。
 
-// gccでコンパイルするとき-marchとして具体的なCPU名を指定したときに、_blsr_u64がinline展開できないようで
-// コンパイルエラーになる。
-
-#if (defined(USE_AVX2) && defined(IS_64BIT)) && !defined(__GNUC__)
+#if defined(USE_AVX2) & defined(IS_64BIT)
+// これは、BMI1の命令であり、ZEN1/ZEN2であっても使ったほうが速い。
 #define BLSR(x) _blsr_u64(x)
 #else
 #define BLSR(x) (x & (x-1))
@@ -330,5 +347,27 @@ public:
 template <typename T> FORCE_INLINE int pop_lsb(T& b) {  int index = LSB32(b);  b = T(BLSR(b)); return index; }
 FORCE_INLINE int pop_lsb(u64 & b) { int index = LSB64(b);  b = BLSR(b); return index; }
 
+// ----------------------------
+//    byte reverse
+// ----------------------------
+
+// 64bitの値をbyte単位で逆順にして返す。
+inline uint64_t bswap64(uint64_t u) {
+#if defined(_MSC_VER)
+	return _byteswap_uint64(u);
+#elif defined(__GNUC__)
+	return __builtin_bswap64(u);
+#else
+	return
+		((u & 0xFF00000000000000u) >> 56u) |
+		((u & 0x00FF000000000000u) >> 40u) |
+		((u & 0x0000FF0000000000u) >> 24u) |
+		((u & 0x000000FF00000000u) >> 8u) |
+		((u & 0x00000000FF000000u) << 8u) |
+		((u & 0x0000000000FF0000u) << 24u) |
+		((u & 0x000000000000FF00u) << 40u) |
+		((u & 0x00000000000000FFu) << 56u);
+#endif
+}
 
 #endif
