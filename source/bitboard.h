@@ -283,8 +283,10 @@ template <int n>
 inline Bitboard& Bitboard::insert64(u64 u)
 {
 	static_assert(n == 0 || n == 1, "");
-#if defined(USE_SSE41)
+#if defined(USE_SSE41) && defined(IS_64BIT)
 	m = _mm_insert_epi64(m, u, n);
+	// ⇨ gcc/clangだと32bit環境で、この命令が定義されていなくてコンパイルエラーになる。
+	//		コンパイラ側のバグっぽい。仕方ないので、この命令を使うのは64bit環境の時のみにする。
 #else
 	p[n] = u;
 #endif
@@ -912,21 +914,16 @@ inline Bitboard lanceEffect(Square sq, const Bitboard& occupied)
 			// 香がp[0]に属する
 			u64 se = lanceStepEffect<C>(sq).template extract64<0>();
 			u64 mocc = se & occupied.extract64<0>();
-			mocc |= mocc >> 1;
-			mocc |= mocc >> 2;
-			mocc |= mocc >> 4;
-			mocc >>= 1;
-			return Bitboard(~mocc & se, 0);
+			// 香が当たる駒より上の升に対応するビットを0、それ以外を1にする
+			mocc = ~uint64_t{0} << MSB64(mocc | 1);
+			return Bitboard(mocc & se, 0);
 		}
 		else {
 			// 香がp[1]に属する
 			u64 se = lanceStepEffect<C>(sq).template extract64<1>();
 			u64 mocc = se & occupied.extract64<1>();
-			mocc |= mocc >> 1;
-			mocc |= mocc >> 2;
-			mocc |= mocc >> 4;
-			mocc >>= 1;
-			return Bitboard(0, ~mocc & se);
+			mocc = ~uint64_t{0} << MSB64(mocc | 1);
+			return Bitboard(0, mocc & se);
 		}
 	}
 #endif
@@ -956,13 +953,10 @@ inline Bitboard rookFileEffect(Square sq, const Bitboard& occupied)
 		// 先手の香の利き
 		u64 se = lanceStepEffect<BLACK>(sq).template extract64<0>();
 		u64 mocc = se & occupied.extract64<0>();
-		mocc |= mocc >> 1;
-		mocc |= mocc >> 2;
-		mocc |= mocc >> 4;
-		mocc >>= 1;
+		mocc = ~uint64_t{0} << MSB64(mocc | 1);
 
 		// 後手の香の利きと先手の香の利きを合成
-		return Bitboard(((em ^ t) & mask) | (~mocc & se), 0);
+		return Bitboard(((em ^ t) & mask) | (mocc & se), 0);
 	}
 	else {
 		// 飛車がp[1]に属する
@@ -974,12 +968,9 @@ inline Bitboard rookFileEffect(Square sq, const Bitboard& occupied)
 
 		u64 se = lanceStepEffect<BLACK>(sq).template extract64<1>();
 		u64 mocc = se & occupied.extract64<1>();
-		mocc |= mocc >> 1;
-		mocc |= mocc >> 2;
-		mocc |= mocc >> 4;
-		mocc >>= 1;
+		mocc = ~uint64_t{0} << MSB64(mocc | 1);
 
-		return Bitboard(0, ((em ^ t) & mask) | (~mocc & se));
+		return Bitboard(0, ((em ^ t) & mask) | (mocc & se));
 	}
 }
 

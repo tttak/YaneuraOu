@@ -380,20 +380,29 @@ using Depth = int;
 
 enum : int {
 
+	// The following DEPTH_ constants are used for TT entries and QS movegen stages. In regular search,
+	// TT depth is literal: the search depth (effort) used to make the corresponding TT value.
+	// In qsearch, however, TT entries only store the current QS movegen stage (which should thus compare
+	// lower than any regular search depth).
 	// 静止探索で王手がかかっているときにこれより少ない残り探索深さでの探索した結果が置換表にあってもそれは信用しない
-	DEPTH_QS_CHECKS = 0,
+	DEPTH_QS_CHECKS     = 0,
 
 	// 静止探索で王手がかかっていないとき。
-	DEPTH_QS_NO_CHECKS = -1,
+	DEPTH_QS_NORMAL     = -1,
 
 	// 静止探索でこれより深い(残り探索深さが少ない)ところではRECAPTURESしか生成しない。
 	DEPTH_QS_RECAPTURES = -5,
 
+
+	// For TT entries where no searching at all was done (whether regular or qsearch) we use
+	// _UNSEARCHED, which should thus compare lower than any QS or regular depth. _ENTRY_OFFSET is used
+	// only for the TT entry occupancy check (see tt.cpp), and should thus be lower than _UNSEARCHED.
+
 	// DEPTH_NONEは探索せずに値を求めたという意味に使う。
-	DEPTH_NONE = -6,
+	DEPTH_UNSEARCHED   = -2,
 
 	// TTの下駄履き用(TTEntryが使われているかどうかのチェックにのみ用いる)
-	DEPTH_OFFSET = -7
+	DEPTH_ENTRY_OFFSET = -3
 };
 
 // --------------------
@@ -432,10 +441,11 @@ enum Value: int32_t
 	// 例えば、3手詰めならこの値より3少ない。
 	VALUE_MATE = 32000,
 
-	VALUE_MATE_IN_MAX_PLY  =   VALUE_MATE - MAX_PLY , // MAX_PLYでの詰みのときのスコア。
-	VALUE_MATED_IN_MAX_PLY = -VALUE_MATE_IN_MAX_PLY , // MAX_PLYで詰まされるときのスコア。
+	VALUE_MATE_IN_MAX_PLY    =  VALUE_MATE  - MAX_PLY , // MAX_PLYでの詰みのときのスコア。
+	VALUE_MATED_IN_MAX_PLY   = -VALUE_MATE_IN_MAX_PLY , // MAX_PLYで詰まされるときのスコア。
 
-	// チェスの終盤DBによって得られた詰みのスコアらしいが、互換性のためにこのシンボルは同様に定義しておく。
+	// チェスの終盤DB(tablebase)によって得られた詰みを表現するスコアらしいが、
+	// Stockfishとの互換性のためにこのシンボルはStockfishと同様に定義しておく。
 	VALUE_TB                 = VALUE_MATE_IN_MAX_PLY - 1,
 	VALUE_TB_WIN_IN_MAX_PLY  = VALUE_MATE - MAX_PLY,
 	VALUE_TB_LOSS_IN_MAX_PLY = -VALUE_TB_WIN_IN_MAX_PLY, 
@@ -683,15 +693,17 @@ private:
 static std::ostream& operator<<(std::ostream& os, Move m)   { os << to_usi_string(m); return os; }
 static std::ostream& operator<<(std::ostream& os, Move16 m) { os << to_usi_string(m); return os; }
 
-// 指し手がおかしくないかをテストする
-// ただし、盤面のことは考慮していない。MOVE_NULLとMOVE_NONEであるとfalseが返る。
-// これら２つの定数は、移動元と移動先が等しい値になっている。このテストだけをする。
-// MOVE_WIN(宣言勝ちの指し手は)は、falseが返る。
+// 指し手が普通の指し手(駒打ち/駒成り含む)であるかテストする。
+// 特殊な指し手(MOVE_NONE/MOVE_NULL/MOVE_WIN)である場合、falseが返る。
+// それ普通の指し手ならばtrueが返る。
 constexpr bool is_ok(Move m) {
-  // return move_from(m)!=move_to(m);
-  // とやりたいところだが、駒打ちでfromのbitを使ってしまっているのでそれだとまずい。
-  // 駒打ちのbitも考慮に入れるために次のように書く。
-  return (m >> 7) != (m & 0x7f);
+	// 通常の指し手ならば、
+	// 1. 32bit moveの場合は、上位16bitに移動させる駒があるからm >> 7が下位7bitと一致することはない。
+	// 2. 16bit moveの場合は、
+	//   2a. 移動させる指し手ならば from == toは満たさない。
+	//   2b. 駒打ちの場合は、m >> 7のbit7が1になっているので右辺とは一致しない。
+	// ということで、以下の条件式で良い。
+	return (m >> 7) != (m & 0x7f);
 }
 static bool is_ok(Move16 m) { return m.is_ok(); }
 

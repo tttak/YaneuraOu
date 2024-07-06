@@ -34,7 +34,7 @@ const std::string config_info();
 // prefetch()は、与えられたアドレスの内容をL1/L2 cacheに事前に読み込む。
 // これはnon-blocking関数で、CPUがメモリに読み込むのを待たない。
 
-void prefetch(void* addr);
+void prefetch(const void* addr);
 
 // --------------------
 //  logger
@@ -214,7 +214,10 @@ struct PRNG
 
 		// time値とか、thisとか色々加算しておく。
 		s = (u64)(time(NULL)) + ((u64)(this) << 32)
-			+ (u64)(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+		//	+ (u64)(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+		// ⇨ MSYS2 + clang18でhigh_resolution_clock::now()を使うとセグフォで落ちるようになった。
+		//   代わりにsteady_clockを用いる。
+			+ (u64)std::chrono::steady_clock::now().time_since_epoch().count();
 	}
 
 	// 乱数を一つ取り出す。
@@ -486,7 +489,10 @@ namespace Tools
 		// メモリ割り当てのエラー
 		MemoryAllocationError,
 
-		// ファイルのオープンに失敗。ファイルが存在しないなど。
+		// ファイルが存在しないエラー。
+		FileNotFound,
+
+		// ファイルのオープンに失敗。
 		FileOpenError,
 
 		// ファイル読み込み時のエラー。
@@ -497,6 +503,9 @@ namespace Tools
 
 		// ファイルClose時のエラー。
 		FileCloseError,
+
+		// ファイルを間違えているエラー。
+		FileMismatch,
 
 		// フォルダ作成時のエラー。
 		CreateFolderError,
