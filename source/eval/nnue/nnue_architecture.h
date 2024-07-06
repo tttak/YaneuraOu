@@ -30,7 +30,11 @@
 #elif defined(EVAL_NNUE_HALFKPE9)
 
 // halfkpe9型
-#include "architectures/halfkpe9_256x2-32-32.h"
+//#include "architectures/halfkpe9_256x2-32-32.h"
+
+// HalfKP-KSDG型
+//#include "architectures/halfkp-kingsafety_distinguishgolds_256x2-32-32.h"
+#include "architectures/halfkp-kingsafety_distinguishgolds_512x2-8-96.h"
 
 #elif defined(YANEURAOU_ENGINE_NNUE_HALFKP_512X2_16_32)
 
