@@ -190,7 +190,10 @@ const string engine_info() {
 			ENGINE_NAME
 #endif
 			<< ' '
-			<< EVAL_TYPE_NAME << ' '
+
+//			<< EVAL_TYPE_NAME << ' '
+			<< "NNUE HalfKP-KSDG_512x2-8-96" << ' '
+
 			<< ENGINE_VERSION << std::setfill('0')
 			<< (Is64Bit ? " 64" : " 32")
 			<< TARGET_CPU
