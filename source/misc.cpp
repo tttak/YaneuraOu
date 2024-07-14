@@ -192,7 +192,7 @@ const string engine_info() {
 			<< ' '
 
 //			<< EVAL_TYPE_NAME << ' '
-			<< "NNUE HalfKP-KSDG_512x2-8-96" << ' '
+			<< "NNUE HalfKP-KSDG_512x2-8-96 LayerStacks12" << ' '
 
 			<< ENGINE_VERSION << std::setfill('0')
 			<< (Is64Bit ? " 64" : " 32")

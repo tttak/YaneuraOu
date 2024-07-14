@@ -54,7 +54,7 @@ namespace Eval::NNUE {
 	extern AlignedPtr<FeatureTransformer> feature_transformer;
 
 	// 評価関数
-	extern AlignedPtr<Network> network;
+	extern AlignedPtr<Network> network[LayerStacks];
 
 	// 評価関数ファイル名
 	extern const char* const kFileName;

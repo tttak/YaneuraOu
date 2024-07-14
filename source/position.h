@@ -587,6 +587,11 @@ public:
 	const Eval::EvalList* eval_list() const { return &evalList; }
 #endif
 
+	int stack_index() const {
+		constexpr int index[24] = {0, 1, 2, 3, 4, 5, 5, 6, 6, 7, 7, 8, 8, 8, 9, 9, 9, 9, 10, 10, 10, 10, 10, 11};
+		return index[std::min((std::abs(st->materialValue) + 99) / 100, 23)];
+	}
+
 #if defined (USE_SEE)
 	// 指し手mのsee(Static Exchange Evaluation : 静的取り合い評価)において
 	// v(しきい値)以上になるかどうかを返す。
