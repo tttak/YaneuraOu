@@ -60,7 +60,11 @@
 #else
 
 // どれも定義されていなかったので標準NNUE型にしておく。
-#include "architectures/halfkp_256x2-32-32.h"
+//#include "architectures/halfkp_256x2-32-32.h"
+
+// HalfKP-KK型
+#include "architectures/halfkp-kk_512x2-8-96.h"
+
 
 #endif
 
