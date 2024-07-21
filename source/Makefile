@@ -503,6 +503,7 @@ ifneq (,$(findstring YANEURAOU_ENGINE_NNUE,$(YANEURAOU_EDITION)))
 		eval/nnue/features/pe9.cpp                                      \
 		eval/nnue/features/king_safety_distinguishgolds.cpp             \
 		eval/nnue/features/kk.cpp                                       \
+		eval/nnue/features/half_kpe4.cpp                                \
 		engine/yaneuraou-engine/yaneuraou-search.cpp
 
 	ifneq (,$(findstring em++,$(COMPILER)))

@@ -193,7 +193,8 @@ const string engine_info() {
 
 //			<< EVAL_TYPE_NAME << ' '
 //			<< "NNUE HalfKP-KSDG_512x2-8-96" << ' '
-			<< "NNUE HalfKP-KK_512x2-8-96" << ' '
+//			<< "NNUE HalfKP-KK_512x2-8-96" << ' '
+			<< "NNUE HalfKPE4_256x2-32-32" << ' '
 
 			<< ENGINE_VERSION << std::setfill('0')
 			<< (Is64Bit ? " 64" : " 32")
