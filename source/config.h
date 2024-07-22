@@ -178,7 +178,7 @@
 // 評価関数で金と小駒の成りを区別する
 // 駒の特徴量はBonaPiece。これはBonanzaに倣っている。
 // このオプションを有効化すると、金と小駒の成りを区別する。(Bonanzaとは異なる特徴量になる)
-// #define DISTINGUISH_GOLDS
+#define DISTINGUISH_GOLDS
 
 // エンジンオプションをコンパイル時に指定したい時に用いる。
 // ";"で区切って複数指定できる。
