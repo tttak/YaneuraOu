@@ -41,7 +41,8 @@
 //#include "architectures/halfkpe4_512x2-8-96.h"
 
 // HalfKPE4-KSDG型
-#include "architectures/halfkpe4-kingsafety_distinguishgolds_512x2-8-96.h"
+//#include "architectures/halfkpe4-kingsafety_distinguishgolds_512x2-8-96.h"
+#include "architectures/halfkpe4-kingsafety_distinguishgolds_256x2-32-32.h"
 
 #elif defined(YANEURAOU_ENGINE_NNUE_HALFKP_512X2_16_32)
 
