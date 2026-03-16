@@ -4,9 +4,11 @@
 // 遠方駒による利きのライブラリ
 // Bitboard/Byteboardに対して8近傍,24近傍を高速に求める等
 
-#include "../shogi.h"
+#include "../types.h"
 
-#ifdef LONG_EFFECT_LIBRARY
+#if defined (LONG_EFFECT_LIBRARY)
+
+namespace YaneuraOu {
 
 struct Bitboard;
 
@@ -217,7 +219,7 @@ namespace LongEffect
     }
 
     // ゼロクリア
-    void clear() { memset(e, 0, sizeof(e)); }
+	void clear();
 
     // around8で回収するときのpadding
     uint8_t padding[SQ_22];
@@ -267,7 +269,7 @@ namespace LongEffect
   struct WordBoard
   {
     // ゼロクリア
-    void clear() { memset(le16, 0, sizeof(le16)); }
+	void clear();
 
     // ある升にある長い利きの方向
     // この方向に利いている(遠方駒は、この逆方向にいる。sqの駒を取り除いたときにさらにこの方角に利きが伸びる)
@@ -340,7 +342,9 @@ namespace LongEffect
 
   // --- initialize for LONG_EFFECT_LIBRARY
   void init();
-}
+
+} // namespace Effect8
+} // namespace YaneuraOu
 
 #endif // LONG_EFFECT_LIBRARY
 

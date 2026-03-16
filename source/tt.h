@@ -1,278 +1,215 @@
-﻿#ifndef _TT_H_
-#define _TT_H_
+﻿#ifndef TT_H_INCLUDED
+#define TT_H_INCLUDED
 
-#include "shogi.h"
+//#include <cstddef>
+//#include <cstdint>
+#include "types.h"
+#include "misc.h"
+#include "memory.h"
+#include "thread.h"
 
-// --------------------
-//       置換表
-// --------------------
+namespace YaneuraOu {
 
-// 置換表エントリー
-// 本エントリーは10bytesに収まるようになっている。3つのエントリーを並べたときに32bytesに収まるので
-// CPUのcache lineに一発で載るというミラクル。
-struct TTEntry {
+struct Key128;
+struct Key256;
 
-	Move move() const { return (Move)move16; }
-	Value value() const { return (Value)value16; }
-	void set_value(Value v) { value16 = v; }
+// cf.【決定版】コンピュータ将棋のHASHの概念について詳しく : http://yaneuraou.yaneu.com/2018/11/18/%E3%80%90%E6%B1%BA%E5%AE%9A%E7%89%88%E3%80%91%E3%82%B3%E3%83%B3%E3%83%94%E3%83%A5%E3%83%BC%E3%82%BF%E5%B0%86%E6%A3%8B%E3%81%AEhash%E3%81%AE%E6%A6%82%E5%BF%B5%E3%81%AB%E3%81%A4%E3%81%84%E3%81%A6/
 
-#if !defined (NO_EVAL_IN_TT)
-	// この局面でevaluate()を呼び出したときの値
-	Value eval() const { return (Value)eval16; }
-#endif
+//class ThreadPool;
+struct TTEntry;
+struct Cluster;
 
-	Depth depth() const { return (Depth)(depth8 * int(ONE_PLY)); }
-	Bound bound() const { return (Bound)(genBound8 & 0x3); }
+// There is only one global hash table for the engine and all its threads. For chess in particular, we even allow racy
+// updates between threads to and from the TT, as taking the time to synchronize access would cost thinking time and
+// thus elo. As a hash table, collisions are possible and may cause chess playing issues (bizarre blunders, faulty mate
+// reports, etc). Fixing these also loses elo; however such risk decreases quickly with larger TT size.
+//
+// probe is the primary method: given a board position, we lookup its entry in the table, and return a tuple of:
+//   1) whether the entry already has this position
+//   2) a copy of the prior data (if any) (may be inconsistent due to read races)
+//   3) a writer object to this entry
+// The copied data and the writer are separated to maintain clear boundaries between local vs global objects.
 
-	uint8_t generation() const { return genBound8 & 0xfc; }
-	void set_generation(uint8_t g) { genBound8 = bound() | g; }
-
-	// 置換表のエントリーに対して与えられたデータを保存する。上書き動作
-	//   v    : 探索のスコア
-	//   eval : 評価関数 or 静止探索の値
-	//   m    : ベストな指し手
-	//   gen  : TT.generation()
-	void save(Key k, Value v, Bound b, Depth d, Move m,
-#if !defined (NO_EVAL_IN_TT)
-		Value eval,
-#endif
-		uint8_t gen)
-	{
-		// ASSERT_LV3((-VALUE_INFINITE < v && v < VALUE_INFINITE) || v == VALUE_NONE);
-
-		// 置換表にVALUE_INFINITE以上の値を書き込んでしまうのは本来はおかしいが、
-		// 実際には置換表が衝突したときにqsearch()から書き込んでしまう。
-		//
-		// 例えば、3手詰めの局面で、置換表衝突により1手詰めのスコアが返ってきた場合、VALUE_INFINITEより
-		// 大きな値を書き込む。
-		//
-		// 逆に置換表をprobe()したときにそのようなスコアが返ってくることがある。
-		// しかしこのようなスコアは、mate distance pruningで補正されるので問題ない。
-		// (ように、探索部を書くべきである。)
-		//
-		// Stockfishで、VALUE_INFINITEを32001(int16_tの最大値よりMAX_PLY以上小さな値)にしてあるのは
-		// そういった理由から。
+//エンジンとそのすべてのスレッドに対して、グローバルなハッシュテーブルは1つだけ存在します。
+// 特にチェスにおいては、TT（トランスポジションテーブル）間でのスレッド間の競合的な更新も許可しており、
+// アクセスを同期化するための時間を費やすと思考時間が減少し、それに伴いEloレーティングも下がるためです。
+//
+// ハッシュテーブルであるため、衝突が発生する可能性があり、
+// それが原因でチェスプレイに問題が生じる場合があります（奇妙なミスや誤ったチェックメイト報告など）。
+// これらを修正することもEloレーティングを失うことにつながりますが、大きなTTサイズではそのリスクは急速に減少します。
+//
+// probeは主なメソッドであり、ボードの局面を与えられると、テーブル内のエントリを検索し、以下のタプルを返します：
+//
+// そのエントリがすでにこの局面を持っているかどうか
+// 以前のデータのコピー（あれば）（読み取り競合により不整合がある可能性があります）
+// このエントリへのライターオブジェクト
+// コピーされたデータとライターは、ローカルオブジェクトとグローバルオブジェクトの境界を明確にするために分離されています。
 
 
-		// このif式だが、
-		// A = m!=MOVE_NONE
-		// B = (k >> 48) != key16)
-		// として、ifが成立するのは、
-		// a)  A && !B
-		// b)  A &&  B
-		// c) !A &&  B
-		// の3パターン。b),c)は、B == trueなので、その下にある次のif式が成立して、この局面のhash keyがkey16に格納される。
-		// a)は、B == false すなわち、(k >> 48) == key16であり、この局面用のentryであるから、その次のif式が成立しないとしても
-		// 整合性は保てる。
-		// a)のケースにおいても、指し手の情報は格納しておいたほうがいい。
-		// これは、このnodeで、TT::probeでhitして、その指し手は試したが、それよりいい手が見つかって、枝刈り等が発生しているような
-		// ケースが考えられる。ゆえに、今回の指し手のほうが、いまの置換表の指し手より価値があると考えられる。
+// A copy of the data already in the entry (possibly collided). `probe` may be racy, resulting in inconsistent data.
 
-		if (m != MOVE_NONE || (k >> 48) != key16)
-			move16 = (uint16_t)m;
+// すでにエントリに存在するデータのコピー（衝突している可能性があります）。
+// `probe` は競合が発生することがあり、不整合なデータを返す可能性があります。
 
-		// このエントリーの現在の内容のほうが価値があるなら上書きしない。
-		// 1. hash keyが違うということはTT::probeでここを使うと決めたわけだから、このEntryは無条件に潰して良い
-		// 2. hash keyが同じだとしても今回の情報のほうが残り探索depthが深い(新しい情報にも価値があるので
-		// 　少しの深さのマイナスなら許容)
-		// 3. BOUND_EXACT(これはPVnodeで探索した結果で、とても価値のある情報なので無条件で書き込む)
-		// 1. or 2. or 3.
-		if (  (k >> 48) != key16
-			|| (d / ONE_PLY > depth8 - 4)
-			/*|| g != generation() // probe()において非0のkeyとマッチした場合、その瞬間に世代はrefreshされている。　*/
-			|| b == BOUND_EXACT
-			)
-		{
-			key16 = (uint16_t)(k >> 48);
-			value16 = (int16_t)v;
-#if !defined (NO_EVAL_IN_TT)
-			eval16 = (int16_t)eval;
-#endif
-			genBound8 = (uint8_t)(gen | b);
-			depth8 = (int8_t)(d / ONE_PLY);
-		}
-	}
+// ■ 補足
+// 
+// moveはMove(32bit)ではあるが、TTEntryにはMove16(16bit)でしか格納されていない。
+// そのため、TT.probe()で取り出すときにこの16bitを32bitに拡張して返す。
 
-private:
-	friend struct TranspositionTable;
+struct TTData {
+	Move   move;
+	Value  value, eval;
+	Depth  depth;
+	Bound  bound;
+	bool   is_pv;
 
-	// hash keyの上位16bit。下位48bitはこのエントリー(のアドレス)に一致しているということは
-	// そこそこ合致しているという前提のコード
-	uint16_t key16;
+	TTData() = delete;
 
-	// 指し手
-	uint16_t move16;
-
-	// このnodeでの探索の結果スコア
-	int16_t value16;
-
-#if !defined (NO_EVAL_IN_TT)
-	// 評価関数の評価値
-	int16_t eval16;
-#endif
-
-	// entryのgeneration上位6bit + Bound下位2bitのpackしたもの。
-	// generationはエントリーの世代を表す。TranspositionTableで新しい探索ごとに+4されていく。
-	uint8_t genBound8;
-
-	// そのときの残り深さ(これが大きいものほど価値がある)
-	// 1バイトに収めるために、DepthをONE_PLYで割ったものを格納する。
-	int8_t depth8;
+	// clang-format off
+	TTData(Move m, Value v, Value ev, Depth d, Bound b, bool pv) :
+		move(m),
+		value(v),
+		eval(ev),
+		depth(d),
+		bound(b),
+		is_pv(pv) {
+	};
+	// clang-format on
 };
 
-// --- 置換表本体
+// This is used to make racy writes to the global TT.
+
+// これはグローバルTTへの競合的な書き込みを行うために使用されます。
+
+struct TTWriter {
+public:
+    void write(Key k, Value v, bool pv, Bound b, Depth d, Move m, Value ev, uint8_t generation8);
+
+private:
+	friend class TranspositionTable;
+	TTEntry* entry;
+	TTWriter(TTEntry* tte);
+};
+
+// ============================================================
+//               やねうら王独自拡張
+// ============================================================
+
+// やねうら王では、TTClusterSizeを変更できて、これが2の時は、TTEntryに格納するhash keyは64bit。(Stockfishのように)3の時は16bit。
+#if TT_CLUSTER_SIZE == 3
+typedef uint16_t TTE_KEY_TYPE;
+#else // TT_CLUSTER_SIZEが2,4,6,8の時は64bit。5,7は選択する意味がないと思うので考えない。
+typedef uint64_t TTE_KEY_TYPE;
+#endif
+
+// ============================================================
+//               置換表本体
+// ============================================================
+
 // TT_ENTRYをClusterSize個並べて、クラスターをつくる。
 // このクラスターのTT_ENTRYは同じhash keyに対する保存場所である。(保存場所が被ったときに後続のTT_ENTRYを使う)
 // このクラスターが、clusterCount個だけ確保されている。
-struct TranspositionTable {
+class TranspositionTable {
+
+public:
+	~TranspositionTable() { aligned_large_pages_free(table); }
+
+	// Set TT size
+	// 置換表のサイズを変更する。mbSize == 確保するメモリサイズ。[MB]単位。
+
+	void resize(size_t mbSize,ThreadPool& threads);  // Set TT size
+
+	// Re-initialize memory, multithreaded
+	// メモリを再初期化、マルチスレッド対応
+
+	// 置換表のエントリーの全クリア
+	// 並列化してクリアするので高速。
+
+	void clear(ThreadPool& threads);                  // Re-initialize memory, multithreaded
+
+	// Approximate what fraction of entries (permille) have been written to during this root search
+	// このルート探索中に書き込まれたエントリの割合（パーミル単位）を概算します。
+	// ⇨ 置換表の使用率を1000分率で返す。(USIプロトコルで統計情報として出力するのに使う)
+
+	int hashfull(int maxAge = 0) const;
+
+	// This must be called at the beginning of each root search to track entry aging
+	// エントリのエイジングを追跡するために、各ルート検索の開始時にこれを呼び出す必要があります。
+	// ⇨ 新しい探索ごとにこの関数を呼び出す。(generationを加算する。)
+
+	// USE_GLOBAL_OPTIONSが有効のときは、このタイミングで、Options["Threads"]の値を
+	// キャプチャして、探索スレッドごとの置換表と世代カウンターを用意する。
+	// ⇨ 下位3bitはPV nodeかどうかのフラグとBoundに用いている。
+	void new_search();
+	
+	// The current age, used when writing new data to the TT
+	// 新しいデータをTTに書き込む際に使用される現在のエイジ
+
+	uint8_t generation() const;
+
+	// The main method, whose retvals separate local vs global objects
+	// メインメソッドで、その戻り値はローカルオブジェクトとグローバルオブジェクトを区別します
 
 	// 置換表のなかから与えられたkeyに対応するentryを探す。
 	// 見つかったならfound == trueにしてそのTT_ENTRY*を返す。
 	// 見つからなかったらfound == falseで、このとき置換表に書き戻すときに使うと良いTT_ENTRY*を返す。
-	// GlobalOptions.use_per_thread_tt == trueのときはスレッドごとに置換表の異なるエリアに属するTTEntryを
-	// 渡す必要があるので、引数としてthread_idを渡す。
-	TTEntry* probe(const Key key, bool& found
-#if defined(USE_GLOBAL_OPTIONS)
-		, size_t thread_id = -1
-#endif
-		) const;
+	// ※ KeyとしてKey(64 bit)以外に 128,256bitのhash keyにも対応。(やねうら王独自拡張)
+	//
+	// ⇨ このprobe()でTTの内部状態が変更されないことは保証されている。(されるようになった)
 
-	// keyの下位bitをClusterのindexにしてその最初のTTEntry*を返す。
-	TTEntry* first_entry(const Key key) const {
-		return &table[(size_t)key & (clusterCount - 1)].entry[0];
-	}
-
-	// 置換表のサイズを変更する。mbSize == 確保するメモリサイズ。MB単位。
-	void resize(size_t mbSize);
-
-	// 置換表のエントリーの全クリア
-	void clear() { memset(table, 0, clusterCount * sizeof(Cluster)); }
-
-	// 新しい探索ごとにこの関数を呼び出す。(generationを加算する。)
-	// USE_GLOBAL_OPTIONSが有効のときは、このタイミングで、Options["Threads"]の値を
-	// キャプチャして、探索スレッドごとの置換表と世代カウンターを用意する。
-	void new_search() {
-		generation8 += 4;
-
-#if defined(USE_GLOBAL_OPTIONS)
-		size_t m = Options["Threads"];
-		if (m != max_thread)
-		{
-			max_thread = m;
-			// スレッドごとの世代カウンター用の配列もこのタイミングで確保。
-			a_generation8.resize(m);
-		}
-#endif
-	} // 下位2bitはTTEntryでBoundに使っているので4ずつ加算。
-
-	// 世代を返す。これはTTEntry.save()のときに使う。
-	uint8_t generation() const { return generation8; }
-
-#if defined(USE_GLOBAL_OPTIONS)
-
-	// --- スレッドIDごとにgenerationを持っているとき用の処理。
-
-	uint8_t generation(size_t thread_id) const {
-		if (GlobalOptions.use_per_thread_tt)
-			return a_generation8[thread_id];
-		else
-			return generation8;
-	}
-
-	void new_search(size_t thread_id) {
-		if (GlobalOptions.use_per_thread_tt)
-			a_generation8[thread_id] += 4;
-		else
-			generation8 += 4;
-	}
-
+#if STOCKFISH
+    std::tuple<bool, TTData, TTWriter> probe(
+          const Key key) const;  // The main method, whose retvals separate local vs global objects
+#else
+	std::tuple<bool, TTData, TTWriter> probe(const Key key, const Position& pos) const;
 #endif
 
-	// 置換表の使用率を1000分率で返す。(USIプロトコルで統計情報として出力するのに使う)
-	int hashfull() const;
+	// This is the hash function; its only external use is memory prefetching.
+	// これはハッシュ関数です。外部での唯一の使用目的はメモリのプリフェッチです。
 
-	TranspositionTable() { mem = nullptr; clusterCount = 0; }
-	~TranspositionTable() { free(mem); }
+	/*
+		📓 first_entry()とは？
+
+		keyを元にClusterのindexを求めて、その最初のTTEntry* を返す。
+
+		Stockfishとは違い、引数にこの局面の手番(side_to_move)を渡しているのは、
+		手番をCluster indexのbit 0に埋めることで、手番が異なれば、異なる
+		TT Clusterになることを保証するため。
+
+		これは、将棋では駒の移動が上下対称ではないので、先手の指し手が(TT raceで)
+		後手番の局面でTT.probeで返ってくると、pseudo-legalの判定で余計なチェックが
+		必要になって嫌だからである。
+	*/ 
+
+#if STOCKFISH
+    TTEntry* first_entry(const Key key)
+      const;  // This is the hash function; its only external use is memory prefetching.
+#else
+	TTEntry* first_entry(const Key& key, Color side_to_move) const;
+#endif
+
+	static void UnitTest(Test::UnitTester& unittest, IEngine& engine);
 
 private:
+	friend struct TTEntry;
 
-	// TTEntryはこのサイズでalignされたメモリに配置する。(される)
-	static const int CacheLineSize = 64;
+	// この置換表が保持しているクラスター数。
+	// Stockfishはresize()ごとに毎回新しく置換表を確保するが、やねうら王では
+	// そこは端折りたいので、毎回は確保しない。そのため前回サイズがここに格納されていないと
+	// 再確保すべきかどうかの判定ができない。ゆえに0で初期化しておく。
+	size_t clusterCount = 0;
 
-#if !defined (NO_EVAL_IN_TT)
-	// 1クラスターにおけるTTEntryの数
-	// TTEntry 10bytes×3つ + 2(padding) = 32bytes
-	static const int ClusterSize = 3;
-#else
-	// TTEntry 8bytes×4つ = 32bytes
-	static const int ClusterSize = 4;
-#endif
+	// 確保されているClusterの先頭(alignされている)
+	// Stockfishではmemをコンストラクタで初期化していないが、初期化しておいたほうが
+	// 不用意に使った場合に確実にアクセス保護違反で落ちるので都合が良い。
+	Cluster* table = nullptr;
 
-#if defined(USE_GLOBAL_OPTIONS)
-	// スレッド数
-	// スレッドごとに置換表を分けたいときのために現在のスレッド数を保持しておき、
-	// 異なるエリアのなかのTTEntryを返すようにする。
-	static size_t max_thread;
-
-	// スレッドごとに世代を持っている必要がある。
-	std::vector<u8> a_generation8;
-#endif
-
-	struct Cluster {
-		TTEntry entry[ClusterSize];
-#if !defined (NO_EVAL_IN_TT)
-		u8 padding[2]; // 全体を32byteぴったりにするためのpadding
-#endif
-	};
-
-	static_assert(sizeof(Cluster) == CacheLineSize / 2, "Cluster size incorrect");
-
-	// この置換表が保持しているクラスター数。2の累乗。
-	size_t clusterCount;
-
-	// 確保されているクラスターの先頭(alignされている)
-	Cluster* table;
-
-	// 確保されたメモリの先頭(alignされていない)
-	void* mem;
-
-	uint8_t generation8; // TT_ENTRYのset_gen()で書き込む
+	// Size must be not bigger than TTEntry::genBound8
+	// サイズはTTEntry::genBound8を超えてはなりません。
+	// ⇨ 世代カウンター。new_search()のごとに8ずつ加算する。TTEntry::save()で用いる。
+	uint8_t generation8;
 };
 
-// 詰みのスコアは置換表上は、このnodeからあと何手で詰むかというスコアを格納する。
-// しかし、search()の返し値は、rootからあと何手で詰むかというスコアを使っている。
-// (こうしておかないと、do_move(),undo_move()するごとに詰みのスコアをインクリメントしたりデクリメントしたり
-// しないといけなくなってとても面倒くさいからである。)
-// なので置換表に格納する前に、この変換をしなければならない。
-// 詰みにまつわるスコアでないなら関係がないので何の変換も行わない。
-// ply : root node からの手数。(ply_from_root)
-inline Value value_to_tt(Value v, int ply) {
+} // namespace YaneuraOu
 
-	ASSERT_LV3(-VALUE_INFINITE < v && v < VALUE_INFINITE);
-
-	return  v >= VALUE_MATE_IN_MAX_PLY ? v + ply
-		  : v <= VALUE_MATED_IN_MAX_PLY ? v - ply : v;
-}
-
-// value_to_tt()の逆関数
-// ply : root node からの手数。(ply_from_root)
-inline Value value_from_tt(Value v, int ply) {
-
-	return  v == VALUE_NONE ? VALUE_NONE
-		: v >= VALUE_MATE_IN_MAX_PLY ? v - ply
-		: v <= VALUE_MATED_IN_MAX_PLY ? v + ply : v;
-}
-
-// PV lineをコピーする。
-// pv に move(1手) + childPv(複数手,末尾MOVE_NONE)をコピーする。
-// 番兵として末尾はMOVE_NONEにすることになっている。
-inline void update_pv(Move* pv, Move move, Move* childPv) {
-
-	for (*pv++ = move; childPv && *childPv != MOVE_NONE; )
-		*pv++ = *childPv++;
-	*pv = MOVE_NONE;
-}
-
-extern TranspositionTable TT;
-
-#endif // _TT_H_
+#endif // #ifndef TT_H_INCLUDED

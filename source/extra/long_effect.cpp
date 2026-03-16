@@ -7,10 +7,14 @@
 //  長い利きに関するライブラリ
 // ----------------------
 
-#ifdef LONG_EFFECT_LIBRARY
+#if defined(LONG_EFFECT_LIBRARY)
 
 #include "../bitboard.h"
 #include "../position.h"
+
+#include <cstring>	// std::memset()
+
+namespace YaneuraOu {
 
 // Effect8::operator<<()で用いるヘルパー関数
 // 3*3ならN=3 , 5*5ならN=5..
@@ -53,7 +57,7 @@ namespace Effect8
       for (auto d : Direct())
       {
         // SQ_22の地点でその周辺8近傍の状態を使ってテーブルを初期化する
-        auto effect = effects_from(pc, SQ_22 + DirectToDelta(d), ZERO_BB);
+        auto effect = effects_from(pc, SQ_22 + DirectToDelta(d), Bitboard(ZERO));
         // 利きがある場所が0、ない場所が1なのでnotしておく。
         auto effect8_not = ~around8(effect, SQ_22);
 
@@ -65,7 +69,7 @@ namespace Effect8
     for (auto pc : Piece())
     {
       // SQ_22に相手の駒を置いたときの利きの場所が、そこに置いてSQ_22に王手になる場所
-      auto effect = effects_from(Piece(pc ^ PIECE_WHITE), SQ_22,ZERO_BB);
+      auto effect = effects_from(Piece(pc ^ PIECE_WHITE), SQ_22, Bitboard(ZERO));
       auto effect8 = around8(effect, SQ_22);
       piece_check_around8_table[pc] = effect8;
     }
@@ -75,7 +79,7 @@ namespace Effect8
     for (int d1 = 0; d1 < DIRECT_NB_PLUS4; ++d1)
       for (uint16_t d2 = 0; d2 < 0x100; ++d2)
       {
-        Bitboard bb = ZERO_BB;
+        Bitboard bb(ZERO);
 
         // SQ_55の地点でやってみる。
 
@@ -169,7 +173,7 @@ namespace Effect24
       ((b.p[0] >> int(sq - SQ_33)) | (b.p[1] << int(SQ_93 + SQ_L - sq))); // p[1]のSQ_93の左は、p[0]のSQ_33
 
     // PEXTで24近傍の状態を回収。
-    return (Directions)PEXT64(t, 0b11111000011111000011011000011111000011111);
+    return (Directions)PEXT64(t, 0b11111000011111000011011000011111000011111ULL);
   }
 
   std::ostream& operator<<(std::ostream& os, Directions d) { return output_around_n(os, d, 5); }
@@ -203,6 +207,9 @@ namespace LongEffect
     return os;
   }
 
+  // ゼロクリア
+  void ByteBoard::clear() { memset(e, 0, sizeof(e)); }
+
   // ----------------------
   //  WordBoard(利きの方向を先後同時に表現)
   // ----------------------
@@ -228,6 +235,9 @@ namespace LongEffect
     }
     return os;
   }
+
+  // ゼロクリア
+  void WordBoard::clear() { memset(le16, 0, sizeof(le16)); }
 
   // ----------------------
   //  Positionクラスの初期化時の利きの全計算
@@ -311,10 +321,10 @@ namespace LongEffect
       // 短いを持っていないもの
     case B_LANCE: case B_BISHOP: case B_ROOK:
     case W_LANCE: case W_BISHOP: case W_ROOK:
-      return ZERO_BB;
+      return Bitboard(ZERO);
 
     default:
-      UNREACHABLE; return ZERO_BB;
+      UNREACHABLE; return Bitboard(ZERO);
     }
   }
 
@@ -637,6 +647,8 @@ namespace LongEffect
     Effect24::init();
   }
 
-}
+} // namespace Effect8
+} // namespace YaneuraOu {
+
 
 #endif // LONG_EFFECT_LIBRARY

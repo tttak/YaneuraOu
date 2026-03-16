@@ -3,37 +3,30 @@
 
 // いまどきの手番つき評価関数(EVAL_KPPTとEVAL_KPP_KKPT)の共用header的なもの。
 
-#if defined (EVAL_KPPT) || defined(EVAL_KPP_KKPT) || defined (EVAL_KPPPT) || defined(EVAL_KPPP_KKPT) || defined(EVAL_KKPP_KKPT) || defined(EVAL_KKPPT) || \
-	defined(EVAL_KPP_KKPT_FV_VAR) || defined(EVAL_HELICES) || defined(EVAL_NABLA)
+#if defined (EVAL_KPPT) || defined(EVAL_KPP_KKPT) || defined(EVAL_NNUE)
+#include <functional>
 
-// KKファイル名
-#define KK_BIN "KK_synthesized.bin"
-
-// KKPファイル名
-#define KKP_BIN "KKP_synthesized.bin"
-
-// KPPファイル名
-#define KPP_BIN "KPP_synthesized.bin"
-
-// KPPPありの評価関数向け。
-#if defined (EVAL_KPPPT) || defined(EVAL_KPPP_KKPT) || defined(EVAL_HELICES)
-// KPPPファイル名
-#define KPPP_BIN "KPPP_synthesized.bin"
-#endif
-
-// KKPPありの評価関数向け。
-#if defined(EVAL_KKPP_KKPT) || defined(EVAL_KKPPT)
-// KKPPファイル名
-#define KKPP_BIN "KKPP_synthesized.bin"
-#endif
-
-
+namespace YaneuraOu {
 namespace Eval
 {
 
+#if defined (EVAL_KPPT) || defined(EVAL_KPP_KKPT) 
+
+	// KKファイル名
+	constexpr const char* KK_BIN = "KK_synthesized.bin";
+
+	// KKPファイル名
+	constexpr const char* KKP_BIN = "KKP_synthesized.bin";
+
+	// KPPファイル名
+	constexpr const char* KPP_BIN = "KPP_synthesized.bin";
+
+#endif
+
 #if defined(USE_EVAL_HASH)
 	// prefetchする関数
-	void prefetch_evalhash(const Key key);
+    using Key64 = uint64_t;
+	void prefetch_evalhash(const Key64 key);
 #endif
 
 	// 評価関数のそれぞれのパラメーターに対して関数fを適用してくれるoperator。
@@ -87,9 +80,8 @@ namespace Eval
 
 #endif
 
-
-}
-
+} // Eval
+} // namespace YaneuraOu
 
 #endif
 

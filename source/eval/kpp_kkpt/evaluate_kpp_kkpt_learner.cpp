@@ -1,7 +1,7 @@
 ﻿// KPP_KKPT評価関数の学習時用のコード
 // KPPTの学習用コードのコピペから少しいじった感じ。
 
-#include "../../shogi.h"
+#include "../../config.h"
 
 #if defined(EVAL_LEARN) && defined(EVAL_KPP_KKPT)
 
@@ -15,6 +15,7 @@
 #include "../../evaluate.h"
 #include "../../position.h"
 #include "../../misc.h"
+#include "../../usi.h"
 
 #include "../evaluate_io.h"
 #include "../evaluate_common.h"
@@ -23,9 +24,9 @@
 
 // --- 以下、定義
 
-namespace Eval
-{
-	using namespace EvalLearningTools;
+namespace YaneuraOu {
+using namespace EvalLearningTools;
+namespace Eval {
 
 	// bugなどにより間違って書き込まれた値を補正する。
 	void correct_eval()
@@ -147,8 +148,8 @@ namespace Eval
 		// 180度盤面を回転させた位置関係に対する勾配
 		std::array<LearnFloatType,2> g_flip = { -g[0] , g[1] };
 
-		Square sq_bk = pos.king_square(BLACK);
-		Square sq_wk = pos.king_square(WHITE);
+		Square sq_bk = pos.square<KING>(BLACK);
+		Square sq_wk = pos.square<KING>(WHITE);
 
 		auto& pos_ = *const_cast<Position*>(&pos);
 
@@ -364,19 +365,19 @@ namespace Eval
 	void save_eval(std::string dir_name)
 	{
 		{
-			auto eval_dir = path_combine((std::string)Options["EvalSaveDir"], dir_name);
+			auto eval_dir = Path::Combine((std::string)Options["EvalSaveDir"], dir_name);
 
 			std::cout << "save_eval() start. folder = " << eval_dir << std::endl;
 
-			// すでにこのフォルダがあるならmkdir()に失敗するが、
+			// すでにこのフォルダがあるならCreateFolder()に失敗するが、
 			// 別にそれは構わない。なければ作って欲しいだけ。
 			// また、EvalSaveDirまでのフォルダは掘ってあるものとする。
 
-			MKDIR(eval_dir);
+			Directory::CreateFolder(eval_dir);
 
 			// EvalIOを利用して評価関数ファイルに書き込む。
 			// 読み込みのときのinputとoutputとを入れ替えるとファイルに書き込める。EvalIo::eval_convert()マジ優秀。
-			auto make_name = [&](std::string filename) { return path_combine(eval_dir, filename); };
+			auto make_name = [&](std::string filename) { return Path::Combine(eval_dir, filename); };
 			auto input = EvalIO::EvalInfo::build_kpp_kkpt32((void*)kk, (void*)kkp, (void*)kpp);
 			auto output = EvalIO::EvalInfo::build_kpp_kkpt32(make_name(KK_BIN), make_name(KKP_BIN), make_name(KPP_BIN));
 
@@ -399,6 +400,7 @@ namespace Eval
 		return Weight::eta;
 	}
 
-}
+} // namespace Eval
+} // YaneuraOu
 
 #endif // EVAL_LEARN

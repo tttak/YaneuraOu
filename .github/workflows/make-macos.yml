@@ -1,0 +1,89 @@
+# for Linux environment
+name: Make CI (for MacOS)
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+    branches:
+      - "**"
+
+jobs:
+  build-macos:
+    # macos-13
+    # https://docs.github.com/ja/actions/using-github-hosted-runners/about-github-hosted-runners
+    # https://github.com/actions/runner-images/blob/main/images/macos/macos-13-Readme.md
+    # ⇨ 13は使えんくなった。最新版を指定しておく。
+    runs-on: macos-latest
+
+    strategy:
+      matrix:
+        edition:
+          - YANEURAOU_ENGINE_NNUE
+          - YANEURAOU_ENGINE_DEEP_COREML
+        compiler:
+          - clang++
+        target:
+          - tournament
+        archcpu:
+          - APPLEM1
+
+    steps:
+      - name: Checkout own repository
+        uses: actions/checkout@v4
+        with:
+          path: main
+
+      - name: make
+        uses: actions/github-script@v7
+        env:
+          JOBS: '8'
+          EDITION: '${{ matrix.edition }}'
+          COMPILER: '${{ matrix.compiler }}'
+          TARGET: '${{ matrix.target }}'
+          CPU: '${{ matrix.archcpu }}'
+          OS: 'macos11'
+        with:
+          script: |
+            const fs = require('fs');
+            const {JOBS, EDITION, COMPILER, TARGET, CPU, OS, EXTRA} = process.env;
+            const editionh = {
+              "YANEURAOU_ENGINE_NNUE": "YANEURAOU_ENGINE_NNUE",
+              "YANEURAOU_ENGINE_DEEP_TENSOR_RT": "YANEURAOU_ENGINE_DEEP_TENSOR_RT",
+              "YANEURAOU_ENGINE_DEEP_COREML": "YANEURAOU_ENGINE_DEEP_COREML",
+            };
+            const dirh = {
+              "YANEURAOU_ENGINE_NNUE": "NNUE",
+              "YANEURAOU_ENGINE_DEEP_TENSOR_RT": "DEEP_TRT",
+              "YANEURAOU_ENGINE_DEEP_COREML": "FukauraOu_CoreML",
+            };
+            const fileh = {
+              "YANEURAOU_ENGINE_NNUE": "YaneuraOu_NNUE",
+              "YANEURAOU_ENGINE_DEEP_TENSOR_RT": "YaneuraOu_Deep_TRT",
+              "YANEURAOU_ENGINE_DEEP_COREML": "FukauraOu_CoreML",
+            };
+            for(let edition of EDITION.split(',')) {
+            for(let compiler of COMPILER.split(',')) {
+            for(let target of TARGET.split(',')) {
+            for(let cpu of CPU.split(',')) {
+              const builddir = `../build/${OS}/${dirh[edition]}`;
+              const filename = `${fileh[edition]}-${OS}-${compiler}-${target}-${cpu.toLowerCase()}`;
+              let log = '';
+              await io.mkdirP(`./main/source/${builddir}`);
+              await exec.exec('nice', `make -j${JOBS} ${target} TARGET_CPU=${cpu} YANEURAOU_EDITION=${editionh[edition]} COMPILER=${compiler} TARGET=${builddir}/${filename}`.split(' '), {
+                "cwd": "./main/source/",
+                listeners: {
+                  stdout: (data) => { log += data.toString(); },
+                  stderr: (data) => { log += data.toString(); },
+                }
+              });
+              await exec.exec(`make`, `clean TARGET_CPU=${cpu} YANEURAOU_EDITION=${edition}`.split(' '), {"cwd": "./main/source/"});
+              fs.writeFileSync(`./main/source/${builddir}/${filename}.log`, log);
+            }}}}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-macos_${{ github.run_number }}_${{ matrix.edition }}_${{ matrix.compiler }}_${{ matrix.target }}_${{ matrix.archcpu }}_${{ github.sha }}
+          path: ./main/build/**/**/*
+

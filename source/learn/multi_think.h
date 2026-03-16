@@ -1,14 +1,16 @@
-﻿#ifndef _MULTI_THINK_
-#define _MULTI_THINK_
+﻿#ifndef MULTI_THINK_H_INCLUDED
+#define MULTI_THINK_H_INCLUDED
 
-#include "../shogi.h"
+#include "../config.h"
 
-#if defined(EVAL_LEARN) && \
-	(defined(YANEURAOU_2018_OTAFUKU_ENGINE) || defined(YANEURAOU_2018_GOKU_ENGINE))
+#if defined(EVAL_LEARN) && defined(YANEURAOU_ENGINE)
 
 #include "../misc.h"
 #include "../learn/learn.h"
+
 #include <atomic>
+
+namespace YaneuraOu {
 
 // 棋譜からの学習や、自ら思考させて定跡を生成するときなど、
 // 複数スレッドが個別にSearch::think()を呼び出したいときに用いるヘルパクラス。
@@ -34,6 +36,11 @@ struct MultiThink
 	//   callback_funcとcallback_interval
 	void go_think();
 
+	// 派生クラス側で初期化したいものがあればこれをoverrideしておけば、
+	// go_think()で初期化が終わったタイミングで呼び出される。
+	// 定跡の読み込みなどはそのタイミングで行うと良い。
+	virtual void init() {}
+
 	// go_think()したときにスレッドを生成して呼び出されるthread worker
 	// これをoverrideして用いる。
 	virtual void thread_worker(size_t thread_id) = 0;
@@ -53,7 +60,7 @@ struct MultiThink
 	// 局面を生成する場合などは、局面を生成するタイミングでこの関数を呼び出すようにしないと、
 	// 生成した局面数と、カウンターの値が一致しなくなってしまうので注意すること。
 	u64 get_next_loop_count() {
-		std::unique_lock<Mutex> lk(loop_mutex);
+		std::unique_lock<std::mutex> lk(loop_mutex);
 		if (loop_count >= loop_max)
 			return UINT64_MAX;
 		return loop_count++;
@@ -61,12 +68,12 @@ struct MultiThink
 
 	// [ASYNC] 処理した個数を返す用。呼び出されるごとにインクリメントされたカウンターが返る。
 	u64 get_done_count() {
-		std::unique_lock<Mutex> lk(loop_mutex);
+		std::unique_lock<std::mutex> lk(loop_mutex);
 		return ++done_count;
 	}
 
 	// worker threadがI/Oにアクセスするときのmutex
-	Mutex io_mutex;
+	std::mutex io_mutex;
 
 protected:
 	// 乱数発生器本体
@@ -81,7 +88,7 @@ private:
 	std::atomic<u64> done_count;
 
 	// ↑の変数を変更するときのmutex
-	Mutex loop_mutex;
+	std::mutex loop_mutex;
 
 	// スレッドの終了フラグ。
 	// vector<bool>にすると複数スレッドから書き換えようとしたときに正しく反映されないことがある…はず。
@@ -105,13 +112,13 @@ struct TaskDispatcher
 		while ((task = get_task_async()) != nullptr)
 			task(thread_id);
 
-		sleep(1);
+		Tools::sleep(1);
 	}
 
 	// [ASYNC] taskを一つ積む。
 	void push_task_async(Task task)
 	{
-		std::unique_lock<Mutex> lk(task_mutex);
+		std::unique_lock<std::mutex> lk(task_mutex);
 		tasks.push_back(task);
 	}
 
@@ -128,7 +135,7 @@ protected:
 	// [ASYNC] taskを一つ取り出す。on_idle()から呼び出される。
 	Task get_task_async()
 	{
-		std::unique_lock<Mutex> lk(task_mutex);
+		std::unique_lock<std::mutex> lk(task_mutex);
 		if (tasks.size() == 0)
 			return nullptr;
 		Task task = *tasks.rbegin();
@@ -137,9 +144,11 @@ protected:
 	}
 
 	// tasksにアクセスするとき用のmutex
-	Mutex task_mutex;
+	std::mutex task_mutex;
 };
 
-#endif // defined(EVAL_LEARN) && defined(YANEURAOU_2017_EARLY_ENGINE)
+} // namespace YaneuraOu
 
-#endif
+#endif // defined(EVAL_LEARN) && defined(YANEURAOU_ENGINE)
+
+#endif // MULTI_THINK_H_INCLUDED

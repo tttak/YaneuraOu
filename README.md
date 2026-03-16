@@ -1,94 +1,150 @@
+﻿[![Make CI (MSYS2 for Windows)](https://github.com/yaneurao/YaneuraOu/actions/workflows/make-msys2.yml/badge.svg?event=push)](https://github.com/yaneurao/YaneuraOu/actions/workflows/make-msys2.yml)
+[![Make CI (DeepLearning for Windows)](https://github.com/yaneurao/YaneuraOu/actions/workflows/make-deep-windows.yml/badge.svg?event=push)](https://github.com/yaneurao/YaneuraOu/actions/workflows/make-deep-windows.yml)
+[![Make CI (MinGW for Windows)](https://github.com/yaneurao/YaneuraOu/actions/workflows/make-mingw.yml/badge.svg?event=push)](https://github.com/yaneurao/YaneuraOu/actions/workflows/make-mingw.yml)
+[![Make CI (for Ubuntu Linux)](https://github.com/yaneurao/YaneuraOu/actions/workflows/make.yml/badge.svg?event=push)](https://github.com/yaneurao/YaneuraOu/actions/workflows/make.yml)
+[![Make CI (DeepLearning for Ubuntu Linux)](https://github.com/yaneurao/YaneuraOu/actions/workflows/make-deep-ubuntu.yml/badge.svg?event=push)](https://github.com/yaneurao/YaneuraOu/actions/workflows/make-deep-ubuntu.yml)
+[![NDK CI (for Android)](https://github.com/yaneurao/YaneuraOu/actions/workflows/ndk.yml/badge.svg?event=push)](https://github.com/yaneurao/YaneuraOu/actions/workflows/ndk.yml)
+[![Make CI (for macOS)](https://github.com/yaneurao/YaneuraOu/actions/workflows/make-macos.yml/badge.svg?event=push)](https://github.com/yaneurao/YaneuraOu/actions/workflows/make-macos.yml)
+[![Make CI (for WebAssembly)](https://github.com/yaneurao/YaneuraOu/actions/workflows/make-wasm.yml/badge.svg?event=push)](https://github.com/yaneurao/YaneuraOu/actions/workflows/make-wasm.yml)
+
 # About this project
 
-YaneuraOu mini is a shogi engine(AI player), stronger than Bonanza6 , educational and tiny code(about 2500 lines) , USI compliant engine , capable of being compiled by VC++2017
+YaneuraOu is the World's Strongest Shogi engine(AI player) , WCSC29 1st winner , educational and USI compliant engine.
 
-やねうら王miniは、将棋の思考エンジンで、Bonanza6より強く、教育的で短いコード(2500行程度)で書かれたUSIプロトコル準拠の思考エンジンで、VC++2017でコンパイル可能です。
+やねうら王は、WCSC29(世界コンピュータ将棋選手権/2019年)、第4回世界将棋AI電竜戦本戦(2023年)などにおいて優勝した世界最強の将棋の思考エンジンです。教育的でUSIプロトコルに準拠しています。
 
-[やねうら王mini 公式サイト (解説記事、開発者向け情報等)](http://yaneuraou.yaneu.com/YaneuraOu_Mini/)
+- [WCSC29、やねうら王優勝しました！](http://yaneuraou.yaneu.com/2019/05/06/wcsc29%E3%80%81%E3%82%84%E3%81%AD%E3%81%86%E3%82%89%E7%8E%8B%E5%84%AA%E5%8B%9D%E3%81%97%E3%81%BE%E3%81%97%E3%81%9F%EF%BC%81/)
+- [第4回世界将棋AI電竜戦本戦 優勝記](https://yaneuraou.yaneu.com/2023/12/10/won-the-4th-shogi-ai-denryu-tournament/)
 
-[やねうら王公式 ](http://yaneuraou.yaneu.com/)
 
-# お知らせ
+# やねうら王プロジェクトを支援する
 
-- SDT5(第5回 将棋電王トーナメント)のため、10月1日～11月12日はプルリクエストが処理できません。
-- SDT5直前は大改造をすることがあるので、動作等が安定していない可能性が高いです。(現状、V4.76が安定)
+[![やねうら王プロジェクトを支援する](docs/yaneuraou-sponsors-banner.png "支援バナー")](https://github.com/sponsors/yaneurao)
+
+- GitHub Sponsors : https://github.com/sponsors/yaneurao
+- FANBOX : https://yaneurao.fanbox.cc/
+
+やねうら王プロジェクトに支援すると、開発版のやねうら王(Windows/macOS)、評価関数ファイル、最新定跡ファイルなどのダウンロードURLが書かれたニュースレターが受け取れます。
+
+
+# やねうら王エンジンの大会での戦績
+
+- 2025年 文部科学大臣杯第6回世界将棋AI電竜戦本戦 『水匠Concerto』準優勝。(探索部やねうら王V9.10改。やねうらおはチームメンバーとして参加)
+- 2025年 第35回 世界コンピュータ将棋選手権(WCSC35)『水匠』優勝。(探索部やねうら王V8.60改)
+- 2025年 第3回世界将棋AI電竜戦ハードウェア統一戦 『水匠』優勝。(探索部やねうら王V8.60改)
+- 2024年 第34回 世界コンピュータ将棋選手権(WCSC34)『お前、CSA会員にならねーか？』優勝。(探索部やねうら王V8.20 GitHub版)
+- 2024年 第2回 マイナビニュース杯電竜戦ハードウェア統一戦 『水匠』準優勝 (探索部やねうら王V8.10開発版)
+- 2023年 第4回世界将棋AI電竜戦本戦 『水匠』優勝 (探索部やねうら王。やねうらおは、チームメンバーとして参加)
+- 2023年 第1回 マイナビニュース杯電竜戦ハードウェア統一戦 『水匠』優勝。(探索部やねうら王)
+- 2023年 第33回 世界コンピュータ将棋選手権(WCSC33)『やねうら王』準優勝。
+- 2023年 第4回世界将棋AI電竜戦TSEC4 ファイナル『やねうら王』相居飛車部門優勝。総合2位。
+- 2022年 第3回世界将棋AI電竜戦本戦 『水匠』優勝。(探索部やねうら王)
+- 2021年 第2回世界将棋AI電竜戦TSEC 『水匠』総合優勝。(探索部やねうら王)
+- 2020年 第1回 世界コンピュータ将棋オンライン大会(WCSO1) 『水匠』優勝。(探索部やねうら王)
+- 2019年 世界コンピュータ将棋選手権(WCSC29) 『やねうら王 with お多福ラボ2019』優勝。
+  - 決勝の上位8チームすべてがやねうら王の思考エンジンを採用。
+- 2018年 世界コンピュータ将棋選手権(WCSC28) 『Hefeweizen』優勝
+- 2017年 世界コンピュータ将棋選手権(WCSC27) 『elmo』優勝
+- 2017年 第5回将棋電王トーナメント(SDT5) 『平成将棋合戦ぽんぽこ』優勝
+
+# やねうら王の特徴
+
+- USIプロトコルに準拠した思考エンジンです。
+- 入玉宣言勝ち、トライルール等にも対応しています。
+- Ponder(相手番で思考する)、StochasticPonder(確率的ponder)に対応しています。
+- MultiPV(複数の候補手を出力する)に対応しています。
+- 秒読み、フィッシャールールなど様々な持時間に対応しています。
+- 256スレッドのような超並列探索に対応しています。
+- 定跡DBにやねうら王標準定跡フォーマットを採用しています。
+- 定跡DBのon the fly(メモリに丸読みしない)に対応しています。
+- 定跡DBの様々なメンテナンス用コマンドをサポートしています。
+- 置換表の上限サイズは33TB(実質的に無限)まで対応しています。
+- Windows、Ubuntu、macOS、ARMなど様々なプラットフォームをサポートしています。
+- 評価関数として、KPPT、KPP_KKPT、NNUE(各種)に対応しています。
+
+# ふかうら王の特徴
+
+- dlshogi互換エンジンです。
+- やねうら王の思考エンジンオプションをサポートしています。
+- 定跡DBにやねうら王標準定跡フォーマットを採用しています。
+- 定跡DBのon the fly(メモリに丸読みしない)に対応しています。
+- GPU無しでも動作するDirectML版、TensorRT版を用意しています。
+
+# やねうら王の解説記事
+
+|記事内容|リンク|レベル|
+|-|-|-|
+|やねうら王のインストール手順について | [やねうら王のインストール手順](https://github.com/yaneurao/YaneuraOu/wiki/やねうら王のインストール手順)|入門|
+|ふかうら王のインストール手順について | [ふかうら王のインストール手順](https://github.com/yaneurao/YaneuraOu/wiki/ふかうら王のインストール手順)|中級|
+|やねうら王のお勧めエンジン設定について | [やねうら王のお勧めエンジン設定](https://github.com/yaneurao/YaneuraOu/wiki/やねうら王のお勧めエンジン設定)|入門|
+|ふかうら王のお勧めエンジン設定について | [ふかうら王のお勧めエンジン設定](https://github.com/yaneurao/YaneuraOu/wiki/ふかうら王のお勧めエンジン設定)|入門|
+|やねうら王/ふかうら王のエンジンオプションについて | [思考エンジンオプション](https://github.com/yaneurao/YaneuraOu/wiki/思考エンジンオプション)|入門~中級|
+|やねうら王詰将棋エンジンについて| [やねうら王詰将棋エンジン](https://github.com/yaneurao/YaneuraOu/wiki/やねうら王詰将棋エンジン)|入門~中級|
+|やねうら王のよくある質問|[よくある質問](https://github.com/yaneurao/YaneuraOu/wiki/よくある質問)|初級~中級|
+|やねうら王のソースコードのルールについて|[CONTRIBUTING.md](CONTRIBUTING.md)|開発者向け|
+|やねうら王の隠し機能 | [隠し機能](https://github.com/yaneurao/YaneuraOu/wiki/隠し機能)|中級~上級|
+|やねうら王の定跡を作る | [定跡の作成](https://github.com/yaneurao/YaneuraOu/wiki/定跡の作成)|中級~上級|
+|やねうら王のUSI拡張コマンドについて | [USI拡張コマンド](https://github.com/yaneurao/YaneuraOu/wiki/USI拡張コマンド)|開発者向け|
+|やねうら王のビルド手順について | [やねうら王のビルド手順](https://github.com/yaneurao/YaneuraOu/wiki/やねうら王のビルド手順)|開発者向け|
+|ふかうら王のビルド手順について | [ふかうら王のビルド手順](https://github.com/yaneurao/YaneuraOu/wiki/ふかうら王のビルド手順)|開発者向け|
+|やねうら王のソースコード解説 |[やねうら王のソースコード解説](https://github.com/yaneurao/YaneuraOu/wiki/やねうら王のソースコード解説)|開発者向け|
+|AWSでやねうら王を動かす| [AWSでやねうら王](https://github.com/yaneurao/YaneuraOu/wiki/AWSでやねうら王)|中級~開発者|
+|大会に参加する時の設定|[大会に参加する時の設定](https://github.com/yaneurao/YaneuraOu/wiki/大会に参加する時の設定)|開発者|
+|やねうら王の学習コマンド|[やねうら王の学習コマンド](https://github.com/yaneurao/YaneuraOu/wiki/やねうら王の学習コマンド)|開発者|
+|ふかうら王の学習手順|[ふかうら王の学習手順](https://github.com/yaneurao/YaneuraOu/wiki/ふかうら王の学習手順)|開発者|
+|USI対応エンジンの自己対局|[USI対応エンジンの自己対局](https://github.com/yaneurao/YaneuraOu/wiki/USI対応エンジンの自己対局)|中級～開発者|
+|パラメーター自動調整フレームワーク|[パラメーター自動調整フレームワーク](https://github.com/yaneurao/YaneuraOu/wiki/パラメーター自動調整フレームワーク)|開発者|
+|探索部の計測資料|[探索部の計測資料](探索部の計測資料)|開発者|
+|廃止したコマンド・オプションなど| [過去の資料](https://github.com/yaneurao/YaneuraOu/wiki/過去の資料)|開発者|
+|やねうら王の更新履歴|[やねうら王の更新履歴](https://github.com/yaneurao/YaneuraOu/wiki/やねうら王の更新履歴)|開発者|
+
 
 # 現在進行中のサブプロジェクト
 
-## やねうら王2017 Early
-
-2017年5月5日完成。この思考エンジンを用いたelmoがWCSC27で優勝しました。elmo(WCSC27)や蒼天幻想ナイツ・オブ・タヌキ(WCSC27出場)の評価関数を用いるとXeon 24コアでR4000程度の模様。
-
-- 思考エンジン本体のダウンロードは[こちら](https://github.com/yaneurao/YaneuraOu/releases/)
-
-## やねうら王2017 GOKU : SDT5に『極やねうら王』として出場。
-
-2017年11月の第5回将棋電王トーナメントに参加してきました。(探索部の強さ、前バージョンからあまり変わらず)　Apery(SDT5)などの評価関数を用いるとXeon 24コアでR4200程度の模様。
-
-
-## やねうら王2018 OTAFUKU (やねうら王2018 with お多福ラボ)
-
-今年は一年、これでいきます。
-
-
-## やねうら王詰め将棋solver
-
-《tanuki-さんが開発中》
-
-長手数の詰将棋が解けるsolverです。
-
+|プロジェクト名|進捗|
+|-|-|
+| やねうら王 | 現在進行形で改良しています。|
+| ふかうら王 | 現在進行形で改良しています。|
+| やねうら王詰将棋エンジンV2 | 省メモリで長手数の詰将棋が解ける詰将棋用のエンジン。|
+| やねうら王Script-Collection | やねうら王関連のスクリプト集です。|
 
 # 過去のサブプロジェクト
 
 過去のサブプロジェクトである、やねうら王nano , mini , classic、王手将棋、取る一手将棋、協力詰めsolver、連続自己対戦フレームワークなどはこちらからどうぞ。
 
-- [過去のサブプロジェクト](/docs/README2017.md)
+- [過去のサブプロジェクト](https://github.com/yaneurao/YaneuraOu/wiki/%E9%81%8E%E5%8E%BB%E3%81%AE%E3%82%B5%E3%83%96%E3%83%97%E3%83%AD%E3%82%B8%E3%82%A7%E3%82%AF%E3%83%88)
 
-## やねうら王評価関数ファイル
+# やねうら王ニュース記事一覧
 
-- やねうら王2017Early用 - Apery(WCSC26)、Apery(SDT4)＝「浮かむ瀬」の評価関数バイナリがそのまま使えます。
-- やねうら王2017 KPP_KKPT型評価関数 - 以下のKPP_KKPT型ビルド用評価関数のところにあるものが使えます。
-- やねうら王2018 Otafuku用 KPPT型　→ やねうら王2017Early(KPPT)と同様
-- やねうら王2018 Otafuku用 KPP_KKPT型　→ やねうら王2017Early(KPP_KKPT)と同様
+やねうら王公式ブログの関連記事の見出し一覧です。
 
-### 「Re : ゼロから始める評価関数生活」プロジェクト(略して「リゼロ」)
+各エンジンオプションの解説、定跡ファイルのダウンロード、定跡の生成手法などについての詳しい資料があります。初心者から開発者まで、知りたいことが全部詰まっています。
 
-ゼロベクトルの評価関数(≒駒得のみの評価関数)から、「elmo絞り」(elmo(WCSC27)の手法)を用いて強化学習しました。従来のソフトにはない、不思議な囲いと終盤力が特徴です。
-やねうら王2017Earlyの評価関数ファイルと差し替えて使うことが出来ます。フォルダ名に書いてあるepochの数字が大きいものほど新しい世代(強い)です。
+- [やねうら王ニュース記事一覧](https://github.com/yaneurao/YaneuraOu/wiki/%E3%82%84%E3%81%AD%E3%81%86%E3%82%89%E7%8E%8B%E3%83%8B%E3%83%A5%E3%83%BC%E3%82%B9)
 
-- [リゼロ評価関数 epoch 0](https://drive.google.com/open?id=0Bzbi5rbfN85Nb3o1Zkd6cjVNYkE) : 全パラメーターがゼロの初期状態の評価関数です。
-- [リゼロ評価関数 epoch 0.1](https://drive.google.com/open?id=0Bzbi5rbfN85NNTBERmhiMGZlSWs) : [解説記事](http://yaneuraou.yaneu.com/2017/06/20/%E5%BE%93%E6%9D%A5%E6%89%8B%E6%B3%95%E3%81%AB%E5%9F%BA%E3%81%A5%E3%81%8F%E3%83%97%E3%83%AD%E3%81%AE%E6%A3%8B%E8%AD%9C%E3%82%92%E7%94%A8%E3%81%84%E3%81%AA%E3%81%84%E8%A9%95%E4%BE%A1%E9%96%A2%E6%95%B0/)
-- [リゼロ評価関数 epoch 1から4まで](https://drive.google.com/open?id=0Bzbi5rbfN85NNWY0RTJlc2x5czg) : [解説記事](http://yaneuraou.yaneu.com/2017/06/12/%E4%BA%BA%E9%96%93%E3%81%AE%E6%A3%8B%E8%AD%9C%E3%82%92%E7%94%A8%E3%81%84%E3%81%9A%E3%81%AB%E8%A9%95%E4%BE%A1%E9%96%A2%E6%95%B0%E3%81%AE%E5%AD%A6%E7%BF%92%E3%81%AB%E6%88%90%E5%8A%9F/)
-- [リゼロ評価関数 epoch 5から6まで](https://drive.google.com/open?id=0Bzbi5rbfN85NSS0wWkEwSERZVzQ) : [解説記事](http://yaneuraou.yaneu.com/2017/06/13/%E7%B6%9A-%E4%BA%BA%E9%96%93%E3%81%AE%E6%A3%8B%E8%AD%9C%E3%82%92%E7%94%A8%E3%81%84%E3%81%9A%E3%81%AB%E8%A9%95%E4%BE%A1%E9%96%A2%E6%95%B0%E3%81%AE%E5%AD%A6%E7%BF%92/)
-- [リゼロ評価関数 epoch 7](https://drive.google.com/open?id=0Bzbi5rbfN85NWWloTFdMRjI5LWs) : [解説記事](http://yaneuraou.yaneu.com/2017/06/15/%E7%B6%9A2-%E4%BA%BA%E9%96%93%E3%81%AE%E6%A3%8B%E8%AD%9C%E3%82%92%E7%94%A8%E3%81%84%E3%81%9A%E3%81%AB%E8%A9%95%E4%BE%A1%E9%96%A2%E6%95%B0%E3%81%AE%E5%AD%A6%E7%BF%92/)
-- [リゼロ評価関数 epoch 8](https://drive.google.com/open?id=0Bzbi5rbfN85NMHd0OEUxcUVJQW8) : [解説記事](http://yaneuraou.yaneu.com/2017/06/21/%E3%83%AA%E3%82%BC%E3%83%AD%E8%A9%95%E4%BE%A1%E9%96%A2%E6%95%B0epoch8%E5%85%AC%E9%96%8B%E3%81%97%E3%81%BE%E3%81%97%E3%81%9F%E3%80%82/)
-
-### やねうら王 KPP_KKPT型ビルド用評価関数
-
-やねうら王2017 KPP_KKPT型ビルドで使える評価関数です。
-
-- [リゼロ評価関数 KPP_KKPT型 epoch4](https://drive.google.com/open?id=0Bzbi5rbfN85NSk1qQ042U0RnUEU) : [解説記事](http://yaneuraou.yaneu.com/2017/09/02/%E3%82%84%E3%81%AD%E3%81%86%E3%82%89%E7%8E%8B%E3%80%81kpp_kkpt%E5%9E%8B%E8%A9%95%E4%BE%A1%E9%96%A2%E6%95%B0%E3%81%AB%E5%AF%BE%E5%BF%9C%E3%81%97%E3%81%BE%E3%81%97%E3%81%9F/)
-
-### Shivoray(シボレー) 全自動雑巾絞り機
-
-自分で自分好みの評価関数を作って遊んでみたいという人のために『Shivoray』(シボレー)という全自動雑巾絞り機を公開しました。
-
-- [ShivorayV4.71](https://drive.google.com/open?id=0Bzbi5rbfN85Nb292azZxRmU0R1U) : [解説記事](http://yaneuraou.yaneu.com/2017/06/26/%E3%80%8Eshivoray%E3%80%8F%E5%85%A8%E8%87%AA%E5%8B%95%E9%9B%91%E5%B7%BE%E7%B5%9E%E3%82%8A%E6%A9%9F%E5%85%AC%E9%96%8B%E3%81%97%E3%81%BE%E3%81%97%E3%81%9F/)
-
-## 定跡集
-
-やねうら王2017Earlyで使える、各種定跡集。
-ダウンロードしたあと、zipファイルになっているのでそれを解凍して、やねうら王の実行ファイルを配置しているフォルダ配下のbookフォルダに放り込んでください。
-
-- コンセプトおよび定跡フォーマットについて : [やねうら大定跡はじめました](http://yaneuraou.yaneu.com/2016/07/10/%E3%82%84%E3%81%AD%E3%81%86%E3%82%89%E5%A4%A7%E5%AE%9A%E8%B7%A1%E3%81%AF%E3%81%98%E3%82%81%E3%81%BE%E3%81%97%E3%81%9F/)
-- 定跡ファイルのダウンロードは[こちら](https://github.com/yaneurao/YaneuraOu/releases/tag/v4.73_book)
-
-## 世界コンピュータ将棋選手権および2017年に開催される第5回将棋電王トーナメントに参加される開発者の方へ
-
-やねうら王をライブラリとして用いて参加される場合、このやねうら王のGitHub上にあるすべてのファイルおよび、このトップページから直リンしているファイルすべてが使えます。
-
-## ライセンス
+# ライセンス
 
 やねうら王プロジェクトのソースコードはStockfishをそのまま用いている部分が多々あり、Apery/SilentMajorityを参考にしている部分もありますので、やねうら王プロジェクトは、それらのプロジェクトのライセンス(GPLv3)に従うものとします。
 
 「リゼロ評価関数ファイル」については、やねうら王プロジェクトのオリジナルですが、一切の権利は主張しませんのでご自由にお使いください。
+
+# やねうら王プロジェクト関連リンク
+
+やねうら王関連の最新情報がキャッチできる主要なサイトです。
+
+|サイト | リンク|
+|-----|-----|
+|やねうら王公式ブログ | https://yaneuraou.yaneu.com |
+|やねうら王mini 公式 (解説記事等)| http://yaneuraou.yaneu.com/YaneuraOu_Mini |
+|やねうら王 X | https://x.com/yaneuraou|
+|やねうら王公式ちゃんねる(YouTube) | https://www.youtube.com/c/yanechan|
+|やねうら王公式GitHub | https://github.com/yaneurao/YaneuraOu |
+|やねうら王スクリプト集 | https://github.com/yaneurao/YaneuraOu-ScriptCollection |
+
+上記のやねうら王公式ブログでは、コンピュータ将棋に関する情報を大量に発信していますので、やねうら王に興味がなくとも、コンピュータ将棋の開発をしたいなら、非常に参考になると思います。
+
+# 質問箱
+
+やねうら王関連の質問は、以下のブログ記事のコメント欄にお願いします。
+https://yaneuraou.yaneu.com/2022/05/19/yaneuraou-question-box/
+

@@ -1,8 +1,13 @@
 ﻿#include "evaluate_io.h"
 #include "../misc.h"
+#include "../usi.h"
 
-namespace EvalIO
-{
+#include <fstream>
+#include <cstring>	// memset()
+
+namespace YaneuraOu {
+namespace EvalIO {
+
 	bool eval_convert(const EvalInfo& input, const EvalInfo& output, const std::vector<u16>* map)
 	{
 		// 特徴因子の型の数が異なるとそもそも変換できない。
@@ -69,15 +74,15 @@ namespace EvalIO
 				// file to memory
 				else if (in_.file_or_memory.file() && out_.file_or_memory.memory())
 				{
-					if (read_file_to_memory(in_.file_or_memory.filename, [&](u64 size) {
-						if (size != input_block_size)
+					if (SystemIO::ReadFileToMemory(in_.file_or_memory.filename, [&](size_t size) {
+						if ((u64)size != input_block_size)
 						{
 							std::cout << "info string Error! : file size incorrect , file = " << in_.file_or_memory.filename
 								<< " , actual size = "<< size << " , needed_size = " << input_block_size << std::endl;
 							return (void*)nullptr;
 						}
 						return out_.file_or_memory.ptr;
-					}) != 0)
+					}).is_not_ok() )
 					{
 #if defined(EVAL_LEARN)
 						if (Options["SkipLoadingEval"])
@@ -96,7 +101,7 @@ namespace EvalIO
 				// memory to file
 				else if (in_.file_or_memory.memory() && out_.file_or_memory.file())
 				{
-					if (write_memory_to_file(out_.file_or_memory.filename, in_.file_or_memory.ptr, output_block_size) != 0)
+					if (SystemIO::WriteMemoryToFile(out_.file_or_memory.filename, in_.file_or_memory.ptr, output_block_size).is_not_ok())
 					{
 						std::cout << "info string write file error , file = " << out_.file_or_memory.filename << std::endl;
 						return false;
@@ -107,14 +112,14 @@ namespace EvalIO
 				{
 					std::vector<u8> buffer(input_block_size);
 					std::ifstream ifs(in_.file_or_memory.filename, std::ios::binary);
-					if (ifs) ifs.read(reinterpret_cast<char*>(&buffer[0]), input_block_size);
+					if (ifs) ifs.read(reinterpret_cast<char*>(buffer.data()), input_block_size);
 					else
 					{
 						std::cout << "info string read file error , file = " << in_.file_or_memory.filename << std::endl;
 						return false;
 					};
 					std::ofstream ofs(out_.file_or_memory.filename, std::ios::binary);
-					if (ofs) ofs.write(reinterpret_cast<char*>(&buffer[0]), output_block_size);
+					if (ofs) ofs.write(reinterpret_cast<char*>(buffer.data()), output_block_size);
 					else
 					{
 						std::cout << "info string write file error , file = " << out_.file_or_memory.filename << std::endl;
@@ -145,14 +150,14 @@ namespace EvalIO
 					input_buffer.resize(input_block_size);
 					in_ptr = (void*)&input_buffer[0];
 
-					if (read_file_to_memory(in_.file_or_memory.filename, [&](u64 file_size) {
-						if (file_size != input_block_size)
+					if (SystemIO::ReadFileToMemory(in_.file_or_memory.filename, [&](size_t file_size) {
+						if ((u64)file_size != input_block_size)
 						{
 							std::cout << "info string Error! file_size = " << file_size << " , input_block_size = " << input_block_size << std::endl;
 							return (void*)nullptr;
 						}
 						return in_ptr;
-					}) != 0)
+					}).is_not_ok())
 						return false;
 				}
 
@@ -324,7 +329,7 @@ namespace EvalIO
 
 				if (out_.file_or_memory.ptr == nullptr)
 				{
-					if (write_memory_to_file(out_.file_or_memory.filename , out_ptr , output_block_size) != 0)
+					if (SystemIO::WriteMemoryToFile(out_.file_or_memory.filename , out_ptr , output_block_size).is_not_ok())
 					{
 						std::cout << "info string write file error , file = " << out_.file_or_memory.filename << std::endl;
 						return false;
@@ -335,4 +340,6 @@ namespace EvalIO
 
 		return true;
 	}
-}
+
+} // namespace EvalIO
+} // namespace YaneuraOu
