@@ -69,6 +69,16 @@ namespace Eval::NNUE {
   // 評価値の計算で利用する定数
   extern int FV_SCALE; // default 16。水匠5では24がベストらしいのでエンジンオプション"FV_SCALE"で変更可能にした。
 
+  // FMScale
+  extern int FMScale1;
+  extern int FMScale2;
+  extern int FMScale3;
+  extern int FMScale4;
+  extern int FMScale5;
+  extern int FMScale6;
+  extern int FMScale7;
+  extern int FMScale8;
+
   constexpr int kWeightScaleBits = 6;
 
   // Size of cache line (in bytes)

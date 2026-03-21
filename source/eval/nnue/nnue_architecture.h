@@ -50,7 +50,10 @@
 #elif defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536)
 
 // SFNN without Psqt 1536型
-#include "architectures/sfnnwop-1536.h"
+//#include "architectures/sfnnwop-1536.h"
+
+// HalfKA-KSDG3 FM 1280型
+#include "architectures/halfka-ksdg3_fm-1280.h"
 
 #elif defined(EVAL_NNUE_HALFKP_VM_256X2_32_32)
 

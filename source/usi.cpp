@@ -428,8 +428,21 @@ bool USIEngine::usi_cmdexec(const std::string& cmd) {
     // ログファイルの書き出しのon
     // 🤔 Stockfishの方は、エンジンオプションでログの出力ファイル名を指定できるのだが、
     //     ログ自体はホスト側で記録することが多いので、ファイル名は固定でいいや…。
-    else if (token == "log")
-        start_logger("io_log.txt");
+    else if (token == "log") {
+        //start_logger("io_log.txt");
+
+		// 1. 現在時刻の取得
+		auto now = std::chrono::system_clock::now();
+		std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+		std::tm now_tm = *std::localtime(&now_c);
+
+		// 2. フォーマットした文字列の作成
+		std::stringstream ss;
+		ss << "io_log_" << std::put_time(&now_tm, "%Y%m%d_%H%M%S") << ".txt";
+
+		// 3. ロガー開始
+		start_logger(ss.str());
+    }
 
 #if defined(ENABLE_TEST_CMD)
     // テストコマンド

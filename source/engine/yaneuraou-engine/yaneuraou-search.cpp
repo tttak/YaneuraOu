@@ -376,6 +376,8 @@ void YaneuraOuEngine::trace_eval() const {
 
     //sync_cout << "\n" << Eval::trace(p, *networks) << sync_endl;
 	// TODO あとで
+
+    sync_cout << "eval=" << evaluate() << sync_endl;
 }
 
 // 現在の局面の評価値を出力する。

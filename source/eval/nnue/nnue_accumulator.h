@@ -18,6 +18,18 @@ namespace Eval::NNUE {
 struct alignas(64) Accumulator {
   std::int16_t
       accumulation[2][kRefreshTriggers.size()][kTransformedFeatureDimensions];
+
+  // 因子計算用 (FM項)
+  struct FactorGroup {
+      std::int64_t sum_v[32];   // Σv
+      std::int64_t sum_v2[32];  // Σv^2
+  };
+
+  struct FactorPart {
+      FactorGroup halfka;   // HalfKA (12672 ～ 203670)
+      FactorGroup ksdg;     // KSDG3 (0 ～ 12671)
+  } factors[2];             // [手番]
+
   Value score = VALUE_ZERO;
   bool computed_accumulation = false;
   bool computed_score = false;

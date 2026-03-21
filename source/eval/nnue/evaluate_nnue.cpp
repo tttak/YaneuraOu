@@ -25,6 +25,16 @@
 
 namespace YaneuraOu::Eval::NNUE {
 extern int FV_SCALE;
+
+extern int FMScale1;
+extern int FMScale2;
+extern int FMScale3;
+extern int FMScale4;
+extern int FMScale5;
+extern int FMScale6;
+extern int FMScale7;
+extern int FMScale8;
+
 }
  
 // ============================================================
@@ -91,6 +101,41 @@ void add_options_(OptionsMap& options, ThreadPool& threads) {
                     YaneuraOu::Eval::NNUE::FV_SCALE = int(o);
                     return std::nullopt;
                 }));
+
+    // NNUEのFMScaleの値
+    Options.add("FMScale1", Option(25909, 0, 1000000000, [&](const Option& o) {
+                    YaneuraOu::Eval::NNUE::FMScale1 = int(o);
+                    return std::nullopt;
+                }));
+    Options.add("FMScale2", Option(49861, 0, 1000000000, [&](const Option& o) {
+                    YaneuraOu::Eval::NNUE::FMScale2 = int(o);
+                    return std::nullopt;
+                }));
+    Options.add("FMScale3", Option(12861, 0, 1000000000, [&](const Option& o) {
+                    YaneuraOu::Eval::NNUE::FMScale3 = int(o);
+                    return std::nullopt;
+                }));
+    Options.add("FMScale4", Option(11909, 0, 1000000000, [&](const Option& o) {
+                    YaneuraOu::Eval::NNUE::FMScale4 = int(o);
+                    return std::nullopt;
+                }));
+    Options.add("FMScale5", Option(7021, 0, 1000000000, [&](const Option& o) {
+                    YaneuraOu::Eval::NNUE::FMScale5 = int(o);
+                    return std::nullopt;
+                }));
+    Options.add("FMScale6", Option(20723, 0, 1000000000, [&](const Option& o) {
+                    YaneuraOu::Eval::NNUE::FMScale6 = int(o);
+                    return std::nullopt;
+                }));
+    Options.add("FMScale7", Option(2640, 0, 1000000000, [&](const Option& o) {
+                    YaneuraOu::Eval::NNUE::FMScale7 = int(o);
+                    return std::nullopt;
+                }));
+    Options.add("FMScale8", Option(3135, 0, 1000000000, [&](const Option& o) {
+                    YaneuraOu::Eval::NNUE::FMScale8 = int(o);
+                    return std::nullopt;
+                }));
+
 }
 #endif
 
@@ -156,6 +201,15 @@ namespace Eval {
 namespace NNUE {
 
 	int FV_SCALE = 16; // 水匠5では24がベストらしいのでエンジンオプション"FV_SCALE"で変更可能にした。
+
+	int FMScale1 = 25909;
+	int FMScale2 = 49861;
+	int FMScale3 = 12861;
+	int FMScale4 = 11909;
+	int FMScale5 = 7021;
+	int FMScale6 = 20723;
+	int FMScale7 = 2640;
+	int FMScale8 = 3135;
 
     // 入力特徴量変換器
 	LargePagePtr<FeatureTransformer> feature_transformer;
@@ -346,6 +400,7 @@ namespace {
 #if defined(SFNNwoPSQT)
     // レイヤースタックの選択。双方の玉の段に応じて9通りに分岐させる。
     static int stack_index_for_nnue(const Position& pos) {
+/*
         constexpr int kFToIndex[] = { 0, 0, 0, 3, 3, 3, 6, 6, 6 };
         constexpr int kEToIndex[] = { 0, 0, 0, 1, 1, 1, 2, 2, 2 };
         const auto stm = pos.side_to_move();
@@ -357,6 +412,10 @@ namespace {
         if (idx < 0) idx = 0;
         if (idx >= kLayerStacks) idx = kLayerStacks - 1;
         return idx;
+*/
+        // 駒割りの差の絶対値から算出する
+        constexpr int index[24] = {0, 1, 2, 3, 4, 5, 5, 6, 6, 7, 7, 8, 8, 8, 9, 9, 9, 9, 10, 10, 10, 10, 10, 11};
+        return index[std::min((std::abs(pos.state()->materialValue) + 99) / 100, 23)];
     }
 #endif
 
@@ -367,16 +426,23 @@ namespace {
             return accumulator.score;
         }
 
+        // L1パス用 (1280次元)
         alignas(kCacheLineSize) TransformedFeatureType
             transformed_features[FeatureTransformer::kBufferSize];
-        feature_transformer->Transform(pos, transformed_features, refresh);
+
+        // Diffパス用 (128次元)
+        alignas(kCacheLineSize) TransformedFeatureType diff_transformed[128];
+
+        // Absパス用 (128次元)
+        alignas(kCacheLineSize) TransformedFeatureType abs_transformed[128];
+
+        const auto bucket_id = stack_index_for_nnue(pos);
+
+        feature_transformer->Transform(pos, transformed_features, diff_transformed, abs_transformed, refresh, bucket_id);
+
         alignas(kCacheLineSize) char buffer[Network::kBufferSize];
-#if defined(SFNNwoPSQT)
-        const auto bucket = stack_index_for_nnue(pos);
-        const auto output = network[bucket]->Propagate(transformed_features, buffer);
-#else
-        const auto output = network->Propagate(transformed_features, buffer);
-#endif
+        const auto output = network[bucket_id]->Propagate(transformed_features, diff_transformed, abs_transformed, bucket_id, buffer);
+
 
         // VALUE_MAX_EVALより大きな値が返ってくるとaspiration searchがfail highして
         // 探索が終わらなくなるのでVALUE_MAX_EVAL以下であることを保証すべき。

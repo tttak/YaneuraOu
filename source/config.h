@@ -763,6 +763,12 @@ constexpr bool pretty_jp = false;
 //     evaluate function
 // ----------------------------
 
+// HalfKA-KSDG3 FM 1280型
+#define LONG_EFFECT_LIBRARY
+#define USE_BOARD_EFFECT_PREV
+#define DISTINGUISH_GOLDS
+
+
 // -- 評価関数の種類によりエンジン名に使用する文字列を変更する。
 #if defined(EVAL_MATERIAL)
 	#if defined(MATERIAL_LEVEL)
