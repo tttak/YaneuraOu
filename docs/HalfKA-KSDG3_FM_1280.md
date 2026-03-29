@@ -1,6 +1,9 @@
 # HalfKA-KSDG3_FM_1280
 
 - 「HalfKA-KSDG3_FM_1280」はやねうら王の「SFNNwoPSQT-1536 NNUE アーキテクチャ」を元にして、FM（Factorization Machines）的な考え方を取り入れたものです。
+  - C++側（やねうら王）：https://github.com/tttak/YaneuraOu/tree/HalfKA-KSDG3_FM_1280
+  - python側（nnue-pytorch）：https://github.com/tttak/nnue-pytorch/tree/HalfKA-KSDG3_FM_1280
+
 - FM的な考え方を取り入れるアイデアやプログラム作成（python側、C++側の両方）等について、多くの部分をGemini等（Gemini、Copilot、ChatGPT）にお手伝い頂きました。
 - C++側はとりあえずは処理速度はあまり考慮していません。たぶん高速化の余地は色々とあると思います。
 - 棋力的には特に強くなっていません。NPSは水匠11αの約3分の1で、ノード数固定で対局すると水匠11αと同程度、同じ持ち時間で対局すると水匠11αへの勝率20%くらいで大幅に負け越します。
