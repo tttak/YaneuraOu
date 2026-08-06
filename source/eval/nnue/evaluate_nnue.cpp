@@ -430,6 +430,39 @@ namespace {
     }
 #endif
 
+    // Router による動的バケット選択を行うヘルパー関数
+    inline int SelectBucketWithRouter(
+        const TransformedFeatureType* transformed_features,
+        const TransformedFeatureType* diff_transformed,
+        const TransformedFeatureType* abs_transformed)
+    {
+        alignas(kCacheLineSize) std::uint8_t router_input[384];
+        alignas(kCacheLineSize) std::int32_t router_out[32]; // SIMD制約のため32確保
+
+        // 1. Router 用の入力特徴量 (384次元) を構築
+        for (int j = 0; j < 128; ++j) {
+            int32_t abs_val = static_cast<int32_t>(abs_transformed[j]);
+            router_input[j]       = static_cast<std::uint8_t>(std::clamp((abs_val - 64) * 2, 0, 127));
+            router_input[j + 128] = static_cast<std::uint8_t>(diff_transformed[j]);
+            router_input[j + 256] = static_cast<std::uint8_t>(transformed_features[j]);
+        }
+
+        // 2. Router 推論実行
+        router->Propagate(router_input, router_out);
+
+        // 3. 出力の中から最大値を持つバケットを選択 (Argmax)
+        int chosen_bucket = 0;
+        std::int32_t max_score = router_out[0];
+        for (int b = 1; b < kLayerStacks; ++b) {
+            if (router_out[b] > max_score) {
+                max_score = router_out[b];
+                chosen_bucket = b;
+            }
+        }
+
+        return chosen_bucket;
+    }
+
     // 評価値を計算する
     static Value ComputeScore(const Position& pos, bool refresh = false) {
         auto& accumulator = pos.state()->accumulator;
@@ -451,37 +484,8 @@ namespace {
 
         feature_transformer->Transform(pos, transformed_features, diff_transformed, abs_transformed, refresh, bucket_id);
 
-
-        // --- [追加] Router による動的バケット選択 (MoE Router) START ---
-        alignas(kCacheLineSize) std::uint8_t router_input[384];
-        alignas(kCacheLineSize) std::int32_t router_out[32]; // SIMD制約のため32確保
-
-        // 1. Router 用の入力特徴量 (384次元) を構築
-        for (int j = 0; j < 128; ++j) {
-            int32_t abs_val = static_cast<int32_t>(abs_transformed[j]);
-            router_input[j]       = static_cast<std::uint8_t>(std::clamp((abs_val - 64) * 2, 0, 127));
-            router_input[j + 128] = static_cast<std::uint8_t>(diff_transformed[j]);
-            router_input[j + 256] = static_cast<std::uint8_t>(transformed_features[j]);
-        }
-
-        // 2. Router 推論実行
-        router->Propagate(router_input, router_out);
-
-        // 3. 12個の出力 (0〜11) の中から最大値を持つバケットを選択 (Argmax)
-        int chosen_bucket = 0;
-        std::int32_t max_score = router_out[0];
-        for (int b = 1; b < kLayerStacks; ++b) {
-            if (router_out[b] > max_score) {
-                max_score = router_out[b];
-                chosen_bucket = b;
-            }
-        }
-
-        // 既存の bucket_id を Router の判定結果で上書き
-        bucket_id = chosen_bucket;
-
-        // --- [追加] Router による動的バケット選択 (MoE Router) END ---
-
+        // Router による動的バケット選択
+        bucket_id = SelectBucketWithRouter(transformed_features, diff_transformed, abs_transformed);
 
         alignas(kCacheLineSize) char buffer[Network::kBufferSize];
         const auto output = network[bucket_id]->Propagate(transformed_features, diff_transformed, abs_transformed, bucket_id, buffer);
