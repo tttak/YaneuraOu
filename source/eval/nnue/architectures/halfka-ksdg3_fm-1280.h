@@ -33,6 +33,9 @@ constexpr IndexType kHidden1Dims = 31;
 constexpr IndexType L2_INPUT_SIZE = 192;
 constexpr IndexType kHidden2Dims = 96;
 
+// --- [追加] Router 層の型定義 ---
+using Router = Layers::AffineTransformExplicit<384, 32>;
+
 struct Network {
 
 	// Define network structure

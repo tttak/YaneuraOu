@@ -103,35 +103,35 @@ void add_options_(OptionsMap& options, ThreadPool& threads) {
                 }));
 
     // NNUEのFMScaleの値
-    Options.add("FMScale1", Option(25909, 0, 1000000000, [&](const Option& o) {
+    Options.add("FMScale1", Option(42273, 0, 1000000000, [&](const Option& o) {
                     YaneuraOu::Eval::NNUE::FMScale1 = int(o);
                     return std::nullopt;
                 }));
-    Options.add("FMScale2", Option(49861, 0, 1000000000, [&](const Option& o) {
+    Options.add("FMScale2", Option(42273, 0, 1000000000, [&](const Option& o) {
                     YaneuraOu::Eval::NNUE::FMScale2 = int(o);
                     return std::nullopt;
                 }));
-    Options.add("FMScale3", Option(12861, 0, 1000000000, [&](const Option& o) {
+    Options.add("FMScale3", Option(13107, 0, 1000000000, [&](const Option& o) {
                     YaneuraOu::Eval::NNUE::FMScale3 = int(o);
                     return std::nullopt;
                 }));
-    Options.add("FMScale4", Option(11909, 0, 1000000000, [&](const Option& o) {
+    Options.add("FMScale4", Option(13107, 0, 1000000000, [&](const Option& o) {
                     YaneuraOu::Eval::NNUE::FMScale4 = int(o);
                     return std::nullopt;
                 }));
-    Options.add("FMScale5", Option(7021, 0, 1000000000, [&](const Option& o) {
+    Options.add("FMScale5", Option(16909, 0, 1000000000, [&](const Option& o) {
                     YaneuraOu::Eval::NNUE::FMScale5 = int(o);
                     return std::nullopt;
                 }));
-    Options.add("FMScale6", Option(20723, 0, 1000000000, [&](const Option& o) {
+    Options.add("FMScale6", Option(16909, 0, 1000000000, [&](const Option& o) {
                     YaneuraOu::Eval::NNUE::FMScale6 = int(o);
                     return std::nullopt;
                 }));
-    Options.add("FMScale7", Option(2640, 0, 1000000000, [&](const Option& o) {
+    Options.add("FMScale7", Option(5243, 0, 1000000000, [&](const Option& o) {
                     YaneuraOu::Eval::NNUE::FMScale7 = int(o);
                     return std::nullopt;
                 }));
-    Options.add("FMScale8", Option(3135, 0, 1000000000, [&](const Option& o) {
+    Options.add("FMScale8", Option(5243, 0, 1000000000, [&](const Option& o) {
                     YaneuraOu::Eval::NNUE::FMScale8 = int(o);
                     return std::nullopt;
                 }));
@@ -202,17 +202,20 @@ namespace NNUE {
 
 	int FV_SCALE = 16; // 水匠5では24がベストらしいのでエンジンオプション"FV_SCALE"で変更可能にした。
 
-	int FMScale1 = 25909;
-	int FMScale2 = 49861;
-	int FMScale3 = 12861;
-	int FMScale4 = 11909;
-	int FMScale5 = 7021;
-	int FMScale6 = 20723;
-	int FMScale7 = 2640;
-	int FMScale8 = 3135;
+	int FMScale1 = 42273;
+	int FMScale2 = 42273;
+	int FMScale3 = 13107;
+	int FMScale4 = 13107;
+	int FMScale5 = 16909;
+	int FMScale6 = 16909;
+	int FMScale7 = 5243;
+	int FMScale8 = 5243;
 
     // 入力特徴量変換器
 	LargePagePtr<FeatureTransformer> feature_transformer;
+
+    // --- [追加] ルーター (全バケット共通) ---
+    AlignedPtr<Router> router;
 
     // 評価関数
 #if defined(SFNNwoPSQT)
@@ -296,6 +299,8 @@ namespace {
 		// 評価関数パラメータを初期化する
 		void Initialize() {
 			Detail::Initialize<FeatureTransformer>(feature_transformer);
+			Detail::Initialize<Router>(router);
+
 #if defined(SFNNwoPSQT)
 			for (int i = 0; i < kLayerStacks; ++i) {
 				Detail::Initialize<Network>(network[i]);
@@ -357,6 +362,12 @@ namespace {
     			sync_cout << "info string NNUE feature params read failed: " << result.to_string() << sync_endl;
     			return result;
     		}
+
+			// Router の読み込み
+			sync_cout << "router->ReadParameters(stream) START!!" << sync_endl;
+			router->ReadParameters(stream);
+			sync_cout << "router->ReadParameters(stream) END!!" << sync_endl;
+
 #if defined(SFNNwoPSQT)
     		for (int i = 0; i < kLayerStacks; ++i) {
     			result = Detail::ReadParameters<Network>(stream, network[i]);
@@ -436,9 +447,41 @@ namespace {
         // Absパス用 (128次元)
         alignas(kCacheLineSize) TransformedFeatureType abs_transformed[128];
 
-        const auto bucket_id = stack_index_for_nnue(pos);
+        auto bucket_id = stack_index_for_nnue(pos);
 
         feature_transformer->Transform(pos, transformed_features, diff_transformed, abs_transformed, refresh, bucket_id);
+
+
+        // --- [追加] Router による動的バケット選択 (MoE Router) START ---
+        alignas(kCacheLineSize) std::uint8_t router_input[384];
+        alignas(kCacheLineSize) std::int32_t router_out[32]; // SIMD制約のため32確保
+
+        // 1. Router 用の入力特徴量 (384次元) を構築
+        for (int j = 0; j < 128; ++j) {
+            int32_t abs_val = static_cast<int32_t>(abs_transformed[j]);
+            router_input[j]       = static_cast<std::uint8_t>(std::clamp((abs_val - 64) * 2, 0, 127));
+            router_input[j + 128] = static_cast<std::uint8_t>(diff_transformed[j]);
+            router_input[j + 256] = static_cast<std::uint8_t>(transformed_features[j]);
+        }
+
+        // 2. Router 推論実行
+        router->Propagate(router_input, router_out);
+
+        // 3. 12個の出力 (0〜11) の中から最大値を持つバケットを選択 (Argmax)
+        int chosen_bucket = 0;
+        std::int32_t max_score = router_out[0];
+        for (int b = 1; b < kLayerStacks; ++b) {
+            if (router_out[b] > max_score) {
+                max_score = router_out[b];
+                chosen_bucket = b;
+            }
+        }
+
+        // 既存の bucket_id を Router の判定結果で上書き
+        bucket_id = chosen_bucket;
+
+        // --- [追加] Router による動的バケット選択 (MoE Router) END ---
+
 
         alignas(kCacheLineSize) char buffer[Network::kBufferSize];
         const auto output = network[bucket_id]->Propagate(transformed_features, diff_transformed, abs_transformed, bucket_id, buffer);
