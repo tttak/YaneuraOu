@@ -110,11 +110,9 @@ struct Network {
 		return true;
 	}
 
-	// Fast integer sigmoid approximation
-	static inline int32_t sigmoid_gate_fast(int32_t x, int32_t value) {
-		int32_t g = (x >> 9) + 64;
-		g = std::max(0, std::min(127, g));
-		return (value * g) / 127;
+	static inline int32_t sigmoid_gate_slow(int32_t x, int32_t value) {
+		float sig = 1.0f / (1.0f + std::exp(-static_cast<float>(x) / 8128.0f));
+		return static_cast<int32_t>(value * sig);
 	}
 
 	struct alignas(kCacheLineSize) Buffer {
@@ -210,14 +208,19 @@ struct Network {
 			buf.diff_ac_out[j] = static_cast<uint8_t>(std::max(0, std::min(127, d_scaled)));
 
 			// Abs Path: gateによるフィルタリング (GLU構造)
-			int32_t a_gated = sigmoid_gate_fast(ga, va);
-			int32_t a_scaled = (a_gated * 6) / 128 + 77;
-			buf.abs_ac_out[j] = static_cast<uint8_t>(std::max(0, std::min(127, a_scaled)));
+			int32_t a_gated = sigmoid_gate_slow(ga, va);
+			float abs_gated = static_cast<float>(a_gated) / 8128.0f;
+			int32_t a_scaled = static_cast<int32_t>(
+				std::round(
+					std::clamp(abs_gated * 0.05f + 0.6f, 0.0f, 1.0f) * 127.0f
+				)
+			);
+			buf.abs_ac_out[j] = static_cast<uint8_t>(a_scaled);
 
 			// Abs Sqr Path: 二乗による非線形強調
 			int32_t val_sq = buf.abs_ac_out[j];
 			int32_t sqr_full = (val_sq * val_sq) / 127;
-			buf.abs_sqr_out[j] = static_cast<uint8_t>(sqr_full / 128);
+			buf.abs_sqr_out[j] = static_cast<uint8_t>(sqr_full);
 		}
 
 
@@ -225,7 +228,7 @@ struct Network {
 		fc_0.Propagate(transformedFeatures, buf.fc_0_out);
 		for (int j = 0; j < 32; ++j) {
 			// FM 側の信号（gate_d）で Main パスの情報の通りやすさを制御
-			int32_t sig_half = sigmoid_gate_fast(buf.diff_fc_out[j] - 154, 64);
+			int32_t sig_half = sigmoid_gate_slow(buf.diff_fc_out[j] - 2438, 64);
 			buf.fc_0_out[j] = static_cast<int32_t>((buf.fc_0_out[j] * (64 + sig_half)) / 128);
 			buf.fc_0_out[j] = std::max(0, buf.fc_0_out[j]);
 		}
