@@ -230,7 +230,7 @@ struct Network {
 			// FM 側の信号（gate_d）で Main パスの情報の通りやすさを制御
 			int32_t sig_half = sigmoid_gate_slow(buf.diff_fc_out[j] - 2438, 64);
 			buf.fc_0_out[j] = static_cast<int32_t>((buf.fc_0_out[j] * (64 + sig_half)) / 128);
-			buf.fc_0_out[j] = std::max(0, buf.fc_0_out[j]);
+			buf.fc_0_out[j] = std::clamp(buf.fc_0_out[j], 0, 8128);
 		}
 
 		ac_sqr_0.Propagate(buf.fc_0_out, buf.ac_sqr_0_out_temp); 
