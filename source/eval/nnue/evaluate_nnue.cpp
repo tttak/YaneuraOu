@@ -480,15 +480,15 @@ namespace {
         // Absパス用 (128次元)
         alignas(kCacheLineSize) TransformedFeatureType abs_transformed[128];
 
-        auto bucket_id = stack_index_for_nnue(pos);
+        const auto bucket_id1 = stack_index_for_nnue(pos);
 
-        feature_transformer->Transform(pos, transformed_features, diff_transformed, abs_transformed, refresh, bucket_id);
+        feature_transformer->Transform(pos, transformed_features, diff_transformed, abs_transformed, refresh, bucket_id1);
 
         // Router による動的バケット選択
-        bucket_id = SelectBucketWithRouter(transformed_features, diff_transformed, abs_transformed);
+        const auto bucket_id2 = SelectBucketWithRouter(transformed_features, diff_transformed, abs_transformed);
 
         alignas(kCacheLineSize) char buffer[Network::kBufferSize];
-        const auto output = network[bucket_id]->Propagate(transformed_features, diff_transformed, abs_transformed, bucket_id, buffer);
+        const auto output = network[bucket_id2]->Propagate(transformed_features, diff_transformed, abs_transformed, bucket_id1, buffer);
 
 
         // VALUE_MAX_EVALより大きな値が返ってくるとaspiration searchがfail highして
