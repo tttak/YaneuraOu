@@ -419,10 +419,10 @@ class FeatureTransformer {
 			diff_output[96 + j] = ToOutputRange(((sk_u - sk_t) * FMScale4) >> 22); // sk(1次)差分
 
 			// --- Abs Path (128次元) ---
-			abs_output [ 0 + j] = ToOutputRange(((ih_u + ih_t) * FMScale5) >> 37); // ih(2次)和
-			abs_output [32 + j] = ToOutputRange(((ik_u + ik_t) * FMScale6) >> 37); // ik(2次)和
-			abs_output [64 + j] = ToOutputRange(((sh_u + sh_t) * FMScale7) >> 22); // sh(1次)和
-			abs_output [96 + j] = ToOutputRange(((sk_u + sk_t) * FMScale8) >> 22); // sk(1次)和
+			abs_output [ 0 + j] = ToOutputRange((ih_u * FMScale5) >> 37); // ih(2次)和
+			abs_output [32 + j] = ToOutputRange((ik_u * FMScale6) >> 37); // ik(2次)和
+			abs_output [64 + j] = ToOutputRange((sh_u * FMScale7) >> 22); // sh(1次)和
+			abs_output [96 + j] = ToOutputRange((sk_u * FMScale8) >> 22); // sk(1次)和
 		}
 	}
 
