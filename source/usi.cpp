@@ -12,6 +12,10 @@
 #include "engine.h"
 #include "movegen.h"
 
+#if defined(ENABLE_TEST_CMD) && defined(EVAL_NNUE)
+#include "eval/nnue/nnue_test_command.h"
+#endif
+
 #if defined(__EMSCRIPTEN__)
 // yaneuraou.wasm
 #include <emscripten.h>
@@ -1451,6 +1455,13 @@ void test_cmd(IEngine& engine, std::istringstream& is) {
     // 詰み関係のテスト用コマンド
     if (mate_test_cmd(engine, is, token))
         return;
+
+#if defined(EVAL_NNUE)
+    if (token == "nnue") {
+        Eval::NNUE::TestCommand(engine.get_position(), is);
+        return;
+    }
+#endif
 
     sync_cout << "info string Error! : unknown command = " << token << sync_endl;
 }

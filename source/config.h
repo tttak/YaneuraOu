@@ -252,7 +252,7 @@
 //  高速化に関する設定
 // ---------------------
 
-// トーナメント(大会)用のビルド。最新CPU(いまはAVX2)用でEVAL_HASH大きめ。EVAL_LEARN、TEST_CMD使用不可。ASSERTなし。
+// トーナメント(大会)用のビルド。最新CPU(いまはAVX2)用でEVAL_HASH大きめ。EVAL_LEARN使用不可。ASSERTなし。
 // #define FOR_TOURNAMENT
 
 // ---------------------
@@ -560,7 +560,7 @@ constexpr int MAX_PLY_NUM = 246;
 #if defined(FOR_TOURNAMENT)
 	#undef ASSERT_LV
 	#undef EVAL_LEARN
-	#undef ENABLE_TEST_CMD
+	//#undef ENABLE_TEST_CMD
 	#undef USE_GLOBAL_OPTIONS
 	#undef KEEP_LAST_MOVE
 
