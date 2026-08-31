@@ -183,22 +183,29 @@ class FeatureTransformer {
 #endif
 
 		// --- pair_weights_ の読み込み ---
+		// 先頭の4 phaseデータ [4, 3, 640] はPyTorch復元用なので読み飛ばす。
 		for (std::size_t p = 0; p < kPhaseBuckets; ++p) {
-			// Mul (640次元)
-			for (std::size_t i = 0; i < kPairWeightDimensions; ++i) 
-				pair_weights_mul[p][i] = read_little_endian<int16_t>(stream);
-
-			// Diff (640次元)
-			for (std::size_t i = 0; i < kPairWeightDimensions; ++i) 
-				pair_weights_diff[p][i] = read_little_endian<int16_t>(stream);
-
-			// Sum (640次元)
-			for (std::size_t i = 0; i < kPairWeightDimensions; ++i) 
-				pair_weights_sum[p][i] = read_little_endian<int16_t>(stream);
+			for (std::size_t t = 0; t < kPairWeightTypes; ++t) {
+				for (std::size_t i = 0; i < kPairWeightDimensions; ++i)
+					(void)read_little_endian<int16_t>(stream);
+			}
 		}
 
-		// --- 全12項目の統計を表示 ---
-		const char* phase_names[] = {"OPEN", "MID1", "MID2", "END "};
+		// 続くC++推論用データ [12, 3, 640] を読み込む。
+		for (std::size_t b = 0; b < kPairWeightBuckets; ++b) {
+			for (std::size_t i = 0; i < kPairWeightDimensions; ++i)
+				pair_weights_mul[b][i] = read_little_endian<int16_t>(stream);
+			for (std::size_t i = 0; i < kPairWeightDimensions; ++i)
+				pair_weights_diff[b][i] = read_little_endian<int16_t>(stream);
+			for (std::size_t i = 0; i < kPairWeightDimensions; ++i)
+				pair_weights_sum[b][i] = read_little_endian<int16_t>(stream);
+		}
+
+		// --- 12 bucket x 3項目の統計を表示 ---
+		const char* bucket_names[] = {
+			"B00", "B01", "B02", "B03", "B04", "B05",
+			"B06", "B07", "B08", "B09", "B10", "B11"
+		};
 		
 		auto print_stats = [&](const char* p_name, const char* t_name, int16_t* arr) {
 			int16_t min_v = 32767, max_v = -32768;
@@ -219,10 +226,10 @@ class FeatureTransformer {
 		};
 
 		std::cout << "------------------------------------------------------------" << std::endl;
-		for (int p = 0; p < kPhaseBuckets; ++p) {
-			print_stats(phase_names[p], "MUL ", pair_weights_mul[p]);
-			print_stats(phase_names[p], "DIFF", pair_weights_diff[p]);
-			print_stats(phase_names[p], "SUM ", pair_weights_sum[p]);
+		for (int b = 0; b < kPairWeightBuckets; ++b) {
+			print_stats(bucket_names[b], "MUL ", pair_weights_mul[b]);
+			print_stats(bucket_names[b], "DIFF", pair_weights_diff[b]);
+			print_stats(bucket_names[b], "SUM ", pair_weights_sum[b]);
 			std::cout << "------------------------------------------------------------" << std::endl;
 		}
 
@@ -266,40 +273,12 @@ class FeatureTransformer {
 		const auto& accumulation = pos.state()->accumulator.accumulation;
 		const auto& factors      = pos.state()->accumulator.factors; // FM項用
 
-		// --- 1. Phase-based Weight Blending: 局面（序終盤）に応じた重みの線形補間 ---
-		// 進行度(bucket_id)に基づき、4つのフェーズ（OPEN/MID1/MID2/END）の重みをブレンドします。
-
-		// 進行度 [0, 11] を [0.0, 3.0] にスケールし、隣接する2つのフェーズ係数を算出
-		float pf = static_cast<float>(bucket_id) / 11.0f;
-		float p3 = pf * 3.0f;
-
-		float fw[4] = {
-			std::max(0.0f, 1.0f - p3),
-			std::max(0.0f, 1.0f - std::abs(p3 - 1.0f)),
-			std::max(0.0f, 1.0f - std::abs(p3 - 2.0f)),
-			std::max(0.0f, p3 - 2.0f)
-		};
-
-		// 固定小数点(Q14)に変換して整数演算で高速にブレンド
-		int32_t iw[4];
-		iw[0] = static_cast<int32_t>(fw[0] * 16384.0f);
-		iw[1] = static_cast<int32_t>(fw[1] * 16384.0f);
-		iw[2] = static_cast<int32_t>(fw[2] * 16384.0f);
-		iw[3] = 16384 - (iw[0] + iw[1] + iw[2]);
-
-		// ブレンド済み重みバッファ
-		alignas(kCacheLineSize) int16_t curr_w_mul[kPairWeightDimensions];
-		alignas(kCacheLineSize) int16_t curr_w_diff[kPairWeightDimensions];
-		alignas(kCacheLineSize) int16_t curr_w_sum[kPairWeightDimensions];
-
-		for (IndexType j = 0; j < kPairWeightDimensions; ++j) {
-			curr_w_mul[j]  = (pair_weights_mul[0][j] * iw[0] + pair_weights_mul[1][j] * iw[1] + 
-							  pair_weights_mul[2][j] * iw[2] + pair_weights_mul[3][j] * iw[3]) >> 14;
-			curr_w_diff[j] = (pair_weights_diff[0][j] * iw[0] + pair_weights_diff[1][j] * iw[1] + 
-							  pair_weights_diff[2][j] * iw[2] + pair_weights_diff[3][j] * iw[3]) >> 14;
-			curr_w_sum[j]  = (pair_weights_sum[0][j] * iw[0] + pair_weights_sum[1][j] * iw[1] + 
-							  pair_weights_sum[2][j] * iw[2] + pair_weights_sum[3][j] * iw[3]) >> 14;
-		}
+		// serialize.pyでPyTorchと同じ順序でsoftmax済みの12 bucket weightを生成している。
+		// PairWeightテーブルの参照は必ず0～11に制限する。
+		const int pair_bucket = std::clamp(bucket_id, 0, static_cast<int>(kPairWeightBuckets) - 1);
+		const int16_t* curr_w_mul  = pair_weights_mul[pair_bucket];
+		const int16_t* curr_w_diff = pair_weights_diff[pair_bucket];
+		const int16_t* curr_w_sum  = pair_weights_sum[pair_bucket];
 
 		// --- 2. Main Transformation: Accumulatorからの特徴抽出 ---
 		const Color perspectives[2] = {pos.side_to_move(), ~pos.side_to_move()};
@@ -327,9 +306,9 @@ class FeatureTransformer {
 					__m256i a32 = _mm256_cvtepi16_epi32(a16);
 					__m256i b32 = _mm256_cvtepi16_epi32(b16);
 
-					__m256i w_mul  = _mm256_cvtepi16_epi32(_mm_loadu_si128((__m128i*)&curr_w_mul[idx]));
-					__m256i w_diff = _mm256_cvtepi16_epi32(_mm_loadu_si128((__m128i*)&curr_w_diff[idx]));
-					__m256i w_sum  = _mm256_cvtepi16_epi32(_mm_loadu_si128((__m128i*)&curr_w_sum[idx]));
+					__m256i w_mul  = _mm256_cvtepi16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(&curr_w_mul[idx])));
+					__m256i w_diff = _mm256_cvtepi16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(&curr_w_diff[idx])));
+					__m256i w_sum  = _mm256_cvtepi16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(&curr_w_sum[idx])));
 
 					__m256i term_mul  = _mm256_mullo_epi32(_mm256_mullo_epi32(a32, b32), w_mul);
 					__m256i diff      = _mm256_sub_epi32(a32, b32);
@@ -677,11 +656,13 @@ class FeatureTransformer {
 
 	// pair_weights
 	static constexpr IndexType kPairWeightDimensions = 640;
-	static constexpr IndexType kPhaseBuckets = 4;
+	static constexpr IndexType kPairWeightTypes = 3;        // Mul / Diff / Sum
+	static constexpr IndexType kPhaseBuckets = 4;           // nn.binのPyTorch復元用ブロック
+	static constexpr IndexType kPairWeightBuckets = 12;     // C++推論用ブロック
 
-	alignas(kCacheLineSize) int16_t pair_weights_mul [kPhaseBuckets][kPairWeightDimensions];
-	alignas(kCacheLineSize) int16_t pair_weights_diff[kPhaseBuckets][kPairWeightDimensions];
-	alignas(kCacheLineSize) int16_t pair_weights_sum [kPhaseBuckets][kPairWeightDimensions];
+	alignas(kCacheLineSize) int16_t pair_weights_mul [kPairWeightBuckets][kPairWeightDimensions];
+	alignas(kCacheLineSize) int16_t pair_weights_diff[kPairWeightBuckets][kPairWeightDimensions];
+	alignas(kCacheLineSize) int16_t pair_weights_sum [kPairWeightBuckets][kPairWeightDimensions];
 
 };
 
