@@ -5,6 +5,7 @@
 #if defined(ENABLE_TEST_CMD) && defined(EVAL_NNUE)
 
 #include "../../extra/all.h"
+#include "../../evaluate.h"
 #include "evaluate_nnue.h"
 #include "nnue_test_command.h"
 
@@ -137,6 +138,181 @@ void TestFeatures(Position& pos) {
             << ") features" << std::endl;
 }
 
+// NNUE Accumulatorの差分更新結果と全計算結果を比較するテスト
+void TestAccumulator(Position& pos) {
+  const std::uint64_t num_games = 1000;
+  const int MAX_PLY = 256;
+
+  StateInfo si;
+  pos.set_hirate(&si);
+  StateInfo state[MAX_PLY];
+
+  PRNG prng(20171128);
+  std::uint64_t num_moves = 0;
+
+  auto print_state_failure = [&](const std::uint64_t game, const int ply,
+                                 const char* reason, const Move* move) {
+    std::cout << std::endl
+              << "NNUE accumulator test failed" << std::endl
+              << "  game              : " << (game + 1) << std::endl
+              << "  ply               : " << (ply + 1) << std::endl
+              << "  SFEN              : " << pos.sfen() << std::endl
+              << "  move              : ";
+    if (move)
+      std::cout << *move;
+    else
+      std::cout << "(root)";
+    std::cout << std::endl
+              << "  reason            : " << reason << std::endl;
+  };
+
+  auto print_value_failure = [&](const std::uint64_t game, const int ply,
+                                 const Move move, const Color perspective,
+                                 const char* target, const std::size_t index,
+                                 const std::int64_t incremental_value,
+                                 const std::int64_t full_value,
+                                 const std::size_t trigger_index,
+                                 const bool is_main) {
+    std::cout << std::endl
+              << "NNUE accumulator test failed" << std::endl
+              << "  game              : " << (game + 1) << std::endl
+              << "  ply               : " << (ply + 1) << std::endl
+              << "  SFEN              : " << pos.sfen() << std::endl
+              << "  move              : " << move << std::endl
+              << "  perspective       : "
+              << (perspective == BLACK ? "BLACK" : "WHITE") << std::endl
+              << "  target            : " << target << std::endl;
+    if (is_main) {
+      std::cout << "  trigger_index     : " << trigger_index << std::endl
+                << "  TriggerEvent      : "
+                << static_cast<int>(kRefreshTriggers[trigger_index]) << std::endl
+                << "  dimension index   : " << index << std::endl;
+    } else {
+      std::cout << "  index             : " << index << std::endl;
+    }
+    std::cout << "  incremental value : " << incremental_value << std::endl
+              << "  full refresh value: " << full_value << std::endl
+              << "  difference        : "
+              << (incremental_value - full_value) << std::endl;
+  };
+
+  std::cout << "start testing accumulator with random games";
+
+  for (std::uint64_t game = 0; game < num_games; ++game) {
+    if (!pos.state()->accumulator.computed_accumulation) {
+      print_state_failure(game, -1, "root accumulator is not computed", nullptr);
+      std::cout << "failed." << std::endl;
+      return;
+    }
+
+    for (int ply = 0; ply < MAX_PLY; ++ply) {
+      MoveList<LEGAL_ALL> mg(pos);
+      if (mg.size() == 0)
+        break;
+
+      const Move move = mg.begin()[prng.rand(mg.size())];
+      pos.do_move(move, state[ply]);
+      ++num_moves;
+
+      auto* const current = pos.state();
+      if (current->accumulator.computed_accumulation) {
+        print_state_failure(game, ply,
+                            "current accumulator is already computed after do_move",
+                            &move);
+        std::cout << "failed." << std::endl;
+        return;
+      }
+      if (current->previous == nullptr) {
+        print_state_failure(game, ply, "current StateInfo has no previous state", &move);
+        std::cout << "failed." << std::endl;
+        return;
+      }
+      if (!current->previous->accumulator.computed_accumulation) {
+        print_state_failure(game, ply, "previous accumulator is not computed", &move);
+        std::cout << "failed." << std::endl;
+        return;
+      }
+
+      ::YaneuraOu::Eval::evaluate_with_no_return(pos);
+      if (!current->accumulator.computed_accumulation) {
+        print_state_failure(game, ply, "incremental update did not compute accumulator",
+                            &move);
+        std::cout << "failed." << std::endl;
+        return;
+      }
+
+      const Accumulator incremental = current->accumulator;
+
+      // compute_eval()はComputeScore(pos, true)を呼び、同じ局面の
+      // Accumulatorをfull refreshで再計算する。
+      ::YaneuraOu::Eval::compute_eval(pos);
+      if (!current->accumulator.computed_accumulation) {
+        print_state_failure(game, ply, "full refresh did not compute accumulator", &move);
+        std::cout << "failed." << std::endl;
+        return;
+      }
+
+      const auto& full = current->accumulator;
+      for (const Color perspective : {BLACK, WHITE}) {
+        for (std::size_t trigger_index = 0;
+             trigger_index < kRefreshTriggers.size(); ++trigger_index) {
+          for (IndexType index = 0; index < kTransformedFeatureDimensions; ++index) {
+            const std::int64_t incremental_value =
+                incremental.accumulation[perspective][trigger_index][index];
+            const std::int64_t full_value =
+                full.accumulation[perspective][trigger_index][index];
+            if (incremental_value != full_value) {
+              print_value_failure(game, ply, move, perspective, "main accumulation",
+                                  index, incremental_value, full_value,
+                                  trigger_index, true);
+              std::cout << "failed." << std::endl;
+              return;
+            }
+          }
+        }
+
+        const auto& incremental_factors = incremental.factors[perspective];
+        const auto& full_factors = full.factors[perspective];
+        struct FactorComparison {
+          const char* target;
+          const std::int64_t* incremental_values;
+          const std::int64_t* full_values;
+        };
+        const FactorComparison factor_comparisons[] = {
+            {"halfka.sum_v", incremental_factors.halfka.sum_v,
+             full_factors.halfka.sum_v},
+            {"halfka.sum_v2", incremental_factors.halfka.sum_v2,
+             full_factors.halfka.sum_v2},
+            {"ksdg.sum_v", incremental_factors.ksdg.sum_v,
+             full_factors.ksdg.sum_v},
+            {"ksdg.sum_v2", incremental_factors.ksdg.sum_v2,
+             full_factors.ksdg.sum_v2},
+        };
+
+        for (const auto& comparison : factor_comparisons) {
+          for (std::size_t index = 0; index < 32; ++index) {
+            const std::int64_t incremental_value = comparison.incremental_values[index];
+            const std::int64_t full_value = comparison.full_values[index];
+            if (incremental_value != full_value) {
+              print_value_failure(game, ply, move, perspective, comparison.target,
+                                  index, incremental_value, full_value, 0, false);
+              std::cout << "failed." << std::endl;
+              return;
+            }
+          }
+        }
+      }
+    }
+
+    pos.set_hirate(&si);
+    if ((game % 100) == 0)
+      std::cout << "." << std::flush;
+  }
+
+  std::cout << "passed." << std::endl;
+  std::cout << num_games << " games, " << num_moves << " moves" << std::endl;
+}
+
 // 評価関数の構造を表す文字列を出力する
 void PrintInfo(std::istream& stream) {
   std::cout << "network architecture: " << GetArchitectureString() << std::endl;
@@ -180,11 +356,14 @@ void TestCommand(Position& pos, std::istream& stream) {
 
   if (sub_command == "test_features") {
     TestFeatures(pos);
+  } else if (sub_command == "test_accumulator") {
+    TestAccumulator(pos);
   } else if (sub_command == "info") {
     PrintInfo(stream);
   } else {
     std::cout << "usage:" << std::endl;
     std::cout << " test nnue test_features" << std::endl;
+    std::cout << " test nnue test_accumulator" << std::endl;
     std::cout << " test nnue info [path/to/" << kFileName << "...]" << std::endl;
   }
 }
