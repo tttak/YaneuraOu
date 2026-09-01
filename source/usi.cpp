@@ -1458,7 +1458,7 @@ void test_cmd(IEngine& engine, std::istringstream& is) {
 
 #if defined(EVAL_NNUE)
     if (token == "nnue") {
-        Eval::NNUE::TestCommand(engine.get_position(), is);
+        Eval::NNUE::TestCommand(engine, is);
         return;
     }
 #endif

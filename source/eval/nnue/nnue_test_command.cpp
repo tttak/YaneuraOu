@@ -4,17 +4,238 @@
 
 #if defined(ENABLE_TEST_CMD) && defined(EVAL_NNUE)
 
+#include "../../engine.h"
 #include "../../extra/all.h"
 #include "../../evaluate.h"
 #include "evaluate_nnue.h"
 #include "nnue_test_command.h"
 
+#include <cstdint>
+#include <cstdlib>
+#include <fstream>
+#include <functional>
+#include <iomanip>
 #include <set>
+#include <sstream>
+#include <streambuf>
+#include <string>
+#include <string_view>
+#include <utility>
 
 namespace YaneuraOu {
 namespace Eval::NNUE {
 
 namespace {
+
+struct MoveAccuracyRecord {
+  PackedSfen sfen;
+  s16 score;
+  u16 move;
+  u16 game_ply;
+  s8 game_result;
+  u8 padding;
+};
+
+static_assert(sizeof(MoveAccuracyRecord) == 40,
+              "sfenpack record must be exactly 40 bytes");
+
+class NullStreamBuffer : public std::streambuf {
+ protected:
+  int_type overflow(int_type character) override {
+    return traits_type::not_eof(character);
+  }
+};
+
+class ScopedCoutRedirect {
+ public:
+  ScopedCoutRedirect() : original_buffer_(std::cout.rdbuf(&null_buffer_)) {}
+  ~ScopedCoutRedirect() { std::cout.rdbuf(original_buffer_); }
+
+ private:
+  NullStreamBuffer null_buffer_;
+  std::streambuf* original_buffer_;
+};
+
+class ScopedMoveAccuracyEngineState {
+ public:
+  ScopedMoveAccuracyEngineState(IEngine& engine, std::string& best_move)
+      : engine_(engine),
+        original_position_(engine.sfen()),
+        original_threads_(engine.get_options()["Threads"]),
+        original_multi_pv_(engine.get_options()["MultiPV"]),
+        original_generate_all_legal_moves_(
+            engine.get_options()["GenerateAllLegalMoves"]),
+        original_own_book_(engine.get_options()["USI_OwnBook"]),
+        original_draw_value_black_(engine.get_options()["DrawValueBlack"]),
+        original_draw_value_white_(engine.get_options()["DrawValueWhite"]),
+        original_entering_king_rule_(
+            static_cast<std::string>(engine.get_options()["EnteringKingRule"])),
+        original_bestmove_callback_(engine.get_on_bestmove()) {
+    auto& options = engine_.get_options();
+    options.set_option_if_exists("Threads", "1");
+    options.set_option_if_exists("MultiPV", "1");
+    options.set_option_if_exists("GenerateAllLegalMoves", "false");
+    options.set_option_if_exists("USI_OwnBook", "false");
+    options.set_option_if_exists("DrawValueBlack", "0");
+    options.set_option_if_exists("DrawValueWhite", "0");
+    options.set_option_if_exists("EnteringKingRule", EKR_STRINGS[EKR_27_POINT]);
+
+    engine_.set_on_bestmove(
+        [&best_move](std::string_view move, std::string_view) {
+          best_move.assign(move.data(), move.size());
+        });
+  }
+
+  ~ScopedMoveAccuracyEngineState() {
+    engine_.wait_for_search_finished();
+    engine_.set_on_bestmove(std::move(original_bestmove_callback_));
+
+    auto& options = engine_.get_options();
+    options.set_option_if_exists("Threads", std::to_string(original_threads_));
+    options.set_option_if_exists("MultiPV", std::to_string(original_multi_pv_));
+    options.set_option_if_exists("GenerateAllLegalMoves",
+                                 original_generate_all_legal_moves_ ? "true" : "false");
+    options.set_option_if_exists("USI_OwnBook", original_own_book_ ? "true" : "false");
+    options.set_option_if_exists("DrawValueBlack",
+                                 std::to_string(original_draw_value_black_));
+    options.set_option_if_exists("DrawValueWhite",
+                                 std::to_string(original_draw_value_white_));
+    options.set_option_if_exists("EnteringKingRule", original_entering_king_rule_);
+    engine_.set_position(original_position_, {});
+  }
+
+  bool is_configured() const {
+    const auto& options = engine_.get_options();
+    return static_cast<int64_t>(options["Threads"]) == 1
+        && static_cast<int64_t>(options["MultiPV"]) == 1
+        && static_cast<int64_t>(options["GenerateAllLegalMoves"]) == 0
+        && static_cast<int64_t>(options["USI_OwnBook"]) == 0
+        && static_cast<int64_t>(options["DrawValueBlack"]) == 0
+        && static_cast<int64_t>(options["DrawValueWhite"]) == 0
+        && static_cast<std::string>(options["EnteringKingRule"])
+               == EKR_STRINGS[EKR_27_POINT];
+  }
+
+ private:
+  IEngine& engine_;
+  std::string original_position_;
+  int64_t original_threads_;
+  int64_t original_multi_pv_;
+  bool original_generate_all_legal_moves_;
+  bool original_own_book_;
+  int64_t original_draw_value_black_;
+  int64_t original_draw_value_white_;
+  std::string original_entering_king_rule_;
+  std::function<void(std::string_view, std::string_view)>
+      original_bestmove_callback_;
+};
+
+void TestMoveAccuracy(IEngine& engine, std::istream& stream) {
+  std::string file_name;
+  stream >> file_name;
+  if (file_name.empty()) {
+    std::cout << "error: sfenpack file path is required" << std::endl;
+    return;
+  }
+
+  std::ifstream input(file_name, std::ios::binary);
+  if (!input) {
+    std::cout << "error: failed to open sfenpack file: " << file_name << std::endl;
+    return;
+  }
+
+  std::uint64_t total_records = 0;
+  std::uint64_t tested_positions = 0;
+  std::uint64_t correct_moves = 0;
+  std::string error_message;
+  std::string best_move_text;
+
+  {
+    ScopedCoutRedirect suppress_search_output;
+    ScopedMoveAccuracyEngineState engine_state(engine, best_move_text);
+
+    if (!engine_state.is_configured()) {
+      error_message = "failed to configure engine for move accuracy measurement";
+    } else {
+      MoveAccuracyRecord packed_record;
+      while (input.read(reinterpret_cast<char*>(&packed_record),
+                        sizeof(packed_record))) {
+        ++total_records;
+
+        const int score = packed_record.score;
+        if (30000 < std::abs(score) || packed_record.game_result == 0)
+          continue;
+
+        Position decoded_position;
+        StateInfo decoded_state;
+        if (decoded_position
+                .set_from_packed_sfen(packed_record.sfen, &decoded_state, false)
+                .is_not_ok())
+          continue;
+
+        if (MoveList<LEGAL>(decoded_position).size() == 0) {
+          error_message = "no legal move in a tested sfenpack position";
+          break;
+        }
+
+        engine.set_position(decoded_position.sfen(), {});
+        best_move_text.clear();
+
+        Search::LimitsType limits;
+        limits.depth = 1;
+        limits.startTime = now();
+        engine.go(limits);
+        engine.wait_for_search_finished();
+
+        if (best_move_text.empty()) {
+          error_message = "depth=1 search did not return a best move";
+          break;
+        }
+
+        const Move16 best_move = Move16::from_string(best_move_text);
+        if (best_move == Move16::none() || best_move == Move16::resign()
+            || best_move == Move16::win()) {
+          error_message = "depth=1 search returned no comparable best move: "
+                        + best_move_text;
+          break;
+        }
+
+        ++tested_positions;
+        const u16 teacher_move = packed_record.move;
+        if (best_move.to_u16() == teacher_move)
+          ++correct_moves;
+      }
+    }
+  }
+
+  if (error_message.empty() && input.bad())
+    error_message = "failed while reading sfenpack file";
+  else if (error_message.empty() && input.gcount() != 0)
+    error_message = "sfenpack file ends with an incomplete record";
+
+  if (!error_message.empty()) {
+    std::cout << "error: " << error_message << std::endl;
+    return;
+  }
+  if (total_records == 0) {
+    std::cout << "error: sfenpack file is empty" << std::endl;
+    return;
+  }
+  if (tested_positions == 0) {
+    std::cout << "error: no positions passed the sfenpack filters" << std::endl;
+    return;
+  }
+
+  const double accuracy =
+      100.0 * static_cast<double>(correct_moves)
+      / static_cast<double>(tested_positions);
+  std::ostringstream accuracy_text;
+  accuracy_text << std::fixed << std::setprecision(3) << accuracy;
+
+  std::cout << "tested positions = " << tested_positions << std::endl;
+  std::cout << "correct moves    = " << correct_moves << std::endl;
+  std::cout << "accuracy=" << accuracy_text.str() << "%" << std::endl;
+}
 
 // 主に差分計算に関するRawFeaturesのテスト
 void TestFeatures(Position& pos) {
@@ -350,9 +571,11 @@ void PrintInfo(std::istream& stream) {
 }  // namespace
 
 // NNUE評価関数に関するUSI拡張コマンド
-void TestCommand(Position& pos, std::istream& stream) {
+void TestCommand(IEngine& engine, std::istream& stream) {
   std::string sub_command;
   stream >> sub_command;
+
+  auto& pos = engine.get_position();
 
   if (sub_command == "test_features") {
     TestFeatures(pos);
@@ -360,10 +583,13 @@ void TestCommand(Position& pos, std::istream& stream) {
     TestAccumulator(pos);
   } else if (sub_command == "info") {
     PrintInfo(stream);
+  } else if (sub_command == "accuracy") {
+    TestMoveAccuracy(engine, stream);
   } else {
     std::cout << "usage:" << std::endl;
     std::cout << " test nnue test_features" << std::endl;
     std::cout << " test nnue test_accumulator" << std::endl;
+    std::cout << " test nnue accuracy <sfenpack file>" << std::endl;
     std::cout << " test nnue info [path/to/" << kFileName << "...]" << std::endl;
   }
 }
