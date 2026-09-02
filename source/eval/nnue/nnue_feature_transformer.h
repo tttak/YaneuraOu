@@ -405,6 +405,53 @@ class FeatureTransformer {
 		}
 	}
 
+#if defined(ENABLE_NNUE_TRACE)
+	// Trace-only accessors. These are compiled out of normal tournament builds.
+	void TracePairWeights(const int bucket_id, std::int16_t* weight_mul,
+	                      std::int16_t* weight_diff,
+	                      std::int16_t* weight_sum) const {
+		const int pair_bucket =
+			std::clamp(bucket_id, 0, static_cast<int>(kPairWeightBuckets) - 1);
+		for (IndexType j = 0; j < kPairWeightDimensions; ++j) {
+			weight_mul[j] = pair_weights_mul[pair_bucket][j];
+			weight_diff[j] = pair_weights_diff[pair_bucket][j];
+			weight_sum[j] = pair_weights_sum[pair_bucket][j];
+		}
+	}
+
+	void TraceMainPair(const Position& pos, const Color perspective,
+	                   const int bucket_id, std::int32_t* a_values,
+	                   std::int32_t* b_values, std::int32_t* mul_terms,
+	                   std::int32_t* diff_sq_terms,
+	                   std::int32_t* sum_terms,
+	                   std::int32_t* mixed_numerators) const {
+		const int pair_bucket =
+			std::clamp(bucket_id, 0, static_cast<int>(kPairWeightBuckets) - 1);
+		const auto& accumulation = pos.state()->accumulator.accumulation;
+		for (IndexType j = 0; j < kPairWeightDimensions; ++j) {
+			const std::int32_t a =
+				std::clamp<std::int32_t>(accumulation[perspective][0][j], 0, 127);
+			const std::int32_t b = std::clamp<std::int32_t>(
+				accumulation[perspective][0][j + kPairWeightDimensions], 0, 127);
+			const std::int32_t mul_term = a * b;
+			const std::int32_t diff = a - b;
+			const std::int32_t diff_sq_term = diff * diff;
+			const std::int32_t sum_term = (a + b) * 64;
+			const std::int32_t mixed_numerator =
+				mul_term * pair_weights_mul[pair_bucket][j]
+				+ diff_sq_term * pair_weights_diff[pair_bucket][j]
+				+ sum_term * pair_weights_sum[pair_bucket][j];
+
+			a_values[j] = a;
+			b_values[j] = b;
+			mul_terms[j] = mul_term;
+			diff_sq_terms[j] = diff_sq_term;
+			sum_terms[j] = sum_term;
+			mixed_numerators[j] = mixed_numerator;
+		}
+	}
+#endif  // defined(ENABLE_NNUE_TRACE)
+
    private:
 	static void order_packs([[maybe_unused]] uint64_t* v) {
 #if defined(USE_AVX512)  // _mm512_set_epi32 packs in the order [15 11 7 3 14 10 6 2 13 9 5 1 12 8 4 0]

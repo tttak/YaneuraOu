@@ -22,6 +22,14 @@
 #include <string_view>
 #include <utility>
 
+#if defined(ENABLE_NNUE_TRACE)
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstring>
+#include <vector>
+#endif
+
 namespace YaneuraOu {
 namespace Eval::NNUE {
 
@@ -534,6 +542,1075 @@ void TestAccumulator(Position& pos) {
   std::cout << num_games << " games, " << num_moves << " moves" << std::endl;
 }
 
+#if defined(ENABLE_NNUE_TRACE)
+
+constexpr std::size_t kTraceFmDimensions = 32;
+constexpr std::size_t kTraceFmOutputDimensions = 4 * kTraceFmDimensions;
+constexpr std::size_t kTracePairDimensions = 640;
+constexpr std::size_t kTraceRouterInputDimensions = 384;
+constexpr std::size_t kTraceRouterOutputDimensions = kLayerStacks;
+constexpr std::size_t kTraceFmFcOutputDimensions = 64;
+constexpr std::size_t kTraceFmHiddenDimensions = 32;
+constexpr std::size_t kTraceLcaQueryInputDimensions = 31;
+constexpr std::size_t kTraceLcaFmInputDimensions = 64;
+constexpr std::size_t kTracePhaseDimensions = 6;
+constexpr std::size_t kTraceCrossInputDimensions = 16;
+constexpr std::size_t kTraceBucketInputDimensions = 192;
+constexpr std::size_t kTraceBucketHiddenDimensions = 96;
+
+static_assert(FeatureTransformer::kOutputDimensions ==
+                  2 * kTracePairDimensions,
+              "NNUE trace expects the 1280-dimensional main path");
+static_assert(Router::kInputDimensions == kTraceRouterInputDimensions,
+              "NNUE trace expects the 384-dimensional Router input");
+static_assert(Router::kOutputDimensions >= kTraceRouterOutputDimensions,
+              "NNUE Router output is smaller than the layer-stack count");
+
+struct TraceFmAccumulator {
+  std::array<std::int64_t, kTraceFmDimensions> halfka_sum_v;
+  std::array<std::int64_t, kTraceFmDimensions> halfka_sum_v2;
+  std::array<std::int64_t, kTraceFmDimensions> ksdg_sum_v;
+  std::array<std::int64_t, kTraceFmDimensions> ksdg_sum_v2;
+};
+
+struct TraceFmInteraction {
+  std::array<std::int64_t, kTraceFmDimensions> ih;
+  std::array<std::int64_t, kTraceFmDimensions> ik;
+  std::array<std::int64_t, kTraceFmDimensions> sh;
+  std::array<std::int64_t, kTraceFmDimensions> sk;
+};
+
+struct TraceMainPair {
+  std::array<std::int32_t, kTracePairDimensions> a;
+  std::array<std::int32_t, kTracePairDimensions> b;
+  std::array<std::int32_t, kTracePairDimensions> mul_term;
+  std::array<std::int32_t, kTracePairDimensions> diff_sq_term;
+  std::array<std::int32_t, kTracePairDimensions> sum_term;
+  std::array<std::int32_t, kTracePairDimensions> mixed_numerator;
+  std::array<FeatureTransformer::OutputType, kTracePairDimensions> output;
+};
+
+struct TraceRouter {
+  std::array<std::uint8_t, kTraceRouterInputDimensions> input;
+  std::array<std::int32_t, kTraceRouterOutputDimensions> logits;
+  int selected_bucket;
+};
+
+struct TraceFmPath {
+  int selected_bucket;
+  alignas(kCacheLineSize)
+      std::array<std::uint8_t, kTraceFmOutputDimensions> diff_input;
+  alignas(kCacheLineSize)
+      std::array<std::uint8_t, kTraceFmOutputDimensions> abs_input;
+  alignas(kCacheLineSize)
+      std::array<std::int32_t, kTraceFmFcOutputDimensions> diff_fc_preact;
+  alignas(kCacheLineSize)
+      std::array<std::int32_t, kTraceFmFcOutputDimensions> abs_fc_preact;
+  std::array<std::int32_t, kTraceFmHiddenDimensions> diff_gate_preact;
+  std::array<std::int32_t, kTraceFmHiddenDimensions> diff_value_preact;
+  std::uint32_t diff_rms_sum_sq_f32_bits;
+  std::uint32_t diff_inv_rms_f32_bits;
+  std::array<std::uint32_t, kTraceFmHiddenDimensions>
+      diff_normalized_f32_bits;
+  std::array<std::int32_t, kTraceFmHiddenDimensions>
+      diff_normalized_scaled_centered;
+  std::array<std::uint8_t, kTraceFmHiddenDimensions> diff_output_pre_lca;
+  std::array<std::int32_t, kTraceFmHiddenDimensions> diff_main_gate_q64;
+  std::array<std::int32_t, kTraceFmHiddenDimensions>
+      diff_main_gate_multiplier_q128;
+  std::array<std::int32_t, kTraceFmHiddenDimensions> abs_gate_preact;
+  std::array<std::int32_t, kTraceFmHiddenDimensions> abs_value_preact;
+  std::array<std::uint32_t, kTraceFmHiddenDimensions>
+      abs_gate_sigmoid_f32_bits;
+  std::array<std::int32_t, kTraceFmHiddenDimensions> abs_gated_value;
+  std::array<std::uint32_t, kTraceFmHiddenDimensions>
+      abs_scaled_before_round_f32_bits;
+  std::array<std::uint8_t, kTraceFmHiddenDimensions> abs_output;
+  std::array<std::uint8_t, kTraceFmHiddenDimensions> abs_squared_output;
+};
+
+struct TraceLca {
+  int selected_bucket;
+  std::array<std::int32_t, kTraceFmHiddenDimensions>
+      main_fc_preact_before_gate;
+  std::array<std::int32_t, kTraceFmHiddenDimensions>
+      main_fc_preact_after_gate;
+  std::array<std::uint8_t, kTraceLcaQueryInputDimensions> query_input;
+  std::array<std::uint8_t, kTraceLcaFmInputDimensions> fm_input;
+  std::array<std::int32_t, kTraceFmHiddenDimensions> query_preact;
+  std::array<std::int32_t, kTraceFmHiddenDimensions> key_preact;
+  std::array<std::int32_t, kTraceFmHiddenDimensions> value_preact;
+  std::uint32_t temperature_f32_bits;
+  std::uint32_t dot_product_f32_bits;
+  std::uint32_t attention_logit_f32_bits;
+  std::uint32_t attention_score_f32_bits;
+  std::array<std::uint32_t, kTraceFmHiddenDimensions>
+      value_clamped_f32_bits;
+  std::array<std::uint32_t, kTraceFmHiddenDimensions>
+      correction_f32_bits;
+  std::array<std::uint32_t, kTraceFmHiddenDimensions>
+      output_post_lca_f32_bits;
+  std::array<std::uint8_t, kTraceFmHiddenDimensions> output_post_lca;
+};
+
+struct TraceDeepPath {
+  int selected_bucket;
+  std::array<std::uint8_t, kTraceRouterInputDimensions> phase_input;
+  std::array<std::int32_t, kTracePhaseDimensions> phase_preact;
+  std::array<std::uint32_t, kTracePhaseDimensions> phase_logit_f32_bits;
+  std::array<std::uint32_t, kTracePhaseDimensions> phase_sigmoid_f32_bits;
+  std::array<std::uint32_t, kTracePhaseDimensions> phase_value_f32_bits;
+  std::array<std::uint32_t, kTracePhaseDimensions> channel_scale_f32_bits;
+  std::array<std::uint8_t, kTraceLcaQueryInputDimensions> main_raw;
+  std::array<std::uint8_t, kTraceLcaQueryInputDimensions> main_squared;
+  std::array<std::uint8_t, kTraceCrossInputDimensions> cross_main_squared;
+  std::array<std::uint8_t, kTraceCrossInputDimensions> cross_diff;
+  std::array<std::uint8_t, kTraceCrossInputDimensions> cross_main_raw;
+  std::array<std::uint8_t, kTraceCrossInputDimensions> cross_abs;
+  std::array<std::uint8_t, kTraceCrossInputDimensions> cross_product_diff;
+  std::array<std::uint8_t, kTraceCrossInputDimensions> cross_product_abs;
+  std::array<std::uint8_t, 2 * kTraceCrossInputDimensions> cross_input;
+  std::array<std::int32_t, kTraceFmHiddenDimensions> cross_preact;
+  std::array<std::uint8_t, kTraceFmHiddenDimensions> cross_output;
+  std::array<std::uint8_t, kTraceBucketInputDimensions> fc1_input;
+  std::array<std::int32_t, kTraceBucketHiddenDimensions> fc1_preact;
+  std::array<std::uint8_t, kTraceBucketHiddenDimensions> fc1_output;
+  std::array<std::int32_t, 1> fc2_preact;
+};
+
+struct TraceFinalPath {
+  int selected_bucket;
+  int material_bucket;
+  std::array<std::int32_t, 1> deep_output;
+  std::array<std::int32_t, 1> bypass_input;
+  std::array<std::int32_t, 1> bypass_preact;
+  std::array<std::int32_t, 1> bypass_scaled_numerator;
+  std::array<std::int32_t, 1> bypass_output;
+  std::array<std::int32_t, 1> alpha_q14;
+  std::array<std::int32_t, 1> inv_alpha_q14;
+  std::array<std::int64_t, 1> deep_term;
+  std::array<std::int64_t, 1> bypass_term;
+  std::array<std::int64_t, 1> blend_numerator;
+  std::array<std::int32_t, 1> blend_output;
+  std::array<std::int32_t, 1> network_output;
+  std::array<std::int32_t, 1> fv_scale;
+  std::array<std::int32_t, 1> eval_before_clamp;
+  std::array<std::int32_t, 1> value_max_eval;
+  std::array<std::int32_t, 1> eval_after_clamp;
+};
+
+struct TracePerspectiveData {
+  std::vector<IndexType> active_indices;
+  std::array<std::int16_t, kTransformedFeatureDimensions> main_accumulator;
+  TraceFmAccumulator fm_accumulator;
+  TraceFmInteraction fm_interaction;
+  TraceMainPair main_pair;
+};
+
+struct NnueTraceSnapshot {
+  std::string sfen;
+  Color side_to_move;
+  int pair_bucket;
+  std::array<TracePerspectiveData, COLOR_NB> perspective;
+  std::array<std::int16_t, kTracePairDimensions> pair_weight_mul;
+  std::array<std::int16_t, kTracePairDimensions> pair_weight_diff;
+  std::array<std::int16_t, kTracePairDimensions> pair_weight_sum;
+  TraceFmInteraction raw_diff;
+  TraceFmInteraction raw_abs;
+  std::array<FeatureTransformer::OutputType, kTraceFmOutputDimensions>
+      scaled_diff;
+  std::array<FeatureTransformer::OutputType, kTraceFmOutputDimensions>
+      scaled_abs;
+  TraceRouter router;
+  TraceFmPath fm_path;
+  TraceLca lca;
+  TraceDeepPath deep_path;
+  TraceFinalPath final_path;
+};
+
+const char* TracePerspectiveName(const Color perspective) {
+  return perspective == BLACK ? "BLACK" : "WHITE";
+}
+
+int TracePairBucket(const Position& pos) {
+  // Keep this trace-only calculation identical to stack_index_for_nnue().
+  constexpr int bucket_by_material[24] = {
+      0, 1, 2, 3, 4, 5, 5, 6, 6, 7, 7, 8,
+      8, 8, 9, 9, 9, 9, 10, 10, 10, 10, 10, 11};
+  return bucket_by_material[std::min(
+      (std::abs(pos.state()->materialValue) + 99) / 100, 23)];
+}
+
+std::uint32_t TraceFloatBits(const float value) {
+  std::uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+std::uint64_t Fnv1a64Indices(const std::vector<IndexType>& indices) {
+  constexpr std::uint64_t kOffsetBasis = UINT64_C(14695981039346656037);
+  constexpr std::uint64_t kPrime = UINT64_C(1099511628211);
+  std::uint64_t hash = kOffsetBasis;
+  for (const IndexType index : indices) {
+    const std::uint32_t value = static_cast<std::uint32_t>(index);
+    for (unsigned int byte_index = 0; byte_index < 4; ++byte_index) {
+      hash ^= static_cast<std::uint8_t>(value >> (byte_index * 8));
+      hash *= kPrime;
+    }
+  }
+  return hash;
+}
+
+bool MakeNnueTraceSnapshot(const std::string& sfen,
+                           NnueTraceSnapshot* const snapshot,
+                           std::string* const error_message) {
+  if (!feature_transformer) {
+    *error_message = "NNUE feature transformer is not loaded";
+    return false;
+  }
+  if (!router) {
+    *error_message = "NNUE router is not loaded";
+    return false;
+  }
+
+  Position trace_position;
+  StateInfo trace_state;
+  trace_position.set(sfen, &trace_state);
+
+  snapshot->sfen = trace_position.sfen();
+  snapshot->side_to_move = trace_position.side_to_move();
+  snapshot->pair_bucket = TracePairBucket(trace_position);
+
+  for (std::size_t trigger_index = 0;
+       trigger_index < kRefreshTriggers.size(); ++trigger_index) {
+    Features::IndexList active_indices[COLOR_NB];
+    RawFeatures::AppendActiveIndices(
+        trace_position, kRefreshTriggers[trigger_index], active_indices);
+    for (const Color perspective : {BLACK, WHITE}) {
+      auto& destination = snapshot->perspective[perspective].active_indices;
+      destination.insert(destination.end(), active_indices[perspective].begin(),
+                         active_indices[perspective].end());
+    }
+  }
+  for (const Color perspective : {BLACK, WHITE}) {
+    auto& indices = snapshot->perspective[perspective].active_indices;
+    std::sort(indices.begin(), indices.end());
+  }
+
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType,
+                 FeatureTransformer::kOutputDimensions>
+          transformed_output;
+  feature_transformer->Transform(
+      trace_position, transformed_output.data(), snapshot->scaled_diff.data(),
+      snapshot->scaled_abs.data(), true, snapshot->pair_bucket);
+
+  // Reproduce SelectBucketWithRouter() using the actual transformed byte
+  // arrays and the already loaded Router. This remains trace-only code.
+  for (std::size_t index = 0; index < kTraceFmOutputDimensions; ++index) {
+    const std::int32_t abs_value = snapshot->scaled_abs[index];
+    snapshot->router.input[index] = static_cast<std::uint8_t>(
+        std::clamp((abs_value - 64) * 2, 0, 127));
+    snapshot->router.input[index + kTraceFmOutputDimensions] =
+        snapshot->scaled_diff[index];
+    snapshot->router.input[index + 2 * kTraceFmOutputDimensions] =
+        transformed_output[index];
+  }
+
+  alignas(kCacheLineSize) Router::OutputBuffer router_output;
+  router->Propagate(snapshot->router.input.data(), router_output);
+  std::copy_n(router_output, kTraceRouterOutputDimensions,
+              snapshot->router.logits.begin());
+  snapshot->router.selected_bucket = 0;
+  for (std::size_t bucket = 1; bucket < kTraceRouterOutputDimensions;
+       ++bucket) {
+    if (snapshot->router.logits[bucket] >
+        snapshot->router.logits[snapshot->router.selected_bucket])
+      snapshot->router.selected_bucket = static_cast<int>(bucket);
+  }
+
+  auto& fm_path = snapshot->fm_path;
+  fm_path.selected_bucket = snapshot->router.selected_bucket;
+  std::copy_n(snapshot->scaled_diff.begin(), kTraceFmOutputDimensions,
+              fm_path.diff_input.begin());
+  std::copy_n(snapshot->scaled_abs.begin(), kTraceFmOutputDimensions,
+              fm_path.abs_input.begin());
+
+  const auto& selected_network = network[fm_path.selected_bucket];
+  if (!selected_network) {
+    *error_message = "selected NNUE bucket network is not loaded";
+    return false;
+  }
+  selected_network->fc_diff.Propagate(fm_path.diff_input.data(),
+                                      fm_path.diff_fc_preact.data());
+  selected_network->fc_abs.Propagate(fm_path.abs_input.data(),
+                                     fm_path.abs_fc_preact.data());
+
+  float diff_sum_sq = 0.0f;
+  for (std::size_t index = 0; index < kTraceFmHiddenDimensions; ++index) {
+    const float value =
+        static_cast<float>(fm_path.diff_fc_preact[index +
+                                                  kTraceFmHiddenDimensions]);
+    diff_sum_sq += value * value;
+  }
+  const float diff_inv_rms =
+      1.0f / std::sqrt(diff_sum_sq / 32.0f + 1e-8f);
+  fm_path.diff_rms_sum_sq_f32_bits = TraceFloatBits(diff_sum_sq);
+  fm_path.diff_inv_rms_f32_bits = TraceFloatBits(diff_inv_rms);
+
+  for (std::size_t index = 0; index < kTraceFmHiddenDimensions; ++index) {
+    const std::int32_t diff_gate = fm_path.diff_fc_preact[index];
+    const std::int32_t diff_value =
+        fm_path.diff_fc_preact[index + kTraceFmHiddenDimensions];
+    const std::int32_t abs_gate = fm_path.abs_fc_preact[index];
+    const std::int32_t abs_value =
+        fm_path.abs_fc_preact[index + kTraceFmHiddenDimensions];
+
+    fm_path.diff_gate_preact[index] = diff_gate;
+    fm_path.diff_value_preact[index] = diff_value;
+    fm_path.abs_gate_preact[index] = abs_gate;
+    fm_path.abs_value_preact[index] = abs_value;
+
+    const float diff_normalized =
+        static_cast<float>(diff_value) * diff_inv_rms;
+    const std::int32_t diff_centered =
+        static_cast<std::int32_t>(diff_normalized * 25.4f);
+    fm_path.diff_normalized_f32_bits[index] =
+        TraceFloatBits(diff_normalized);
+    fm_path.diff_normalized_scaled_centered[index] = diff_centered;
+    fm_path.diff_output_pre_lca[index] = static_cast<std::uint8_t>(
+        std::clamp(diff_centered + 64, 0, 127));
+
+    const std::int32_t main_gate_q64 = Network::sigmoid_gate_slow(
+        diff_gate - 2438, 64);
+    fm_path.diff_main_gate_q64[index] = main_gate_q64;
+    fm_path.diff_main_gate_multiplier_q128[index] = 64 + main_gate_q64;
+
+    const float abs_gate_sigmoid =
+        1.0f /
+        (1.0f + std::exp(-static_cast<float>(abs_gate) / 8128.0f));
+    const std::int32_t abs_gated =
+        Network::sigmoid_gate_slow(abs_gate, abs_value);
+    const float abs_gated_float =
+        static_cast<float>(abs_gated) / 8128.0f;
+    const float abs_scaled_before_round =
+        std::clamp(abs_gated_float * 0.05f + 0.6f, 0.0f, 1.0f)
+        * 127.0f;
+    const std::int32_t abs_scaled =
+        static_cast<std::int32_t>(std::round(abs_scaled_before_round));
+
+    fm_path.abs_gate_sigmoid_f32_bits[index] =
+        TraceFloatBits(abs_gate_sigmoid);
+    fm_path.abs_gated_value[index] = abs_gated;
+    fm_path.abs_scaled_before_round_f32_bits[index] =
+        TraceFloatBits(abs_scaled_before_round);
+    fm_path.abs_output[index] = static_cast<std::uint8_t>(abs_scaled);
+    fm_path.abs_squared_output[index] = static_cast<std::uint8_t>(
+        (abs_scaled * abs_scaled) / 127);
+  }
+
+  // Reproduce only the Main input dependency and LCA section of
+  // Network::Propagate(). The deep bucket network remains outside this trace.
+  auto& lca = snapshot->lca;
+  lca.selected_bucket = fm_path.selected_bucket;
+  alignas(kCacheLineSize) Network::Buffer lca_buffer{};
+
+  selected_network->fc_0.Propagate(transformed_output.data(),
+                                   lca_buffer.fc_0_out);
+  std::copy_n(lca_buffer.fc_0_out, kTraceFmHiddenDimensions,
+              lca.main_fc_preact_before_gate.begin());
+  for (std::size_t index = 0; index < kTraceFmHiddenDimensions; ++index) {
+    const std::int32_t main_gate_q64 = fm_path.diff_main_gate_q64[index];
+    lca_buffer.fc_0_out[index] = static_cast<std::int32_t>(
+        (lca_buffer.fc_0_out[index] * (64 + main_gate_q64)) / 128);
+    if (index < kTraceLcaQueryInputDimensions)
+      lca_buffer.fc_0_out[index] =
+          std::clamp(lca_buffer.fc_0_out[index], 0, 8128);
+  }
+  std::copy_n(lca_buffer.fc_0_out, kTraceFmHiddenDimensions,
+              lca.main_fc_preact_after_gate.begin());
+
+  selected_network->ac_0.Propagate(lca_buffer.fc_0_out,
+                                   lca_buffer.ac_0_out);
+  std::copy_n(lca_buffer.ac_0_out, kTraceLcaQueryInputDimensions,
+              lca.query_input.begin());
+
+  for (std::size_t index = 0; index < kTraceFmHiddenDimensions; ++index) {
+    lca_buffer.fm_cat_uint8[index] = fm_path.diff_output_pre_lca[index];
+    lca_buffer.fm_cat_uint8[index + kTraceFmHiddenDimensions] =
+        fm_path.abs_output[index];
+  }
+  std::copy_n(lca_buffer.fm_cat_uint8, kTraceLcaFmInputDimensions,
+              lca.fm_input.begin());
+
+  selected_network->lca_q.Propagate(lca_buffer.ac_0_out,
+                                    lca_buffer.lca_q_out);
+  selected_network->lca_k.Propagate(lca_buffer.fm_cat_uint8,
+                                    lca_buffer.lca_k_out);
+  selected_network->lca_v.Propagate(lca_buffer.fm_cat_uint8,
+                                    lca_buffer.lca_v_out);
+  std::copy_n(lca_buffer.lca_q_out, kTraceFmHiddenDimensions,
+              lca.query_preact.begin());
+  std::copy_n(lca_buffer.lca_k_out, kTraceFmHiddenDimensions,
+              lca.key_preact.begin());
+  std::copy_n(lca_buffer.lca_v_out, kTraceFmHiddenDimensions,
+              lca.value_preact.begin());
+
+  float lca_dot_product = 0.0f;
+  for (std::size_t index = 0; index < kTraceFmHiddenDimensions; ++index) {
+    lca_dot_product +=
+        (static_cast<float>(lca_buffer.lca_q_out[index]) / 8128.0f)
+        * (static_cast<float>(lca_buffer.lca_k_out[index]) / 8128.0f);
+  }
+  const float lca_attention_logit =
+      (lca_dot_product * 0.17677f) / selected_network->lca_temp;
+  const float lca_attention_score =
+      1.0f / (1.0f + std::exp(-lca_attention_logit));
+  lca.temperature_f32_bits = TraceFloatBits(selected_network->lca_temp);
+  lca.dot_product_f32_bits = TraceFloatBits(lca_dot_product);
+  lca.attention_logit_f32_bits = TraceFloatBits(lca_attention_logit);
+  lca.attention_score_f32_bits = TraceFloatBits(lca_attention_score);
+
+  for (std::size_t index = 0; index < kTraceFmHiddenDimensions; ++index) {
+    const float current_diff =
+        static_cast<float>(fm_path.diff_output_pre_lca[index]) / 127.0f;
+    const float value =
+        static_cast<float>(lca_buffer.lca_v_out[index]) / 8128.0f;
+    const float value_clamped =
+        std::clamp(value * 0.4f + 0.5f, 0.0f, 1.0f);
+    const float output_post_lca =
+        current_diff * (1.0f - lca_attention_score)
+        + value_clamped * lca_attention_score;
+    const float correction = output_post_lca - current_diff;
+
+    lca.value_clamped_f32_bits[index] = TraceFloatBits(value_clamped);
+    lca.correction_f32_bits[index] = TraceFloatBits(correction);
+    lca.output_post_lca_f32_bits[index] = TraceFloatBits(output_post_lca);
+    lca.output_post_lca[index] =
+        static_cast<std::uint8_t>(output_post_lca * 127.0f);
+    lca_buffer.diff_ac_out[index] = lca.output_post_lca[index];
+    lca_buffer.abs_ac_out[index] = fm_path.abs_output[index];
+    lca_buffer.abs_sqr_out[index] = fm_path.abs_squared_output[index];
+  }
+
+  auto& deep_path = snapshot->deep_path;
+  deep_path.selected_bucket = lca.selected_bucket;
+
+  for (std::size_t index = 0; index < kTraceFmOutputDimensions; ++index) {
+    const std::int32_t abs_value = snapshot->scaled_abs[index];
+    lca_buffer.phase_input[index] = static_cast<std::uint8_t>(
+        std::clamp((abs_value - 64) * 2, 0, 127));
+    lca_buffer.phase_input[index + kTraceFmOutputDimensions] =
+        snapshot->scaled_diff[index];
+    lca_buffer.phase_input[index + 2 * kTraceFmOutputDimensions] =
+        transformed_output[index];
+  }
+  lca_buffer.phase_input[127] = static_cast<std::uint8_t>(
+      (snapshot->pair_bucket * 127) / 11);
+  std::copy_n(lca_buffer.phase_input, kTraceRouterInputDimensions,
+              deep_path.phase_input.begin());
+
+  selected_network->phase_proj.Propagate(lca_buffer.phase_input,
+                                         lca_buffer.phase_out);
+  float channel_scales[kTracePhaseDimensions];
+  constexpr float scale_multipliers[kTracePhaseDimensions] = {
+      1.3f, 1.5f, 1.0f, 0.7f, 0.88f, 1.5f};
+  for (std::size_t index = 0; index < kTracePhaseDimensions; ++index) {
+    const float phase_logit =
+        (static_cast<float>(lca_buffer.phase_out[index]) / 8128.0f)
+        * 3.0f + 1.0f;
+    const float phase_sigmoid =
+        1.0f / (1.0f + std::exp(-phase_logit));
+    const float phase_value = 0.1f + 0.9f * phase_sigmoid;
+    const float channel_scale =
+        (0.5f + 0.5f * phase_value) * scale_multipliers[index];
+
+    deep_path.phase_preact[index] = lca_buffer.phase_out[index];
+    deep_path.phase_logit_f32_bits[index] = TraceFloatBits(phase_logit);
+    deep_path.phase_sigmoid_f32_bits[index] = TraceFloatBits(phase_sigmoid);
+    deep_path.phase_value_f32_bits[index] = TraceFloatBits(phase_value);
+    deep_path.channel_scale_f32_bits[index] = TraceFloatBits(channel_scale);
+    channel_scales[index] = channel_scale;
+  }
+
+  selected_network->ac_sqr_0.Propagate(lca_buffer.fc_0_out,
+                                       lca_buffer.ac_sqr_0_out_temp);
+  std::copy_n(lca_buffer.ac_0_out, kTraceLcaQueryInputDimensions,
+              deep_path.main_raw.begin());
+  std::copy_n(lca_buffer.ac_sqr_0_out_temp,
+              kTraceLcaQueryInputDimensions,
+              deep_path.main_squared.begin());
+
+  for (std::size_t index = 0; index < kTraceCrossInputDimensions; ++index) {
+    const std::uint8_t main_squared = lca_buffer.ac_sqr_0_out_temp[index];
+    const std::uint8_t diff = lca_buffer.diff_ac_out[index];
+    const std::uint8_t main_raw = lca_buffer.ac_0_out[index];
+    const std::uint8_t abs = lca_buffer.abs_ac_out[index];
+    const std::uint8_t product_diff = static_cast<std::uint8_t>(
+        (main_squared * diff) / 127);
+    const std::uint8_t product_abs = static_cast<std::uint8_t>(
+        (main_raw * abs) / 127);
+
+    deep_path.cross_main_squared[index] = main_squared;
+    deep_path.cross_diff[index] = diff;
+    deep_path.cross_main_raw[index] = main_raw;
+    deep_path.cross_abs[index] = abs;
+    deep_path.cross_product_diff[index] = product_diff;
+    deep_path.cross_product_abs[index] = product_abs;
+    lca_buffer.cross_cat[index] = product_diff;
+    lca_buffer.cross_cat[index + kTraceCrossInputDimensions] = product_abs;
+  }
+  std::copy_n(lca_buffer.cross_cat, 2 * kTraceCrossInputDimensions,
+              deep_path.cross_input.begin());
+  selected_network->fc_cross.Propagate(lca_buffer.cross_cat,
+                                       lca_buffer.cross_fc_out);
+  selected_network->ac_cross.Propagate(lca_buffer.cross_fc_out,
+                                       lca_buffer.cross_feat);
+  std::copy_n(lca_buffer.cross_fc_out, kTraceFmHiddenDimensions,
+              deep_path.cross_preact.begin());
+  std::copy_n(lca_buffer.cross_feat, kTraceFmHiddenDimensions,
+              deep_path.cross_output.begin());
+
+  for (std::size_t index = 0; index < kTraceLcaQueryInputDimensions; ++index) {
+    lca_buffer.l2_input[index] = static_cast<std::uint8_t>(
+        std::clamp<int>(lca_buffer.ac_sqr_0_out_temp[index]
+                            * channel_scales[0],
+                        0, 127));
+    lca_buffer.l2_input[index + kTraceLcaQueryInputDimensions] =
+        static_cast<std::uint8_t>(
+            std::clamp<int>(lca_buffer.ac_0_out[index]
+                                * channel_scales[1],
+                            0, 127));
+  }
+  for (std::size_t index = 0; index < kTraceFmHiddenDimensions; ++index) {
+    lca_buffer.l2_input[62 + index] = static_cast<std::uint8_t>(
+        std::clamp<int>(lca_buffer.diff_ac_out[index] * channel_scales[2],
+                        0, 127));
+    lca_buffer.l2_input[94 + index] = static_cast<std::uint8_t>(
+        std::clamp<int>(lca_buffer.abs_ac_out[index] * channel_scales[3],
+                        0, 127));
+    lca_buffer.l2_input[126 + index] = static_cast<std::uint8_t>(
+        std::clamp<int>(lca_buffer.abs_sqr_out[index] * channel_scales[4],
+                        0, 127));
+    lca_buffer.l2_input[158 + index] = static_cast<std::uint8_t>(
+        std::clamp<int>(lca_buffer.cross_feat[index] * channel_scales[5],
+                        0, 127));
+  }
+  std::memset(lca_buffer.l2_input + 190, 0, 2);
+  std::copy_n(lca_buffer.l2_input, kTraceBucketInputDimensions,
+              deep_path.fc1_input.begin());
+
+  selected_network->fc_1.Propagate(lca_buffer.l2_input,
+                                   lca_buffer.fc_1_out);
+  selected_network->ac_1.Propagate(lca_buffer.fc_1_out,
+                                   lca_buffer.ac_1_out);
+  selected_network->fc_2.Propagate(lca_buffer.ac_1_out,
+                                   lca_buffer.fc_2_out);
+  std::copy_n(lca_buffer.fc_1_out, kTraceBucketHiddenDimensions,
+              deep_path.fc1_preact.begin());
+  std::copy_n(lca_buffer.ac_1_out, kTraceBucketHiddenDimensions,
+              deep_path.fc1_output.begin());
+  deep_path.fc2_preact[0] = lca_buffer.fc_2_out[0];
+
+  auto& final_path = snapshot->final_path;
+  final_path.selected_bucket = deep_path.selected_bucket;
+  final_path.material_bucket = snapshot->pair_bucket;
+  final_path.deep_output[0] = lca_buffer.fc_2_out[0];
+  final_path.bypass_input[0] = lca_buffer.fc_0_out[31];
+  final_path.bypass_preact[0] = lca_buffer.fc_0_out[31];
+  final_path.bypass_scaled_numerator[0] =
+      static_cast<std::int32_t>(lca_buffer.fc_0_out[31] * (600 * 16));
+  final_path.bypass_output[0] =
+      final_path.bypass_scaled_numerator[0] / (127 * 64);
+  final_path.alpha_q14[0] = selected_network->bucket_blend_alpha;
+  final_path.inv_alpha_q14[0] = 16384 - final_path.alpha_q14[0];
+  final_path.deep_term[0] =
+      static_cast<std::int64_t>(final_path.deep_output[0])
+      * final_path.alpha_q14[0];
+  final_path.bypass_term[0] =
+      static_cast<std::int64_t>(final_path.bypass_output[0])
+      * final_path.inv_alpha_q14[0];
+  final_path.blend_numerator[0] =
+      final_path.deep_term[0] + final_path.bypass_term[0];
+  final_path.blend_output[0] = static_cast<std::int32_t>(
+      final_path.blend_numerator[0] / 16384);
+  final_path.network_output[0] = final_path.blend_output[0];
+  final_path.fv_scale[0] = FV_SCALE;
+  final_path.eval_before_clamp[0] =
+      final_path.network_output[0] / final_path.fv_scale[0];
+  final_path.value_max_eval[0] = VALUE_MAX_EVAL;
+  final_path.eval_after_clamp[0] = Math::clamp(
+      final_path.eval_before_clamp[0], -VALUE_MAX_EVAL, VALUE_MAX_EVAL);
+
+  feature_transformer->TracePairWeights(
+      snapshot->pair_bucket, snapshot->pair_weight_mul.data(),
+      snapshot->pair_weight_diff.data(), snapshot->pair_weight_sum.data());
+
+  const auto& accumulator = trace_position.state()->accumulator;
+  for (const Color perspective : {BLACK, WHITE}) {
+    auto& output = snapshot->perspective[perspective];
+    std::copy_n(accumulator.accumulation[perspective][0],
+                kTransformedFeatureDimensions,
+                output.main_accumulator.begin());
+
+    feature_transformer->TraceMainPair(
+        trace_position, perspective, snapshot->pair_bucket,
+        output.main_pair.a.data(), output.main_pair.b.data(),
+        output.main_pair.mul_term.data(),
+        output.main_pair.diff_sq_term.data(),
+        output.main_pair.sum_term.data(),
+        output.main_pair.mixed_numerator.data());
+
+    const std::size_t transformed_offset =
+        perspective == snapshot->side_to_move ? 0 : kTracePairDimensions;
+    std::copy_n(transformed_output.begin() + transformed_offset,
+                kTracePairDimensions, output.main_pair.output.begin());
+
+    const auto& factors = accumulator.factors[perspective];
+    std::copy_n(factors.halfka.sum_v, kTraceFmDimensions,
+                output.fm_accumulator.halfka_sum_v.begin());
+    std::copy_n(factors.halfka.sum_v2, kTraceFmDimensions,
+                output.fm_accumulator.halfka_sum_v2.begin());
+    std::copy_n(factors.ksdg.sum_v, kTraceFmDimensions,
+                output.fm_accumulator.ksdg_sum_v.begin());
+    std::copy_n(factors.ksdg.sum_v2, kTraceFmDimensions,
+                output.fm_accumulator.ksdg_sum_v2.begin());
+
+    for (std::size_t index = 0; index < kTraceFmDimensions; ++index) {
+      const auto interaction = [](const std::int64_t sum_v,
+                                  const std::int64_t sum_v2) {
+        return (sum_v * sum_v - sum_v2) / 2;
+      };
+      output.fm_interaction.ih[index] =
+          interaction(factors.halfka.sum_v[index],
+                      factors.halfka.sum_v2[index]);
+      output.fm_interaction.ik[index] =
+          interaction(factors.ksdg.sum_v[index], factors.ksdg.sum_v2[index]);
+      output.fm_interaction.sh[index] = factors.halfka.sum_v[index];
+      output.fm_interaction.sk[index] = factors.ksdg.sum_v[index];
+    }
+  }
+
+  const auto& us = snapshot->perspective[snapshot->side_to_move].fm_interaction;
+  const auto& them = snapshot->perspective[~snapshot->side_to_move].fm_interaction;
+  for (std::size_t index = 0; index < kTraceFmDimensions; ++index) {
+    snapshot->raw_diff.ih[index] = us.ih[index] - them.ih[index];
+    snapshot->raw_diff.ik[index] = us.ik[index] - them.ik[index];
+    snapshot->raw_diff.sh[index] = us.sh[index] - them.sh[index];
+    snapshot->raw_diff.sk[index] = us.sk[index] - them.sk[index];
+
+    // Current C++ Abs path is the side-to-move perspective only.
+    snapshot->raw_abs.ih[index] = us.ih[index];
+    snapshot->raw_abs.ik[index] = us.ik[index];
+    snapshot->raw_abs.sh[index] = us.sh[index];
+    snapshot->raw_abs.sk[index] = us.sk[index];
+  }
+
+  return true;
+}
+
+template <typename Container>
+void WriteTraceArray(std::ostream& output, const std::string& name,
+                     const char* const type_name, const Container& values) {
+  output << name << '\t' << type_name << '\t' << values.size();
+  for (const auto value : values)
+    output << '\t' << static_cast<std::int64_t>(value);
+  output << '\n';
+}
+
+void WriteTraceString(std::ostream& output, const char* const name,
+                      const std::string& value) {
+  output << name << "\tstr\t1\t" << value << '\n';
+}
+
+void WriteTraceScalar(std::ostream& output, const std::string& name,
+                      const char* const type_name, const std::uint64_t value) {
+  output << name << '\t' << type_name << "\t1\t" << value << '\n';
+}
+
+void WriteTraceHash(std::ostream& output, const std::string& name,
+                    const std::uint64_t value) {
+  const auto flags = output.flags();
+  const auto fill = output.fill();
+  output << name << "\tu64_hex\t1\t0x" << std::hex << std::setw(16)
+         << std::setfill('0') << value << '\n';
+  output.flags(flags);
+  output.fill(fill);
+}
+
+void WriteFmAccumulator(std::ostream& output, const std::string& prefix,
+                        const TraceFmAccumulator& values) {
+  WriteTraceArray(output, prefix + ".halfka.sum_v", "i64", values.halfka_sum_v);
+  WriteTraceArray(output, prefix + ".halfka.sum_v2", "i64", values.halfka_sum_v2);
+  WriteTraceArray(output, prefix + ".ksdg.sum_v", "i64", values.ksdg_sum_v);
+  WriteTraceArray(output, prefix + ".ksdg.sum_v2", "i64", values.ksdg_sum_v2);
+}
+
+void WriteFmInteraction(std::ostream& output, const std::string& prefix,
+                        const TraceFmInteraction& values) {
+  WriteTraceArray(output, prefix + ".ih", "i64", values.ih);
+  WriteTraceArray(output, prefix + ".ik", "i64", values.ik);
+  WriteTraceArray(output, prefix + ".sh", "i64", values.sh);
+  WriteTraceArray(output, prefix + ".sk", "i64", values.sk);
+}
+
+void WriteMainPair(std::ostream& output, const std::string& prefix,
+                   const TraceMainPair& values) {
+  WriteTraceArray(output, prefix + ".a", "i32", values.a);
+  WriteTraceArray(output, prefix + ".b", "i32", values.b);
+  WriteTraceArray(output, prefix + ".mul_term", "i32", values.mul_term);
+  WriteTraceArray(output, prefix + ".diff_sq_term", "i32",
+                  values.diff_sq_term);
+  WriteTraceArray(output, prefix + ".sum_term", "i32", values.sum_term);
+  WriteTraceArray(output, prefix + ".mixed_numerator", "i32",
+                  values.mixed_numerator);
+  WriteTraceArray(output, prefix + ".output", "u8", values.output);
+}
+
+bool WriteNnueTrace(const NnueTraceSnapshot& snapshot,
+                    const std::string& output_file,
+                    std::string* const error_message) {
+  std::ofstream output(output_file, std::ios::binary);
+  if (!output) {
+    *error_message = "failed to open trace output file: " + output_file;
+    return false;
+  }
+
+  output << "NNUE_TRACE_V1\n";
+  WriteTraceString(output, "meta.sfen", snapshot.sfen);
+  WriteTraceString(output, "meta.side_to_move",
+                   TracePerspectiveName(snapshot.side_to_move));
+  WriteTraceString(output, "meta.us_perspective",
+                   TracePerspectiveName(snapshot.side_to_move));
+  WriteTraceString(output, "meta.them_perspective",
+                   TracePerspectiveName(~snapshot.side_to_move));
+  WriteTraceString(output, "meta.pytorch.white_indices_perspective", "BLACK");
+  WriteTraceString(output, "meta.pytorch.black_indices_perspective", "WHITE");
+  WriteTraceString(output, "meta.pytorch.t_w_v_w_perspective", "BLACK");
+  WriteTraceString(output, "meta.pytorch.t_b_v_b_perspective", "WHITE");
+  WriteTraceString(output, "meta.raw_abs_source", "us_perspective_only");
+  WriteTraceString(output, "meta.feature_index_order", "sorted_ascending");
+  WriteTraceString(output, "meta.feature_hash_encoding",
+                   "fnv1a64_sorted_u32_little_endian");
+  WriteTraceString(output, "meta.scaled_layout",
+                   "ih[0:32],ik[32:64],sh[64:96],sk[96:128]");
+  WriteTraceScalar(output, "meta.refresh_trigger_count", "u64",
+                   kRefreshTriggers.size());
+  WriteTraceScalar(output, "meta.main_accumulator_trigger_index", "u64", 0);
+  WriteTraceScalar(output, "meta.main_accumulator_trigger_event", "u64",
+                   static_cast<std::uint64_t>(kRefreshTriggers[0]));
+  WriteTraceScalar(output, "pair.bucket_id", "u64", snapshot.pair_bucket);
+  WriteTraceString(output, "pair.bucket_source",
+                   "stack_index_for_nnue_material_value");
+  WriteTraceString(output, "pair.main.output_order", "us_then_them");
+  WriteTraceString(output, "router.input_layout",
+                   "abs_centered[0:128],diff[128:256],main_us[256:384]");
+  WriteTraceArray(output, "pair.weight.mul", "i16",
+                  snapshot.pair_weight_mul);
+  WriteTraceArray(output, "pair.weight.diff", "i16",
+                  snapshot.pair_weight_diff);
+  WriteTraceArray(output, "pair.weight.sum", "i16",
+                  snapshot.pair_weight_sum);
+
+  for (const Color perspective : {BLACK, WHITE}) {
+    const std::string perspective_name = TracePerspectiveName(perspective);
+    const auto& values = snapshot.perspective[perspective];
+    const std::string feature_prefix = "feature." + perspective_name;
+    const auto& indices = values.active_indices;
+    std::uint64_t index_sum = 0;
+    for (const IndexType index : indices)
+      index_sum += static_cast<std::uint64_t>(index);
+
+    WriteTraceScalar(output, feature_prefix + ".count", "u64", indices.size());
+    WriteTraceScalar(output, feature_prefix + ".sum", "u64", index_sum);
+    WriteTraceScalar(output, feature_prefix + ".min", "u32",
+                     indices.empty() ? 0 : indices.front());
+    WriteTraceScalar(output, feature_prefix + ".max", "u32",
+                     indices.empty() ? 0 : indices.back());
+    WriteTraceHash(output, feature_prefix + ".fnv1a64",
+                   Fnv1a64Indices(indices));
+    WriteTraceArray(output, feature_prefix + ".indices", "u32", indices);
+
+    WriteTraceArray(output, "ft.main." + perspective_name, "i16",
+                    values.main_accumulator);
+    WriteFmAccumulator(output, "fm.accumulator." + perspective_name,
+                       values.fm_accumulator);
+    WriteFmInteraction(output, "fm.interaction." + perspective_name,
+                       values.fm_interaction);
+    WriteMainPair(output, "pair.main." + perspective_name,
+                  values.main_pair);
+  }
+
+  WriteFmInteraction(output, "fm.raw_diff", snapshot.raw_diff);
+  WriteFmInteraction(output, "fm.raw_abs", snapshot.raw_abs);
+  WriteTraceArray(output, "fm.scaled_diff", "u8", snapshot.scaled_diff);
+  WriteTraceArray(output, "fm.scaled_abs", "u8", snapshot.scaled_abs);
+  WriteTraceArray(output, "router.input", "u8", snapshot.router.input);
+  WriteTraceArray(output, "router.logits", "i32", snapshot.router.logits);
+  WriteTraceScalar(output, "router.selected_bucket", "u64",
+                   snapshot.router.selected_bucket);
+  WriteTraceString(output, "fm.path.scope", "direct_fc_gate_before_lca");
+  WriteTraceString(output, "fm.path.diff_gate_target", "main_path");
+  WriteTraceScalar(output, "fm.path.selected_bucket", "u64",
+                   snapshot.fm_path.selected_bucket);
+  WriteTraceArray(output, "fm.path.diff.input", "u8",
+                  snapshot.fm_path.diff_input);
+  WriteTraceArray(output, "fm.path.abs.input", "u8",
+                  snapshot.fm_path.abs_input);
+  WriteTraceArray(output, "fm.path.diff.fc_preact", "i32",
+                  snapshot.fm_path.diff_fc_preact);
+  WriteTraceArray(output, "fm.path.abs.fc_preact", "i32",
+                  snapshot.fm_path.abs_fc_preact);
+  WriteTraceArray(output, "fm.path.diff.gate_preact", "i32",
+                  snapshot.fm_path.diff_gate_preact);
+  WriteTraceArray(output, "fm.path.diff.value_preact", "i32",
+                  snapshot.fm_path.diff_value_preact);
+  WriteTraceScalar(output, "fm.path.diff.rms_sum_sq_f32_bits", "u32",
+                   snapshot.fm_path.diff_rms_sum_sq_f32_bits);
+  WriteTraceScalar(output, "fm.path.diff.inv_rms_f32_bits", "u32",
+                   snapshot.fm_path.diff_inv_rms_f32_bits);
+  WriteTraceArray(output, "fm.path.diff.normalized_f32_bits", "u32",
+                  snapshot.fm_path.diff_normalized_f32_bits);
+  WriteTraceArray(output, "fm.path.diff.normalized_scaled_centered", "i32",
+                  snapshot.fm_path.diff_normalized_scaled_centered);
+  WriteTraceArray(output, "fm.path.diff.output_pre_lca", "u8",
+                  snapshot.fm_path.diff_output_pre_lca);
+  WriteTraceArray(output, "fm.path.diff.main_gate_q64", "i32",
+                  snapshot.fm_path.diff_main_gate_q64);
+  WriteTraceArray(output, "fm.path.diff.main_gate_multiplier_q128", "i32",
+                  snapshot.fm_path.diff_main_gate_multiplier_q128);
+  WriteTraceArray(output, "fm.path.abs.gate_preact", "i32",
+                  snapshot.fm_path.abs_gate_preact);
+  WriteTraceArray(output, "fm.path.abs.value_preact", "i32",
+                  snapshot.fm_path.abs_value_preact);
+  WriteTraceArray(output, "fm.path.abs.gate_sigmoid_f32_bits", "u32",
+                  snapshot.fm_path.abs_gate_sigmoid_f32_bits);
+  WriteTraceArray(output, "fm.path.abs.gated_value", "i32",
+                  snapshot.fm_path.abs_gated_value);
+  WriteTraceArray(output, "fm.path.abs.scaled_before_round_f32_bits",
+                  "u32",
+                  snapshot.fm_path.abs_scaled_before_round_f32_bits);
+  WriteTraceArray(output, "fm.path.abs.output", "u8",
+                  snapshot.fm_path.abs_output);
+  WriteTraceArray(output, "fm.path.abs.squared_output", "u8",
+                  snapshot.fm_path.abs_squared_output);
+  WriteTraceString(output, "lca.scope", "selected_bucket_before_cross");
+  WriteTraceScalar(output, "lca.selected_bucket", "u64",
+                   snapshot.lca.selected_bucket);
+  WriteTraceArray(output, "lca.main_fc_preact_before_gate", "i32",
+                  snapshot.lca.main_fc_preact_before_gate);
+  WriteTraceArray(output, "lca.main_fc_preact_after_gate", "i32",
+                  snapshot.lca.main_fc_preact_after_gate);
+  WriteTraceArray(output, "lca.query_input", "u8",
+                  snapshot.lca.query_input);
+  WriteTraceArray(output, "lca.fm_input", "u8", snapshot.lca.fm_input);
+  WriteTraceArray(output, "lca.query_preact", "i32",
+                  snapshot.lca.query_preact);
+  WriteTraceArray(output, "lca.key_preact", "i32",
+                  snapshot.lca.key_preact);
+  WriteTraceArray(output, "lca.value_preact", "i32",
+                  snapshot.lca.value_preact);
+  WriteTraceScalar(output, "lca.temperature_f32_bits", "u32",
+                   snapshot.lca.temperature_f32_bits);
+  WriteTraceScalar(output, "lca.dot_product_f32_bits", "u32",
+                   snapshot.lca.dot_product_f32_bits);
+  WriteTraceScalar(output, "lca.attention_logit_f32_bits", "u32",
+                   snapshot.lca.attention_logit_f32_bits);
+  WriteTraceScalar(output, "lca.attention_score_f32_bits", "u32",
+                   snapshot.lca.attention_score_f32_bits);
+  WriteTraceArray(output, "lca.value_clamped_f32_bits", "u32",
+                  snapshot.lca.value_clamped_f32_bits);
+  WriteTraceArray(output, "lca.correction_f32_bits", "u32",
+                  snapshot.lca.correction_f32_bits);
+  WriteTraceArray(output, "lca.output_post_lca_f32_bits", "u32",
+                  snapshot.lca.output_post_lca_f32_bits);
+  WriteTraceArray(output, "lca.output_post_lca", "u8",
+                  snapshot.lca.output_post_lca);
+  WriteTraceString(output, "deep.scope", "cross_through_fc2_preblend");
+  WriteTraceString(output, "deep.phase.bucket_source", "material_pair_bucket");
+  WriteTraceScalar(output, "deep.phase.bucket_id", "u64",
+                   snapshot.pair_bucket);
+  WriteTraceScalar(output, "deep.scale.activation", "u64", 127);
+  WriteTraceScalar(output, "deep.scale.hidden_preact", "u64", 8128);
+  WriteTraceScalar(output, "deep.scale.fc2_preact", "u64", 9600);
+  WriteTraceScalar(output, "deep.selected_bucket", "u64",
+                   snapshot.deep_path.selected_bucket);
+  WriteTraceArray(output, "deep.phase.input", "u8",
+                  snapshot.deep_path.phase_input);
+  WriteTraceArray(output, "deep.phase.preact", "i32",
+                  snapshot.deep_path.phase_preact);
+  WriteTraceArray(output, "deep.phase.logit_f32_bits", "u32",
+                  snapshot.deep_path.phase_logit_f32_bits);
+  WriteTraceArray(output, "deep.phase.sigmoid_f32_bits", "u32",
+                  snapshot.deep_path.phase_sigmoid_f32_bits);
+  WriteTraceArray(output, "deep.phase.value_f32_bits", "u32",
+                  snapshot.deep_path.phase_value_f32_bits);
+  WriteTraceArray(output, "deep.phase.channel_scale_f32_bits", "u32",
+                  snapshot.deep_path.channel_scale_f32_bits);
+  WriteTraceArray(output, "deep.main.raw", "u8",
+                  snapshot.deep_path.main_raw);
+  WriteTraceArray(output, "deep.main.squared", "u8",
+                  snapshot.deep_path.main_squared);
+  WriteTraceArray(output, "deep.cross.main_squared", "u8",
+                  snapshot.deep_path.cross_main_squared);
+  WriteTraceArray(output, "deep.cross.diff", "u8",
+                  snapshot.deep_path.cross_diff);
+  WriteTraceArray(output, "deep.cross.main_raw", "u8",
+                  snapshot.deep_path.cross_main_raw);
+  WriteTraceArray(output, "deep.cross.abs", "u8",
+                  snapshot.deep_path.cross_abs);
+  WriteTraceArray(output, "deep.cross.product_diff", "u8",
+                  snapshot.deep_path.cross_product_diff);
+  WriteTraceArray(output, "deep.cross.product_abs", "u8",
+                  snapshot.deep_path.cross_product_abs);
+  WriteTraceArray(output, "deep.cross.input", "u8",
+                  snapshot.deep_path.cross_input);
+  WriteTraceArray(output, "deep.cross.preact", "i32",
+                  snapshot.deep_path.cross_preact);
+  WriteTraceArray(output, "deep.cross.output", "u8",
+                  snapshot.deep_path.cross_output);
+  WriteTraceArray(output, "deep.fc1.input", "u8",
+                  snapshot.deep_path.fc1_input);
+  WriteTraceArray(output, "deep.fc1.preact", "i32",
+                  snapshot.deep_path.fc1_preact);
+  WriteTraceArray(output, "deep.fc1.output", "u8",
+                  snapshot.deep_path.fc1_output);
+  WriteTraceArray(output, "deep.fc2.preact", "i32",
+                  snapshot.deep_path.fc2_preact);
+  WriteTraceArray(output, "deep.fc2.output_preblend", "i32",
+                  snapshot.deep_path.fc2_preact);
+  WriteTraceString(output, "final.scope", "fc2_through_evaluate");
+  WriteTraceString(output, "final.score_perspective", "side_to_move");
+  WriteTraceString(output, "final.side_adjustment", "none_already_side_to_move");
+  WriteTraceString(output, "final.tempo", "none");
+  WriteTraceScalar(output, "final.selected_bucket", "u64",
+                   snapshot.final_path.selected_bucket);
+  WriteTraceScalar(output, "final.material_bucket", "u64",
+                   snapshot.final_path.material_bucket);
+  WriteTraceScalar(output, "final.scale.deep_output", "u64", 9600);
+  WriteTraceScalar(output, "final.scale.bypass_input", "u64", 8128);
+  WriteTraceScalar(output, "final.scale.bypass_output", "u64", 9600);
+  WriteTraceScalar(output, "final.scale.blend_alpha", "u64", 16384);
+  WriteTraceScalar(output, "final.scale.blend_numerator", "u64",
+                   UINT64_C(9600) * UINT64_C(16384));
+  WriteTraceScalar(output, "final.scale.network_output", "u64", 9600);
+  WriteTraceScalar(output, "final.scale.eval_value", "u64", 1);
+  WriteTraceScalar(output, "final.scale.pytorch_nnue2score", "u64", 600);
+  WriteTraceArray(output, "final.deep_output", "i32",
+                  snapshot.final_path.deep_output);
+  WriteTraceArray(output, "final.bypass.input", "i32",
+                  snapshot.final_path.bypass_input);
+  WriteTraceArray(output, "final.bypass.preact", "i32",
+                  snapshot.final_path.bypass_preact);
+  WriteTraceArray(output, "final.bypass.scaled_numerator", "i32",
+                  snapshot.final_path.bypass_scaled_numerator);
+  WriteTraceArray(output, "final.bypass.output", "i32",
+                  snapshot.final_path.bypass_output);
+  WriteTraceArray(output, "final.blend.parameter_raw", "i32",
+                  snapshot.final_path.alpha_q14);
+  WriteTraceArray(output, "final.blend.alpha_q14", "i32",
+                  snapshot.final_path.alpha_q14);
+  WriteTraceArray(output, "final.blend.inv_alpha_q14", "i32",
+                  snapshot.final_path.inv_alpha_q14);
+  WriteTraceArray(output, "final.blend.deep_term", "i64",
+                  snapshot.final_path.deep_term);
+  WriteTraceArray(output, "final.blend.bypass_term", "i64",
+                  snapshot.final_path.bypass_term);
+  WriteTraceArray(output, "final.blend.numerator", "i64",
+                  snapshot.final_path.blend_numerator);
+  WriteTraceArray(output, "final.blend.output", "i32",
+                  snapshot.final_path.blend_output);
+  WriteTraceArray(output, "final.network_output", "i32",
+                  snapshot.final_path.network_output);
+  WriteTraceArray(output, "final.fv_scale", "i32",
+                  snapshot.final_path.fv_scale);
+  WriteTraceArray(output, "final.eval_before_clamp", "i32",
+                  snapshot.final_path.eval_before_clamp);
+  WriteTraceArray(output, "final.value_max_eval", "i32",
+                  snapshot.final_path.value_max_eval);
+  WriteTraceArray(output, "final.eval_after_clamp", "i32",
+                  snapshot.final_path.eval_after_clamp);
+
+  if (!output) {
+    *error_message = "failed while writing trace output file: " + output_file;
+    return false;
+  }
+  return true;
+}
+
+void PrintNnueTraceSummary(const NnueTraceSnapshot& snapshot) {
+  std::cout << "NNUE trace" << std::endl
+            << "  SFEN              : " << snapshot.sfen << std::endl
+            << "  side to move / us : "
+            << TracePerspectiveName(snapshot.side_to_move) << std::endl
+            << "  them              : "
+            << TracePerspectiveName(~snapshot.side_to_move) << std::endl
+            << "  pair bucket       : " << snapshot.pair_bucket << std::endl
+            << "  router bucket     : " << snapshot.router.selected_bucket
+            << std::endl
+            << "  FM path bucket    : " << snapshot.fm_path.selected_bucket
+            << std::endl
+            << "  PyTorch white_indices / t_w / v_w = C++ BLACK" << std::endl
+            << "  PyTorch black_indices / t_b / v_b = C++ WHITE" << std::endl;
+
+  for (const Color perspective : {BLACK, WHITE}) {
+    const auto& indices = snapshot.perspective[perspective].active_indices;
+    std::uint64_t index_sum = 0;
+    for (const IndexType index : indices)
+      index_sum += static_cast<std::uint64_t>(index);
+
+    const auto flags = std::cout.flags();
+    const auto fill = std::cout.fill();
+    std::cout << "  " << TracePerspectiveName(perspective)
+              << " active features" << std::endl
+              << "    count : " << indices.size() << std::endl
+              << "    sum   : " << index_sum << std::endl
+              << "    min   : " << (indices.empty() ? 0 : indices.front())
+              << std::endl
+              << "    max   : " << (indices.empty() ? 0 : indices.back())
+              << std::endl
+              << "    FNV-1a: 0x" << std::hex << std::setw(16)
+              << std::setfill('0') << Fnv1a64Indices(indices) << std::endl;
+    std::cout.flags(flags);
+    std::cout.fill(fill);
+  }
+}
+
+void TraceNnue(std::istream& stream, const bool write_full_trace) {
+  std::string output_file;
+  if (write_full_trace)
+    stream >> std::quoted(output_file);
+
+  std::string sfen;
+  std::getline(stream >> std::ws, sfen);
+  if ((write_full_trace && output_file.empty()) || sfen.empty()) {
+    std::cout << "error: "
+              << (write_full_trace
+                      ? "usage: test nnue trace_full <output file> <SFEN>"
+                      : "usage: test nnue trace <SFEN>")
+              << std::endl;
+    return;
+  }
+
+  NnueTraceSnapshot snapshot;
+  std::string error_message;
+  if (!MakeNnueTraceSnapshot(sfen, &snapshot, &error_message)) {
+    std::cout << "error: " << error_message << std::endl;
+    return;
+  }
+
+  PrintNnueTraceSummary(snapshot);
+  if (write_full_trace) {
+    if (!WriteNnueTrace(snapshot, output_file, &error_message)) {
+      std::cout << "error: " << error_message << std::endl;
+      return;
+    }
+    std::cout << "  full trace written: " << output_file << std::endl;
+  }
+}
+
+#endif  // defined(ENABLE_NNUE_TRACE)
+
 // 評価関数の構造を表す文字列を出力する
 void PrintInfo(std::istream& stream) {
   std::cout << "network architecture: " << GetArchitectureString() << std::endl;
@@ -585,12 +1662,22 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     PrintInfo(stream);
   } else if (sub_command == "accuracy") {
     TestMoveAccuracy(engine, stream);
+#if defined(ENABLE_NNUE_TRACE)
+  } else if (sub_command == "trace") {
+    TraceNnue(stream, false);
+  } else if (sub_command == "trace_full") {
+    TraceNnue(stream, true);
+#endif
   } else {
     std::cout << "usage:" << std::endl;
     std::cout << " test nnue test_features" << std::endl;
     std::cout << " test nnue test_accumulator" << std::endl;
     std::cout << " test nnue accuracy <sfenpack file>" << std::endl;
     std::cout << " test nnue info [path/to/" << kFileName << "...]" << std::endl;
+#if defined(ENABLE_NNUE_TRACE)
+    std::cout << " test nnue trace <SFEN>" << std::endl;
+    std::cout << " test nnue trace_full <output file> <SFEN>" << std::endl;
+#endif
   }
 }
 

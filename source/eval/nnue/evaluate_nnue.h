@@ -30,6 +30,11 @@ namespace Eval::NNUE {
 	// 入力特徴量変換器
 	extern LargePagePtr<FeatureTransformer> feature_transformer;
 
+#if defined(ENABLE_NNUE_TRACE)
+	// Trace-only access to the already loaded Router parameters.
+	extern AlignedPtr<Router> router;
+#endif
+
 	// 評価関数
 #if defined(SFNNwoPSQT)
 	constexpr int kLayerStacks = LayerStacks;

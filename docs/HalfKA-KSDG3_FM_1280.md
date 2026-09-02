@@ -147,13 +147,40 @@
   # pt作成
   python serialize.py --ft_compression none C:\yyy\nn.nnue C:\yyy\nn.pt --features="HalfKA_KSDG3"
 
+  # 評価値計算のC++/pytorchのトレース比較用
+  python trace_nnue.py --checkpoint logs\lightning_logs\version_xxx\xxx.ckpt --trace trace.tsv
+
   # tensorboard起動
   tensorboard --logdir=lightning_logs/
   ```
 
 - ビルドコマンドの例（YaneuraOu）
   ```
+  # 通常
   make -j8 tournament TARGET_CPU=AVX2 COMPILER=clang++ YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE_SFNNwoP1536 EXTRA_CPPFLAGS="-DUSE_ELEMENT_WISE_MULTIPLY"
+
+  # 評価値計算のC++/pytorchのトレース比較用
+  make -j8 tournament TARGET_CPU=AVX2 COMPILER=clang++ YANEURAOU_EDITION=YANEURAOU_ENGINE_NNUE_SFNNwoP1536 EXTRA_CPPFLAGS="-DUSE_ELEMENT_WISE_MULTIPLY -DENABLE_NNUE_TRACE"
+  ```
+
+- 追加コマンドの例（YaneuraOu）（isreadyの後に実行）
+  ```
+  # 評価関数の基本情報を出力
+  test nnue info
+
+  # 特徴量の差分計算のテスト
+  test nnue test_features
+
+  # Accumulatorの差分計算のテスト
+  test nnue test_accumulator
+
+  # move accuracyの測定
+  test nnue accuracy xxx.bin
+
+  # 評価値計算のC++/pytorchのトレース比較用
+  test nnue trace_full trace.tsv l5knl/3g5/p1n1pgs2/1rpp3pp/Pp2S1p2/2S5P/1P1PP1N2/1KG2G3/LN5+rL b BSPb4p 61
+
+  test nnue trace l5knl/3g5/p1n1pgs2/1rpp3pp/Pp2S1p2/2S5P/1P1PP1N2/1KG2G3/LN5+rL b BSPb4p 61
   ```
 
 - その他
