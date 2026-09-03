@@ -366,28 +366,10 @@ class FeatureTransformer {
 		// 内積和 ΣΣ<vi, vj>xi xj = ( (Σvx)^2 - Σ(vx)^2 ) / 2  を計算します。
 		const Color us = pos.side_to_move();
 		const Color them = ~us;
-		
-		for (IndexType j = 0; j < 32; ++j)
-		{
-			// 2次相互作用項の公式: (Σv)^2 - Σ(v^2)
-			auto get_inter = [](int64_t v, int64_t v2) { return (v * v - v2) / 2; };
 
-			// 各特徴量（HalfKA, KSDG）の1次和と2次項を個別に抽出
-			// ih = HalfKA 2次項
-			// ik = KSDG3  2次項
-			// sh = HalfKA 1次項
-			// sk = KSDG3  1次項
-
-			int64_t ih_u = get_inter(factors[us].halfka.sum_v[j], factors[us].halfka.sum_v2[j]);
-			int64_t ik_u = get_inter(factors[us].ksdg.sum_v[j], factors[us].ksdg.sum_v2[j]);
-			int64_t sh_u = factors[us].halfka.sum_v[j];
-			int64_t sk_u = factors[us].ksdg.sum_v[j];
-
-			int64_t ih_t = get_inter(factors[them].halfka.sum_v[j], factors[them].halfka.sum_v2[j]);
-			int64_t ik_t = get_inter(factors[them].ksdg.sum_v[j], factors[them].ksdg.sum_v2[j]);
-			int64_t sh_t = factors[them].halfka.sum_v[j];
-			int64_t sk_t = factors[them].ksdg.sum_v[j];
-
+		auto write_fm_outputs = [&](IndexType j, int64_t ih_u, int64_t ik_u,
+			int64_t sh_u, int64_t sk_u, int64_t ih_t, int64_t ik_t,
+			int64_t sh_t, int64_t sk_t) {
 			// 差分(Diff)と合計(Abs)の両方のパスを生成し、後段のネットワークに渡す
 			// スケーリングとビットシフトにより 0-127 の範囲へ収める
 
@@ -402,7 +384,79 @@ class FeatureTransformer {
 			abs_output [32 + j] = ToOutputRange((ik_u * FMScale6) >> 37); // ik(2次)和
 			abs_output [64 + j] = ToOutputRange((sh_u * FMScale7) >> 22); // sh(1次)和
 			abs_output [96 + j] = ToOutputRange((sk_u * FMScale8) >> 22); // sk(1次)和
+		};
+
+#if defined(USE_AVX2)
+		static_assert(kFactorDimensions == 32,
+			"AVX2 FM interaction expects 32 factor dimensions");
+		const __m256i zero64 = _mm256_setzero_si256();
+		const __m256i one64 = _mm256_set1_epi64x(1);
+		auto get_inter4 = [&](const int64_t* sum_v, const int64_t* sum_v2,
+			IndexType offset) {
+			const __m256i v = _mm256_loadu_si256(
+				reinterpret_cast<const __m256i*>(sum_v + offset));
+			const __m256i v2 = _mm256_loadu_si256(
+				reinterpret_cast<const __m256i*>(sum_v2 + offset));
+			// HalfKA has at most 40 active int16 factors and KSDG3 at most 24,
+			// so every sum_v fits in signed 32 bits. _mm256_mul_epi32 then
+			// produces four exact signed 64-bit squares from the low dword of
+			// each 64-bit lane.
+			const __m256i numerator =
+				_mm256_sub_epi64(_mm256_mul_epi32(v, v), v2);
+
+			// C++ signed division by two truncates toward zero. Emulate it for
+			// all signed inputs instead of relying only on the mathematically
+			// even FM numerator.
+			const __m256i negative = _mm256_cmpgt_epi64(zero64, numerator);
+			const __m256i arithmetic_half = _mm256_or_si256(
+				_mm256_srli_epi64(numerator, 1),
+				_mm256_slli_epi64(negative, 63));
+			const __m256i negative_odd_correction = _mm256_and_si256(
+				_mm256_and_si256(negative, numerator), one64);
+			return _mm256_add_epi64(arithmetic_half, negative_odd_correction);
+		};
+
+		for (IndexType j = 0; j < kFactorDimensions; j += 4) {
+			alignas(32) int64_t interactions[4][4];
+			_mm256_store_si256(reinterpret_cast<__m256i*>(interactions[0]),
+				get_inter4(factors[us].halfka.sum_v,
+					factors[us].halfka.sum_v2, j));
+			_mm256_store_si256(reinterpret_cast<__m256i*>(interactions[1]),
+				get_inter4(factors[us].ksdg.sum_v,
+					factors[us].ksdg.sum_v2, j));
+			_mm256_store_si256(reinterpret_cast<__m256i*>(interactions[2]),
+				get_inter4(factors[them].halfka.sum_v,
+					factors[them].halfka.sum_v2, j));
+			_mm256_store_si256(reinterpret_cast<__m256i*>(interactions[3]),
+				get_inter4(factors[them].ksdg.sum_v,
+					factors[them].ksdg.sum_v2, j));
+
+			for (IndexType lane = 0; lane < 4; ++lane) {
+				const IndexType index = j + lane;
+				write_fm_outputs(
+					index,
+					interactions[0][lane], interactions[1][lane],
+					factors[us].halfka.sum_v[index],
+					factors[us].ksdg.sum_v[index],
+					interactions[2][lane], interactions[3][lane],
+					factors[them].halfka.sum_v[index],
+					factors[them].ksdg.sum_v[index]);
+			}
 		}
+#else
+		for (IndexType j = 0; j < kFactorDimensions; ++j) {
+			// 2次相互作用項の公式: (Σv)^2 - Σ(v^2)
+			auto get_inter = [](int64_t v, int64_t v2) { return (v * v - v2) / 2; };
+			write_fm_outputs(
+				j,
+				get_inter(factors[us].halfka.sum_v[j], factors[us].halfka.sum_v2[j]),
+				get_inter(factors[us].ksdg.sum_v[j], factors[us].ksdg.sum_v2[j]),
+				factors[us].halfka.sum_v[j], factors[us].ksdg.sum_v[j],
+				get_inter(factors[them].halfka.sum_v[j], factors[them].halfka.sum_v2[j]),
+				get_inter(factors[them].ksdg.sum_v[j], factors[them].ksdg.sum_v2[j]),
+				factors[them].halfka.sum_v[j], factors[them].ksdg.sum_v[j]);
+		}
+#endif
 	}
 
 #if defined(ENABLE_NNUE_TRACE)
