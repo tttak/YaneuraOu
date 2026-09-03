@@ -115,6 +115,42 @@ struct Network {
 		return static_cast<int32_t>(value * sig);
 	}
 
+	template<IndexType Dimensions>
+	static inline void AssembleL2Channel(const std::uint8_t* input,
+		std::uint8_t* output, const float scale) {
+#if defined(USE_AVX2)
+		constexpr IndexType kSimdDimensions = (Dimensions / 8) * 8;
+		const __m256 scale_vector = _mm256_set1_ps(scale);
+		const __m256i zero = _mm256_setzero_si256();
+		const __m256i maximum = _mm256_set1_epi32(127);
+
+		for (IndexType i = 0; i < kSimdDimensions; i += 8) {
+			const __m128i input_bytes = _mm_loadl_epi64(
+				reinterpret_cast<const __m128i*>(input + i));
+			const __m256i input_int32 = _mm256_cvtepu8_epi32(input_bytes);
+			const __m256 scaled = _mm256_mul_ps(
+				_mm256_cvtepi32_ps(input_int32), scale_vector);
+			const __m256i truncated = _mm256_cvttps_epi32(scaled);
+			const __m256i clamped = _mm256_min_epi32(
+				_mm256_max_epi32(truncated, zero), maximum);
+
+			const __m128i packed16 = _mm_packus_epi32(
+				_mm256_castsi256_si128(clamped),
+				_mm256_extracti128_si256(clamped, 1));
+			const __m128i packed8 = _mm_packus_epi16(
+				packed16, _mm_setzero_si128());
+			_mm_storel_epi64(reinterpret_cast<__m128i*>(output + i), packed8);
+		}
+#else
+		constexpr IndexType kSimdDimensions = 0;
+#endif
+
+		for (IndexType i = kSimdDimensions; i < Dimensions; ++i) {
+			output[i] = static_cast<std::uint8_t>(
+				std::clamp<int>(input[i] * scale, 0, 127));
+		}
+	}
+
 	struct alignas(kCacheLineSize) Buffer {
 		// 各レイヤーの中間出力を保持するバッファ
 		alignas(kCacheLineSize) typename decltype(fc_0)::OutputBuffer fc_0_out;
@@ -294,16 +330,12 @@ struct Network {
 		// --- 6. L2 Input Assembly: 深層評価パスへの入力構築 (192次元) ---
 		// 各チャネルを Phase Gate で得たスケールで調整しつつ統合
 		// [0:30] MainSqr, [31:61] MainRaw, [62:93] Diff, [94:125] AbsRaw, [126:157] AbsSqr, [158:189] Cross, [190:191] Pad
-		for (int j = 0; j < 31; ++j) {
-			buf.l2_input[     j] = static_cast<uint8_t>(std::clamp<int>(buf.ac_sqr_0_out_temp[j] * main_sqr_scale, 0, 127));
-			buf.l2_input[31 + j] = static_cast<uint8_t>(std::clamp<int>(buf.ac_0_out[j] * main_raw_scale, 0, 127));
-		}
-		for (int j = 0; j < 32; ++j) {
-			buf.l2_input[ 62 + j] = static_cast<uint8_t>(std::clamp<int>(buf.diff_ac_out[j] * diff_scale, 0, 127));
-			buf.l2_input[ 94 + j] = static_cast<uint8_t>(std::clamp<int>(buf.abs_ac_out[j] * abs_raw_scale, 0, 127));
-			buf.l2_input[126 + j] = static_cast<uint8_t>(std::clamp<int>(buf.abs_sqr_out[j] * abs_sqr_scale, 0, 127));
-			buf.l2_input[158 + j] = static_cast<uint8_t>(std::clamp<int>(buf.cross_feat[j] * cross_scale, 0, 127));
-		}
+		AssembleL2Channel<31>(buf.ac_sqr_0_out_temp, &buf.l2_input[0], main_sqr_scale);
+		AssembleL2Channel<31>(buf.ac_0_out, &buf.l2_input[31], main_raw_scale);
+		AssembleL2Channel<32>(buf.diff_ac_out, &buf.l2_input[62], diff_scale);
+		AssembleL2Channel<32>(buf.abs_ac_out, &buf.l2_input[94], abs_raw_scale);
+		AssembleL2Channel<32>(buf.abs_sqr_out, &buf.l2_input[126], abs_sqr_scale);
+		AssembleL2Channel<32>(buf.cross_feat, &buf.l2_input[158], cross_scale);
 		std::memset(buf.l2_input + 190, 0, 2);
 
 
