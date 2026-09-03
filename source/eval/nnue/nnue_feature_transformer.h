@@ -593,6 +593,7 @@ class FeatureTransformer {
 			bool                reset[2];
 			RawFeatures::AppendChangedIndices(pos, kRefreshTriggers[i], removed_indices, added_indices, reset);
 			for (Color perspective : {BLACK, WHITE}) {
+				bool fused_main_update = false;
 #if defined(VECTOR)
 #if defined(USE_AVX512)
 				constexpr IndexType kNumChunks = kHalfDimensions / kSimdWidth;
@@ -619,18 +620,52 @@ class FeatureTransformer {
 						std::memcpy(&accumulator.factors[perspective], &prev_accumulator.factors[perspective], sizeof(accumulator.factors[perspective]));
 					}
 
-					for (const auto index : removed_indices[perspective]) {
-						const IndexType offset = kHalfDimensions * index;
+					// Fuse the common one-remove/one-add Main FT update so each
+					// accumulator chunk is loaded and stored only once. FM updates
+					// remain in the existing removed/added loops below.
+					if (removed_indices[perspective].size() == 1
+						&& added_indices[perspective].size() == 1) {
+						const IndexType removed_offset =
+							kHalfDimensions * removed_indices[perspective][0];
+						const IndexType added_offset =
+							kHalfDimensions * added_indices[perspective][0];
 #if defined(VECTOR)
-						auto column = reinterpret_cast<const vec_t*>(&weights_[offset]);
+						auto removed_column =
+							reinterpret_cast<const vec_t*>(&weights_[removed_offset]);
+						auto added_column =
+							reinterpret_cast<const vec_t*>(&weights_[added_offset]);
 						for (IndexType j = 0; j < kNumChunks; ++j) {
-							accumulation[j] = vec_sub_16(accumulation[j], column[j]);
+							const vec_t after_remove =
+								vec_sub_16(accumulation[j], removed_column[j]);
+							accumulation[j] = vec_add_16(after_remove, added_column[j]);
 						}
 #else
 						for (IndexType j = 0; j < kHalfDimensions; ++j) {
-							accumulator.accumulation[perspective][i][j] -= weights_[offset + j];
+							BiasType after_remove = static_cast<BiasType>(
+								accumulator.accumulation[perspective][i][j]
+								- weights_[removed_offset + j]);
+							accumulator.accumulation[perspective][i][j] =
+								static_cast<BiasType>(after_remove
+									+ weights_[added_offset + j]);
 						}
 #endif
+						fused_main_update = true;
+					}
+
+					for (const auto index : removed_indices[perspective]) {
+						if (!fused_main_update) {
+							const IndexType offset = kHalfDimensions * index;
+#if defined(VECTOR)
+							auto column = reinterpret_cast<const vec_t*>(&weights_[offset]);
+							for (IndexType j = 0; j < kNumChunks; ++j) {
+								accumulation[j] = vec_sub_16(accumulation[j], column[j]);
+							}
+#else
+							for (IndexType j = 0; j < kHalfDimensions; ++j) {
+								accumulator.accumulation[perspective][i][j] -= weights_[offset + j];
+							}
+#endif
+						}
 
 						// FM項の減算
 						if (i == 0) {
@@ -650,17 +685,19 @@ class FeatureTransformer {
 					// Difference calculation for features that changed from 0 to 1
 					// 0から1に変化した特徴量に関する差分計算
 					for (const auto index : added_indices[perspective]) {
-						const IndexType offset = kHalfDimensions * index;
+						if (!fused_main_update) {
+							const IndexType offset = kHalfDimensions * index;
 #if defined(VECTOR)
-						auto column = reinterpret_cast<const vec_t*>(&weights_[offset]);
-						for (IndexType j = 0; j < kNumChunks; ++j) {
-							accumulation[j] = vec_add_16(accumulation[j], column[j]);
-						}
+							auto column = reinterpret_cast<const vec_t*>(&weights_[offset]);
+							for (IndexType j = 0; j < kNumChunks; ++j) {
+								accumulation[j] = vec_add_16(accumulation[j], column[j]);
+							}
 #else
-						for (IndexType j = 0; j < kHalfDimensions; ++j) {
-							accumulator.accumulation[perspective][i][j] += weights_[offset + j];
-						}
+							for (IndexType j = 0; j < kHalfDimensions; ++j) {
+								accumulator.accumulation[perspective][i][j] += weights_[offset + j];
+							}
 #endif
+						}
 
 						// FM項の加算
 						if (i == 0) {

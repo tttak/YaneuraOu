@@ -892,6 +892,8 @@ void TestFeatureTransformerBenchmark(const std::uint64_t repeat_count) {
             << percentage(statistics.one_removed_one_added,
                           statistics.changed_non_reset_samples)
             << "% of changed non-reset)" << std::endl
+			<< "  Main fused path uses        : "
+			<< statistics.one_removed_one_added << std::endl
             << "  HalfKA removed / added      : "
             << statistics.halfka_removed << " / " << statistics.halfka_added
             << std::endl
