@@ -282,7 +282,7 @@ class AffineTransformExplicit {
                 static_assert(RequiredOutputs > 0);
                 static_assert(RequiredOutputs <= kOutputDimensions);
 
-#if defined(USE_AVX2) && !defined(USE_AVX512)
+#if defined(USE_AVX2)
                 static_assert(kOutputDimensions % 8 == 0);
 
                 constexpr IndexType kNumChunks =

@@ -521,7 +521,7 @@ class FeatureTransformer {
 			b[i] = read ? b[i] * 2 : b[i] / 2;
 	}
 
-#if defined(USE_AVX2) && !defined(USE_AVX512)
+#if defined(USE_AVX2)
 	template <bool Add, IndexType Offset>
 	static inline void update_fm_factor_chunk(
 		Accumulator::FactorGroup& group, const WeightType* values) {
@@ -567,7 +567,7 @@ class FeatureTransformer {
 	template <bool Add>
 	static inline void update_fm_factor_group(
 		Accumulator::FactorGroup& group, const WeightType* values) {
-#if defined(USE_AVX2) && !defined(USE_AVX512)
+#if defined(USE_AVX2)
 		static_assert(kFactorDimensions == 32,
 			"AVX2 FM accumulator update expects 32 factor dimensions");
 		update_fm_factor_chunk<Add, 0>(group, values);
