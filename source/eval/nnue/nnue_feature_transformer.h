@@ -8,7 +8,7 @@
 
 #if defined(EVAL_NNUE)
 
-#if defined(SFNNwoPSQT)
+#if defined(SFNNwoPSQT) && !defined(USE_ELEMENT_WISE_MULTIPLY)
 #define USE_ELEMENT_WISE_MULTIPLY
 #endif
 
@@ -210,7 +210,7 @@ class FeatureTransformer {
 		auto print_stats = [&](const char* p_name, const char* t_name, int16_t* arr) {
 			int16_t min_v = 32767, max_v = -32768;
 			double sum_v = 0;
-			for (int i = 0; i < kPairWeightDimensions; ++i) {
+			for (IndexType i = 0; i < kPairWeightDimensions; ++i) {
 				min_v = std::min(min_v, arr[i]);
 				max_v = std::max(max_v, arr[i]);
 				sum_v += arr[i];
@@ -226,7 +226,7 @@ class FeatureTransformer {
 		};
 
 		std::cout << "------------------------------------------------------------" << std::endl;
-		for (int b = 0; b < kPairWeightBuckets; ++b) {
+		for (IndexType b = 0; b < kPairWeightBuckets; ++b) {
 			print_stats(bucket_names[b], "MUL ", pair_weights_mul[b]);
 			print_stats(bucket_names[b], "DIFF", pair_weights_diff[b]);
 			print_stats(bucket_names[b], "SUM ", pair_weights_sum[b]);
