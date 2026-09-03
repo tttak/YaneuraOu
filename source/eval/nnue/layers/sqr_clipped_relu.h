@@ -61,7 +61,36 @@ namespace Eval::NNUE::Layers {
 		// Forward propagation
 		// 順伝播
 		void Propagate(const InputType* input, OutputType* output) const {
+#if defined(USE_AVX2)
+			if constexpr (kInputDimensions % 32 == 0) {
+				PropagateAvx2(input, output);
+				return;
+			}
+#endif
+			PropagateBaseline(input, output);
+		}
 
+#if defined(ENABLE_NNUE_BENCH)
+		void BenchmarkPropagateBaseline(const InputType* input,
+			OutputType* output) const {
+			PropagateBaseline(input, output);
+		}
+
+		void BenchmarkPropagateAvx2(const InputType* input,
+			OutputType* output) const {
+#if defined(USE_AVX2)
+			if constexpr (kInputDimensions % 32 == 0) {
+				PropagateAvx2(input, output);
+				return;
+			}
+#endif
+			PropagateBaseline(input, output);
+		}
+#endif
+
+	private:
+		static inline void PropagateBaseline(const InputType* input,
+			OutputType* output) {
 #if defined(USE_SSE2)
 			constexpr IndexType NumChunks = kInputDimensions / 16;
 			static_assert(kWeightScaleBits == 6);
@@ -94,7 +123,38 @@ namespace Eval::NNUE::Layers {
 			}
 		}
 
-	private:
+#if defined(USE_AVX2)
+		static inline void PropagateAvx2(const InputType* input,
+			OutputType* output) {
+			static_assert(kInputDimensions % 32 == 0);
+			static_assert(kWeightScaleBits == 6);
+
+			constexpr IndexType NumChunks = kInputDimensions / 32;
+			const __m256i offsets =
+				_mm256_set_epi32(7, 3, 6, 2, 5, 1, 4, 0);
+			const auto in = reinterpret_cast<const __m256i*>(input);
+			const auto out = reinterpret_cast<__m256i*>(output);
+
+			for (IndexType i = 0; i < NumChunks; ++i) {
+				__m256i words0 = _mm256_packs_epi32(
+					_mm256_load_si256(&in[i * 4 + 0]),
+					_mm256_load_si256(&in[i * 4 + 1]));
+				__m256i words1 = _mm256_packs_epi32(
+					_mm256_load_si256(&in[i * 4 + 2]),
+					_mm256_load_si256(&in[i * 4 + 3]));
+
+				words0 = _mm256_srli_epi16(
+					_mm256_mulhi_epi16(words0, words0), 3);
+				words1 = _mm256_srli_epi16(
+					_mm256_mulhi_epi16(words1, words1), 3);
+
+				const __m256i packed = _mm256_packs_epi16(words0, words1);
+				_mm256_store_si256(
+					&out[i], _mm256_permutevar8x32_epi32(packed, offsets));
+			}
+		}
+#endif
+
 		friend class Trainer<SqrClippedReLU>;
 
 	};

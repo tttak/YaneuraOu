@@ -1184,6 +1184,182 @@ void TestNetworkBenchmarkCompare(const std::uint64_t repeat_count) {
             << std::endl;
 }
 
+struct alignas(kCacheLineSize) SqrClippedReluBenchCase {
+  std::array<std::int32_t, 32> input;
+  int selected_bucket = 0;
+};
+
+std::vector<SqrClippedReluBenchCase> MakeSqrClippedReluBenchCorpus() {
+  const auto network_corpus = MakeNnueNetworkBenchCorpus();
+  std::vector<SqrClippedReluBenchCase> corpus;
+  corpus.reserve(network_corpus.size());
+  alignas(kCacheLineSize) char network_buffer[Network::kBufferSize];
+
+  for (const auto& sample : network_corpus) {
+#if defined(SFNNwoPSQT)
+    network[sample.selected_bucket]->Propagate(
+#else
+    network->Propagate(
+#endif
+        sample.transformed.data(), sample.diff_transformed.data(),
+        sample.abs_transformed.data(), sample.material_bucket,
+        network_buffer);
+    const auto& network_work =
+        *reinterpret_cast<const Network::Buffer*>(network_buffer);
+
+    SqrClippedReluBenchCase sqr_sample;
+    std::copy_n(network_work.fc_0_out, 32, sqr_sample.input.begin());
+    sqr_sample.selected_bucket = sample.selected_bucket;
+    corpus.emplace_back(std::move(sqr_sample));
+  }
+  return corpus;
+}
+
+enum class SqrClippedReluBenchImplementation {
+  Baseline,
+  Avx2,
+};
+
+template<SqrClippedReluBenchImplementation Implementation>
+NnueBenchTiming MeasureSqrClippedReluCorpus(
+    const std::vector<SqrClippedReluBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  alignas(kCacheLineSize) std::uint8_t output[32];
+  NnueBenchTiming timing;
+
+  const auto begin = NnueBenchClock::now();
+  for (const auto& sample : corpus) {
+#if defined(SFNNwoPSQT)
+    const auto& activation = network[sample.selected_bucket]->ac_sqr_0;
+#else
+    const auto& activation = network->ac_sqr_0;
+#endif
+    if constexpr (Implementation == SqrClippedReluBenchImplementation::Avx2)
+      activation.BenchmarkPropagateAvx2(sample.input.data(), output);
+    else
+      activation.BenchmarkPropagateBaseline(sample.input.data(), output);
+
+    const std::size_t checksum_index =
+        static_cast<std::size_t>(timing.calls) & 31;
+    MixNnueBenchChecksum(checksum, output[checksum_index]);
+    ++timing.calls;
+  }
+  const auto end = NnueBenchClock::now();
+  timing.nanoseconds =
+      std::chrono::duration<double, std::nano>(end - begin).count();
+  return timing;
+}
+
+template<SqrClippedReluBenchImplementation Implementation>
+NnueBenchTiming MeasureSqrClippedReluCorpusAfterWarmup(
+    const std::vector<SqrClippedReluBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  std::uint64_t warmup_checksum = UINT64_C(14695981039346656037);
+  MeasureSqrClippedReluCorpus<Implementation>(corpus, warmup_checksum);
+  MixNnueBenchChecksum(checksum, warmup_checksum);
+  return MeasureSqrClippedReluCorpus<Implementation>(corpus, checksum);
+}
+
+template<SqrClippedReluBenchImplementation Implementation>
+std::uint64_t ChecksumAllSqrClippedReluOutputs(
+    const std::vector<SqrClippedReluBenchCase>& corpus) {
+  alignas(kCacheLineSize) std::uint8_t output[32];
+  std::uint64_t checksum = UINT64_C(14695981039346656037);
+
+  for (const auto& sample : corpus) {
+#if defined(SFNNwoPSQT)
+    const auto& activation = network[sample.selected_bucket]->ac_sqr_0;
+#else
+    const auto& activation = network->ac_sqr_0;
+#endif
+    if constexpr (Implementation == SqrClippedReluBenchImplementation::Avx2)
+      activation.BenchmarkPropagateAvx2(sample.input.data(), output);
+    else
+      activation.BenchmarkPropagateBaseline(sample.input.data(), output);
+
+    for (const std::uint8_t value : output)
+      MixNnueBenchChecksum(checksum, value);
+  }
+  return checksum;
+}
+
+void TestSqrClippedReluBenchmarkCompare(const std::uint64_t repeat_count) {
+  std::cout << "[NNUE benchmark: SqrClippedReLU SSE2 / AVX2 comparison]"
+            << std::endl
+            << "  seed         : " << kNnueBenchSeed << std::endl
+            << "  corpus games : " << kNnueBenchMeasuredGames << std::endl
+            << "  max ply/game : " << kNnueBenchMaxPly << std::endl
+            << "  repeats      : " << repeat_count << std::endl
+            << "  order        : even=SSE2,AVX2 odd=AVX2,SSE2" << std::endl;
+
+  const auto corpus = MakeSqrClippedReluBenchCorpus();
+  if (corpus.empty()) {
+    std::cout << "error: SqrClippedReLU benchmark corpus is empty"
+              << std::endl;
+    return;
+  }
+  std::cout << "  corpus calls : " << corpus.size() << std::endl
+            << "  warm-up calls: " << corpus.size()
+            << " before every timed sample" << std::endl;
+
+  NnueBenchSamples baseline_samples;
+  NnueBenchSamples avx2_samples;
+  std::uint64_t baseline_timing_checksum = UINT64_C(14695981039346656037);
+  std::uint64_t avx2_timing_checksum = UINT64_C(14695981039346656037);
+
+  for (std::uint64_t repeat = 0; repeat < repeat_count; ++repeat) {
+    if ((repeat & 1) == 0) {
+      baseline_samples.Add(MeasureSqrClippedReluCorpusAfterWarmup<
+          SqrClippedReluBenchImplementation::Baseline>(
+              corpus, baseline_timing_checksum));
+      avx2_samples.Add(MeasureSqrClippedReluCorpusAfterWarmup<
+          SqrClippedReluBenchImplementation::Avx2>(
+              corpus, avx2_timing_checksum));
+    } else {
+      avx2_samples.Add(MeasureSqrClippedReluCorpusAfterWarmup<
+          SqrClippedReluBenchImplementation::Avx2>(
+              corpus, avx2_timing_checksum));
+      baseline_samples.Add(MeasureSqrClippedReluCorpusAfterWarmup<
+          SqrClippedReluBenchImplementation::Baseline>(
+              corpus, baseline_timing_checksum));
+    }
+  }
+
+  PrintNnueBenchSamples("existing SSE2", baseline_samples);
+  PrintNnueBenchSamples("AVX2", avx2_samples);
+
+  const NnueBenchSummary baseline_summary =
+      SummarizeNnueBenchSamples(baseline_samples);
+  const NnueBenchSummary avx2_summary = SummarizeNnueBenchSamples(avx2_samples);
+  const double difference = avx2_summary.median - baseline_summary.median;
+  const double improvement = baseline_summary.median == 0.0
+      ? 0.0
+      : (baseline_summary.median - avx2_summary.median)
+            * 100.0 / baseline_summary.median;
+
+  const std::uint64_t baseline_checksum =
+      ChecksumAllSqrClippedReluOutputs<
+          SqrClippedReluBenchImplementation::Baseline>(corpus);
+  const std::uint64_t avx2_checksum =
+      ChecksumAllSqrClippedReluOutputs<
+          SqrClippedReluBenchImplementation::Avx2>(corpus);
+
+  std::cout << "  difference (AVX2 - SSE2) : " << std::fixed
+            << std::setprecision(1) << difference << " ns/call" << std::endl
+            << "  improvement              : " << std::setprecision(2)
+            << improvement << "%" << std::endl
+            << "  SSE2 checksum : 0x" << std::hex << baseline_checksum
+            << std::endl
+            << "  AVX2 checksum : 0x" << avx2_checksum << std::dec << std::endl
+            << "  checksum match: "
+            << (baseline_checksum == avx2_checksum ? "yes" : "NO")
+            << std::endl
+            << "  timing checksum match: "
+            << (baseline_timing_checksum == avx2_timing_checksum ? "yes"
+                                                                 : "NO")
+            << std::endl;
+}
+
 #endif  // defined(ENABLE_NNUE_BENCH)
 
 #if defined(ENABLE_NNUE_TRACE)
@@ -2319,6 +2495,10 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::uint64_t repeat_count;
     if (ReadNnueBenchRepeatCount(stream, repeat_count))
       TestNetworkBenchmarkCompare(repeat_count);
+  } else if (sub_command == "bench_sqr_clipped_relu_compare") {
+    std::uint64_t repeat_count;
+    if (ReadNnueBenchRepeatCount(stream, repeat_count))
+      TestSqrClippedReluBenchmarkCompare(repeat_count);
 #endif
 #if defined(ENABLE_NNUE_TRACE)
   } else if (sub_command == "trace") {
@@ -2336,6 +2516,8 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << " test nnue bench_ft [repeats]" << std::endl;
     std::cout << " test nnue bench_network [repeats]" << std::endl;
     std::cout << " test nnue bench_network_compare [repeats]" << std::endl;
+    std::cout << " test nnue bench_sqr_clipped_relu_compare [repeats]"
+              << std::endl;
 #endif
 #if defined(ENABLE_NNUE_TRACE)
     std::cout << " test nnue trace <SFEN>" << std::endl;
