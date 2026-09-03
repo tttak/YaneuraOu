@@ -30,8 +30,8 @@ namespace Eval::NNUE {
 	// 入力特徴量変換器
 	extern LargePagePtr<FeatureTransformer> feature_transformer;
 
-#if defined(ENABLE_NNUE_TRACE)
-	// Trace-only access to the already loaded Router parameters.
+#if defined(ENABLE_NNUE_TRACE) || defined(ENABLE_NNUE_BENCH)
+	// Test-only access to the already loaded Router parameters.
 	extern AlignedPtr<Router> router;
 #endif
 

@@ -21,13 +21,16 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
-#if defined(ENABLE_NNUE_TRACE)
+#if defined(ENABLE_NNUE_TRACE) || defined(ENABLE_NNUE_BENCH)
 #include <algorithm>
 #include <array>
+#include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstring>
-#include <vector>
+#include <system_error>
 #endif
 
 namespace YaneuraOu {
@@ -542,6 +545,645 @@ void TestAccumulator(Position& pos) {
   std::cout << num_games << " games, " << num_moves << " moves" << std::endl;
 }
 
+#if defined(ENABLE_NNUE_BENCH)
+
+constexpr std::uint64_t kNnueBenchSeed = 20171128;
+constexpr std::uint64_t kNnueBenchWarmupGames = 8;
+constexpr std::uint64_t kNnueBenchMeasuredGames = 64;
+constexpr int kNnueBenchMaxPly = 128;
+
+using NnueBenchClock = std::chrono::steady_clock;
+
+struct NnueBenchTiming {
+  std::uint64_t calls = 0;
+  double nanoseconds = 0.0;
+};
+
+struct NnueBenchSummary {
+  double median = 0.0;
+  double mean = 0.0;
+  double minimum = 0.0;
+  double maximum = 0.0;
+};
+
+struct NnueBenchSamples {
+  std::vector<double> ns_per_call;
+  std::uint64_t calls_per_repeat = 0;
+  double total_nanoseconds = 0.0;
+
+  void Add(const NnueBenchTiming& timing) {
+    if (timing.calls == 0)
+      return;
+    if (calls_per_repeat == 0)
+      calls_per_repeat = timing.calls;
+    ns_per_call.push_back(
+        timing.nanoseconds / static_cast<double>(timing.calls));
+    total_nanoseconds += timing.nanoseconds;
+  }
+};
+
+bool ReadNnueBenchRepeatCount(std::istream& stream,
+                              std::uint64_t& repeat_count) {
+  repeat_count = 1;
+  std::string token;
+  if (!(stream >> token)) {
+    stream.clear();
+    return true;
+  }
+
+  if (!token.empty() && token.front() == '-') {
+    std::cout << "error: benchmark repeat count must be a positive integer"
+              << std::endl;
+    return false;
+  }
+
+  std::uint64_t value = 0;
+  const char* const begin = token.data();
+  const char* const end = begin + token.size();
+  const auto result = std::from_chars(begin, end, value);
+  if (result.ec != std::errc{} || result.ptr != end || value == 0) {
+    std::cout << "error: benchmark repeat count must be a positive integer"
+              << std::endl;
+    return false;
+  }
+  repeat_count = value;
+  return true;
+}
+
+NnueBenchSummary SummarizeNnueBenchSamples(
+    const NnueBenchSamples& samples) {
+  NnueBenchSummary summary;
+  if (samples.ns_per_call.empty())
+    return summary;
+
+  std::vector<double> sorted = samples.ns_per_call;
+  std::sort(sorted.begin(), sorted.end());
+  const std::size_t middle = sorted.size() / 2;
+  summary.median = sorted.size() % 2 == 0
+      ? (sorted[middle - 1] + sorted[middle]) / 2.0
+      : sorted[middle];
+  summary.minimum = sorted.front();
+  summary.maximum = sorted.back();
+  for (const double value : sorted)
+    summary.mean += value;
+  summary.mean /= static_cast<double>(sorted.size());
+  return summary;
+}
+
+struct FtChangeStatistics {
+  std::uint64_t perspective_samples = 0;
+  std::uint64_t non_reset_samples = 0;
+  std::uint64_t changed_non_reset_samples = 0;
+  std::uint64_t reset_samples = 0;
+  std::uint64_t one_removed_one_added = 0;
+  std::uint64_t removed_features = 0;
+  std::uint64_t added_features = 0;
+  std::uint64_t halfka_removed = 0;
+  std::uint64_t halfka_added = 0;
+  std::uint64_t ksdg_removed = 0;
+  std::uint64_t ksdg_added = 0;
+};
+
+enum class FtBenchOperation {
+  IncrementalUpdate,
+  ForcedRefresh,
+  TransformOnly,
+};
+
+void MixNnueBenchChecksum(std::uint64_t& checksum, const std::int64_t value) {
+  checksum ^= static_cast<std::uint64_t>(value);
+  checksum *= UINT64_C(1099511628211);
+}
+
+void ChecksumAccumulator(const Position& pos, std::uint64_t& checksum) {
+  const auto& accumulator = pos.state()->accumulator;
+  for (const Color perspective : {BLACK, WHITE}) {
+    for (std::size_t trigger = 0; trigger < kRefreshTriggers.size(); ++trigger)
+      for (IndexType index = 0; index < kTransformedFeatureDimensions; ++index)
+        MixNnueBenchChecksum(
+            checksum, accumulator.accumulation[perspective][trigger][index]);
+
+    const auto& factors = accumulator.factors[perspective];
+    for (IndexType index = 0; index < 32; ++index) {
+      MixNnueBenchChecksum(checksum, factors.halfka.sum_v[index]);
+      MixNnueBenchChecksum(checksum, factors.halfka.sum_v2[index]);
+      MixNnueBenchChecksum(checksum, factors.ksdg.sum_v[index]);
+      MixNnueBenchChecksum(checksum, factors.ksdg.sum_v2[index]);
+    }
+  }
+}
+
+int NnueBenchMaterialBucket(const Position& pos) {
+  // Keep this benchmark-only calculation identical to stack_index_for_nnue().
+  constexpr int bucket_by_material[24] = {
+      0, 1, 2, 3, 4, 5, 5, 6, 6, 7, 7, 8,
+      8, 8, 9, 9, 9, 9, 10, 10, 10, 10, 10, 11};
+  return bucket_by_material[std::min(
+      (std::abs(pos.state()->materialValue) + 99) / 100, 23)];
+}
+
+void CollectFtChangeStatistics(const Position& pos,
+                               FtChangeStatistics& statistics) {
+  for (IndexType trigger = 0; trigger < kRefreshTriggers.size(); ++trigger) {
+    Features::IndexList removed_indices[2], added_indices[2];
+    bool reset[2];
+    RawFeatures::AppendChangedIndices(pos, kRefreshTriggers[trigger],
+                                      removed_indices, added_indices, reset);
+
+    for (const Color perspective : {BLACK, WHITE}) {
+      ++statistics.perspective_samples;
+      if (reset[perspective]) {
+        ++statistics.reset_samples;
+      } else {
+        ++statistics.non_reset_samples;
+        if (removed_indices[perspective].size() != 0
+            || added_indices[perspective].size() != 0)
+          ++statistics.changed_non_reset_samples;
+        if (removed_indices[perspective].size() == 1
+            && added_indices[perspective].size() == 1)
+          ++statistics.one_removed_one_added;
+
+        statistics.removed_features += removed_indices[perspective].size();
+        if (trigger == 0) {
+          for (const IndexType index : removed_indices[perspective]) {
+            if (FeatureTransformer::BenchmarkIsHalfKaIndex(index))
+              ++statistics.halfka_removed;
+            else
+              ++statistics.ksdg_removed;
+          }
+        }
+      }
+
+      statistics.added_features += added_indices[perspective].size();
+      if (trigger == 0) {
+        for (const IndexType index : added_indices[perspective]) {
+          if (FeatureTransformer::BenchmarkIsHalfKaIndex(index))
+            ++statistics.halfka_added;
+          else
+            ++statistics.ksdg_added;
+        }
+      }
+    }
+  }
+}
+
+NnueBenchTiming RunFtBenchmarkPass(const FtBenchOperation operation,
+                                   const std::uint64_t num_games,
+                                   FtChangeStatistics* const statistics,
+                                   std::uint64_t& checksum) {
+  Position pos;
+  StateInfo root_state;
+  std::vector<StateInfo> states(kNnueBenchMaxPly);
+  PRNG prng(kNnueBenchSeed);
+  NnueBenchTiming timing;
+
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType,
+                 FeatureTransformer::kOutputDimensions> transformed{};
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType, 128> diff_transformed{};
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType, 128> abs_transformed{};
+
+  for (std::uint64_t game = 0; game < num_games; ++game) {
+    pos.set_hirate(&root_state);
+
+    for (int ply = 0; ply < kNnueBenchMaxPly; ++ply) {
+      MoveList<LEGAL_ALL> moves(pos);
+      if (moves.size() == 0)
+        break;
+
+      const Move move = moves.begin()[prng.rand(moves.size())];
+      pos.do_move(move, states[ply]);
+
+      if (operation == FtBenchOperation::TransformOnly) {
+        if (!feature_transformer->UpdateAccumulatorIfPossible(pos)) {
+          std::cout << "error: benchmark could not prepare incremental accumulator"
+                    << std::endl;
+          return {};
+        }
+      }
+
+      const auto begin = NnueBenchClock::now();
+      if (operation == FtBenchOperation::IncrementalUpdate) {
+        if (!feature_transformer->UpdateAccumulatorIfPossible(pos)) {
+          std::cout << "error: benchmark incremental update was unavailable"
+                    << std::endl;
+          return {};
+        }
+      } else if (operation == FtBenchOperation::ForcedRefresh) {
+        feature_transformer->BenchmarkRefreshAccumulator(pos);
+      } else {
+        feature_transformer->Transform(
+            pos, transformed.data(), diff_transformed.data(),
+            abs_transformed.data(), false, NnueBenchMaterialBucket(pos));
+      }
+      const auto end = NnueBenchClock::now();
+
+      timing.nanoseconds +=
+          std::chrono::duration<double, std::nano>(end - begin).count();
+      ++timing.calls;
+
+      if (statistics != nullptr)
+        CollectFtChangeStatistics(pos, *statistics);
+
+      if (operation == FtBenchOperation::TransformOnly) {
+        for (const auto value : transformed)
+          MixNnueBenchChecksum(checksum, value);
+        for (const auto value : diff_transformed)
+          MixNnueBenchChecksum(checksum, value);
+        for (const auto value : abs_transformed)
+          MixNnueBenchChecksum(checksum, value);
+      } else {
+        ChecksumAccumulator(pos, checksum);
+      }
+    }
+  }
+
+  return timing;
+}
+
+void PrintNnueBenchSamples(const char* const name,
+                           const NnueBenchSamples& samples) {
+  const NnueBenchSummary summary = SummarizeNnueBenchSamples(samples);
+  const double median_calls_per_second = summary.median == 0.0
+      ? 0.0
+      : 1.0e9 / summary.median;
+
+  std::cout << name << std::endl
+            << "  repeats          : " << samples.ns_per_call.size() << std::endl
+            << "  calls/repeat     : " << samples.calls_per_repeat << std::endl
+            << "  total time       : " << std::fixed << std::setprecision(3)
+            << samples.total_nanoseconds / 1.0e6 << " ms" << std::endl
+            << "  median ns/call   : " << std::setprecision(1) << summary.median
+            << std::endl
+            << "  mean ns/call     : " << summary.mean << std::endl
+            << "  min ns/call      : " << summary.minimum << std::endl
+            << "  max ns/call      : " << summary.maximum << std::endl
+            << "  median calls/sec : " << median_calls_per_second << std::endl;
+}
+
+void TestFeatureTransformerBenchmark(const std::uint64_t repeat_count) {
+  std::cout << "[NNUE benchmark: FeatureTransformer]" << std::endl
+            << "  seed           : " << kNnueBenchSeed << std::endl
+            << "  warm-up games  : " << kNnueBenchWarmupGames << std::endl
+            << "  measured games : " << kNnueBenchMeasuredGames << std::endl
+            << "  max ply/game   : " << kNnueBenchMaxPly << std::endl
+            << "  repeats        : " << repeat_count << std::endl;
+
+  std::uint64_t checksum = UINT64_C(14695981039346656037);
+  FtChangeStatistics statistics;
+  NnueBenchSamples incremental;
+  NnueBenchSamples refresh;
+  NnueBenchSamples transform;
+
+  for (std::uint64_t repeat = 0; repeat < repeat_count; ++repeat) {
+    RunFtBenchmarkPass(FtBenchOperation::IncrementalUpdate,
+                       kNnueBenchWarmupGames, nullptr, checksum);
+    incremental.Add(RunFtBenchmarkPass(
+        FtBenchOperation::IncrementalUpdate, kNnueBenchMeasuredGames,
+        repeat == 0 ? &statistics : nullptr, checksum));
+
+    RunFtBenchmarkPass(FtBenchOperation::ForcedRefresh,
+                       kNnueBenchWarmupGames, nullptr, checksum);
+    refresh.Add(RunFtBenchmarkPass(
+        FtBenchOperation::ForcedRefresh, kNnueBenchMeasuredGames, nullptr,
+        checksum));
+
+    RunFtBenchmarkPass(FtBenchOperation::TransformOnly,
+                       kNnueBenchWarmupGames, nullptr, checksum);
+    transform.Add(RunFtBenchmarkPass(
+        FtBenchOperation::TransformOnly, kNnueBenchMeasuredGames, nullptr,
+        checksum));
+  }
+
+  PrintNnueBenchSamples("incremental accumulator update", incremental);
+  PrintNnueBenchSamples("forced full refresh", refresh);
+  PrintNnueBenchSamples("Transform (precomputed accumulator)", transform);
+
+  const auto percentage = [](const std::uint64_t numerator,
+                             const std::uint64_t denominator) {
+    return denominator == 0
+        ? 0.0
+        : 100.0 * static_cast<double>(numerator)
+              / static_cast<double>(denominator);
+  };
+
+  std::cout << "[incremental feature statistics]" << std::endl
+            << "  trigger/perspective samples : "
+            << statistics.perspective_samples << std::endl
+            << "  non-reset samples           : "
+            << statistics.non_reset_samples << std::endl
+            << "  changed non-reset samples   : "
+            << statistics.changed_non_reset_samples << std::endl
+            << "  reset samples               : "
+            << statistics.reset_samples << std::endl
+            << "  removed features            : "
+            << statistics.removed_features << std::endl
+            << "  added features              : "
+            << statistics.added_features << std::endl
+            << "  removed=1 && added=1        : "
+            << statistics.one_removed_one_added << " / "
+            << statistics.non_reset_samples << " ("
+            << std::fixed << std::setprecision(2)
+            << percentage(statistics.one_removed_one_added,
+                          statistics.non_reset_samples)
+            << "% of non-reset, "
+            << percentage(statistics.one_removed_one_added,
+                          statistics.changed_non_reset_samples)
+            << "% of changed non-reset)" << std::endl
+            << "  HalfKA removed / added      : "
+            << statistics.halfka_removed << " / " << statistics.halfka_added
+            << std::endl
+            << "  KSDG3 removed / added       : "
+            << statistics.ksdg_removed << " / " << statistics.ksdg_added
+            << std::endl
+            << "  checksum                    : 0x" << std::hex << checksum
+            << std::dec << std::endl;
+}
+
+struct alignas(kCacheLineSize) NetworkBenchCase {
+  std::array<FeatureTransformer::OutputType,
+             FeatureTransformer::kOutputDimensions> transformed;
+  std::array<FeatureTransformer::OutputType, 128> diff_transformed;
+  std::array<FeatureTransformer::OutputType, 128> abs_transformed;
+  std::array<std::uint8_t, 384> router_input;
+  int material_bucket = 0;
+  int selected_bucket = 0;
+};
+
+int SelectNnueBenchBucket(const std::int32_t* const router_output) {
+  int selected_bucket = 0;
+  std::int32_t max_score = router_output[0];
+  for (int bucket = 1; bucket < kLayerStacks; ++bucket) {
+    if (router_output[bucket] > max_score) {
+      max_score = router_output[bucket];
+      selected_bucket = bucket;
+    }
+  }
+  return selected_bucket;
+}
+
+void FillNnueBenchRouterInput(NetworkBenchCase& sample) {
+  for (int index = 0; index < 128; ++index) {
+    const int abs_value = sample.abs_transformed[index];
+    sample.router_input[index] = static_cast<std::uint8_t>(
+        std::clamp((abs_value - 64) * 2, 0, 127));
+    sample.router_input[index + 128] = sample.diff_transformed[index];
+    sample.router_input[index + 256] = sample.transformed[index];
+  }
+}
+
+std::vector<NetworkBenchCase> MakeNnueNetworkBenchCorpus() {
+  Position pos;
+  StateInfo root_state;
+  std::vector<StateInfo> states(kNnueBenchMaxPly);
+  PRNG prng(kNnueBenchSeed);
+  std::vector<NetworkBenchCase> corpus;
+  corpus.reserve(kNnueBenchMeasuredGames * kNnueBenchMaxPly);
+
+  alignas(kCacheLineSize) std::int32_t router_output[32];
+
+  for (std::uint64_t game = 0; game < kNnueBenchMeasuredGames; ++game) {
+    pos.set_hirate(&root_state);
+    for (int ply = 0; ply < kNnueBenchMaxPly; ++ply) {
+      MoveList<LEGAL_ALL> moves(pos);
+      if (moves.size() == 0)
+        break;
+
+      const Move move = moves.begin()[prng.rand(moves.size())];
+      pos.do_move(move, states[ply]);
+
+      NetworkBenchCase sample{};
+      sample.material_bucket = NnueBenchMaterialBucket(pos);
+      feature_transformer->Transform(
+          pos, sample.transformed.data(), sample.diff_transformed.data(),
+          sample.abs_transformed.data(), false, sample.material_bucket);
+      FillNnueBenchRouterInput(sample);
+      router->PropagatePrefix<12>(sample.router_input.data(), router_output);
+      sample.selected_bucket = SelectNnueBenchBucket(router_output);
+      corpus.emplace_back(std::move(sample));
+    }
+  }
+
+  return corpus;
+}
+
+enum class NetworkBenchOperation {
+  RouterOnly,
+  SelectedNetworkOnly,
+  RouterAndNetwork,
+};
+
+enum class NetworkBenchImplementation {
+  Full,
+  Prefix,
+};
+
+template<NetworkBenchImplementation Implementation>
+NnueBenchTiming MeasureNnueNetworkCorpus(
+    const std::vector<NetworkBenchCase>& corpus,
+    const NetworkBenchOperation operation, std::uint64_t& checksum) {
+  alignas(kCacheLineSize) std::int32_t router_output[32];
+  alignas(kCacheLineSize) char network_buffer[Network::kBufferSize];
+  NnueBenchTiming timing;
+
+  const auto begin = NnueBenchClock::now();
+  for (const auto& sample : corpus) {
+    int selected_bucket = sample.selected_bucket;
+    if (operation != NetworkBenchOperation::SelectedNetworkOnly) {
+      if constexpr (Implementation == NetworkBenchImplementation::Prefix)
+        router->PropagatePrefix<12>(sample.router_input.data(), router_output);
+      else
+        router->Propagate(sample.router_input.data(), router_output);
+      selected_bucket = SelectNnueBenchBucket(router_output);
+      MixNnueBenchChecksum(checksum, selected_bucket);
+      MixNnueBenchChecksum(checksum, router_output[selected_bucket]);
+    }
+
+    if (operation != NetworkBenchOperation::RouterOnly) {
+#if defined(SFNNwoPSQT)
+      const auto output = network[selected_bucket]->Propagate<
+          Implementation == NetworkBenchImplementation::Prefix>(
+#else
+      const auto output = network->Propagate<
+          Implementation == NetworkBenchImplementation::Prefix>(
+#endif
+          sample.transformed.data(), sample.diff_transformed.data(),
+          sample.abs_transformed.data(), sample.material_bucket,
+          network_buffer);
+      MixNnueBenchChecksum(checksum, output[0]);
+    }
+    ++timing.calls;
+  }
+  const auto end = NnueBenchClock::now();
+  timing.nanoseconds =
+      std::chrono::duration<double, std::nano>(end - begin).count();
+  return timing;
+}
+
+void TestNetworkBenchmark(const std::uint64_t repeat_count) {
+  std::cout << "[NNUE benchmark: Router / Network]" << std::endl
+            << "  seed         : " << kNnueBenchSeed << std::endl
+            << "  corpus games : " << kNnueBenchMeasuredGames << std::endl
+            << "  max ply/game : " << kNnueBenchMaxPly << std::endl
+            << "  repeats      : " << repeat_count << std::endl;
+
+  const auto corpus = MakeNnueNetworkBenchCorpus();
+  if (corpus.empty()) {
+    std::cout << "error: NNUE network benchmark corpus is empty" << std::endl;
+    return;
+  }
+  std::cout << "  corpus calls : " << corpus.size() << std::endl
+            << "  warm-up calls: " << corpus.size() << std::endl;
+
+  std::uint64_t checksum = UINT64_C(14695981039346656037);
+  NnueBenchSamples router_samples;
+  NnueBenchSamples selected_network_samples;
+  NnueBenchSamples combined_samples;
+
+  for (std::uint64_t repeat = 0; repeat < repeat_count; ++repeat) {
+    MeasureNnueNetworkCorpus<NetworkBenchImplementation::Prefix>(
+        corpus, NetworkBenchOperation::RouterOnly, checksum);
+    router_samples.Add(
+        MeasureNnueNetworkCorpus<NetworkBenchImplementation::Prefix>(
+            corpus, NetworkBenchOperation::RouterOnly, checksum));
+
+    MeasureNnueNetworkCorpus<NetworkBenchImplementation::Prefix>(
+        corpus, NetworkBenchOperation::SelectedNetworkOnly, checksum);
+    selected_network_samples.Add(
+        MeasureNnueNetworkCorpus<NetworkBenchImplementation::Prefix>(
+            corpus, NetworkBenchOperation::SelectedNetworkOnly, checksum));
+
+    MeasureNnueNetworkCorpus<NetworkBenchImplementation::Prefix>(
+        corpus, NetworkBenchOperation::RouterAndNetwork, checksum);
+    combined_samples.Add(
+        MeasureNnueNetworkCorpus<NetworkBenchImplementation::Prefix>(
+            corpus, NetworkBenchOperation::RouterAndNetwork, checksum));
+  }
+
+  PrintNnueBenchSamples("Router (FC + argmax)", router_samples);
+  PrintNnueBenchSamples("selected Network::Propagate",
+                        selected_network_samples);
+  PrintNnueBenchSamples("Router + selected Network::Propagate",
+                        combined_samples);
+  std::cout << "  checksum    : 0x" << std::hex << checksum << std::dec
+            << std::endl;
+}
+
+template<NetworkBenchImplementation Implementation>
+NnueBenchTiming MeasureNnueNetworkCorpusAfterWarmup(
+    const std::vector<NetworkBenchCase>& corpus,
+    const NetworkBenchOperation operation, std::uint64_t& checksum) {
+  MeasureNnueNetworkCorpus<Implementation>(corpus, operation, checksum);
+  return MeasureNnueNetworkCorpus<Implementation>(corpus, operation,
+                                                   checksum);
+}
+
+void PrintNnueBenchComparison(const char* const name,
+                              const NnueBenchSamples& full,
+                              const NnueBenchSamples& prefix) {
+  const NnueBenchSummary full_summary = SummarizeNnueBenchSamples(full);
+  const NnueBenchSummary prefix_summary = SummarizeNnueBenchSamples(prefix);
+  const double difference = prefix_summary.median - full_summary.median;
+  const double improvement = full_summary.median == 0.0
+      ? 0.0
+      : (full_summary.median - prefix_summary.median)
+            * 100.0 / full_summary.median;
+
+  std::cout << name << std::endl
+            << "  full" << std::endl
+            << "    median ns/call : " << std::fixed << std::setprecision(1)
+            << full_summary.median << std::endl
+            << "    mean ns/call   : " << full_summary.mean << std::endl
+            << "    min ns/call    : " << full_summary.minimum << std::endl
+            << "    max ns/call    : " << full_summary.maximum << std::endl
+            << "  prefix" << std::endl
+            << "    median ns/call : " << prefix_summary.median << std::endl
+            << "    mean ns/call   : " << prefix_summary.mean << std::endl
+            << "    min ns/call    : " << prefix_summary.minimum << std::endl
+            << "    max ns/call    : " << prefix_summary.maximum << std::endl
+            << "  difference (prefix - full) : " << difference
+            << " ns/call" << std::endl
+            << "  improvement               : " << std::setprecision(2)
+            << improvement << "%" << std::endl;
+}
+
+void TestNetworkBenchmarkCompare(const std::uint64_t repeat_count) {
+  std::cout << "[NNUE benchmark: Full / Prefix comparison]" << std::endl
+            << "  seed         : " << kNnueBenchSeed << std::endl
+            << "  corpus games : " << kNnueBenchMeasuredGames << std::endl
+            << "  max ply/game : " << kNnueBenchMaxPly << std::endl
+            << "  repeats      : " << repeat_count << std::endl
+            << "  order        : even=full,prefix odd=prefix,full"
+            << std::endl;
+
+  const auto corpus = MakeNnueNetworkBenchCorpus();
+  if (corpus.empty()) {
+    std::cout << "error: NNUE network benchmark corpus is empty" << std::endl;
+    return;
+  }
+  std::cout << "  corpus calls : " << corpus.size() << std::endl
+            << "  warm-up calls: " << corpus.size()
+            << " before every timed sample" << std::endl;
+
+  constexpr std::array<NetworkBenchOperation, 3> operations = {
+      NetworkBenchOperation::RouterOnly,
+      NetworkBenchOperation::SelectedNetworkOnly,
+      NetworkBenchOperation::RouterAndNetwork};
+  constexpr std::array<const char*, 3> names = {
+      "Router (FC + argmax)",
+      "selected Network::Propagate",
+      "Router + selected Network::Propagate"};
+
+  std::array<NnueBenchSamples, 3> full_samples;
+  std::array<NnueBenchSamples, 3> prefix_samples;
+  std::uint64_t full_checksum = UINT64_C(14695981039346656037);
+  std::uint64_t prefix_checksum = UINT64_C(14695981039346656037);
+
+  for (std::size_t operation_index = 0;
+       operation_index < operations.size(); ++operation_index) {
+    const NetworkBenchOperation operation = operations[operation_index];
+    for (std::uint64_t repeat = 0; repeat < repeat_count; ++repeat) {
+      if ((repeat & 1) == 0) {
+        full_samples[operation_index].Add(
+            MeasureNnueNetworkCorpusAfterWarmup<
+                NetworkBenchImplementation::Full>(
+                    corpus, operation, full_checksum));
+        prefix_samples[operation_index].Add(
+            MeasureNnueNetworkCorpusAfterWarmup<
+                NetworkBenchImplementation::Prefix>(
+                    corpus, operation, prefix_checksum));
+      } else {
+        prefix_samples[operation_index].Add(
+            MeasureNnueNetworkCorpusAfterWarmup<
+                NetworkBenchImplementation::Prefix>(
+                    corpus, operation, prefix_checksum));
+        full_samples[operation_index].Add(
+            MeasureNnueNetworkCorpusAfterWarmup<
+                NetworkBenchImplementation::Full>(
+                    corpus, operation, full_checksum));
+      }
+    }
+  }
+
+  for (std::size_t operation_index = 0;
+       operation_index < operations.size(); ++operation_index)
+    PrintNnueBenchComparison(names[operation_index],
+                             full_samples[operation_index],
+                             prefix_samples[operation_index]);
+
+  std::cout << "  full checksum   : 0x" << std::hex << full_checksum
+            << std::endl
+            << "  prefix checksum : 0x" << prefix_checksum << std::dec
+            << std::endl
+            << "  checksum match  : "
+            << (full_checksum == prefix_checksum ? "yes" : "NO")
+            << std::endl;
+}
+
+#endif  // defined(ENABLE_NNUE_BENCH)
+
 #if defined(ENABLE_NNUE_TRACE)
 
 constexpr std::size_t kTraceFmDimensions = 32;
@@ -818,7 +1460,7 @@ bool MakeNnueTraceSnapshot(const std::string& sfen,
   }
 
   alignas(kCacheLineSize) Router::OutputBuffer router_output;
-  router->Propagate(snapshot->router.input.data(), router_output);
+  router->PropagatePrefix<12>(snapshot->router.input.data(), router_output);
   std::copy_n(router_output, kTraceRouterOutputDimensions,
               snapshot->router.logits.begin());
   snapshot->router.selected_bucket = 0;
@@ -1010,8 +1652,8 @@ bool MakeNnueTraceSnapshot(const std::string& sfen,
   std::copy_n(lca_buffer.phase_input, kTraceRouterInputDimensions,
               deep_path.phase_input.begin());
 
-  selected_network->phase_proj.Propagate(lca_buffer.phase_input,
-                                         lca_buffer.phase_out);
+  selected_network->phase_proj.PropagatePrefix<6>(lca_buffer.phase_input,
+                                                  lca_buffer.phase_out);
   float channel_scales[kTracePhaseDimensions];
   constexpr float scale_multipliers[kTracePhaseDimensions] = {
       1.3f, 1.5f, 1.0f, 0.7f, 0.88f, 1.5f};
@@ -1662,6 +2304,20 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     PrintInfo(stream);
   } else if (sub_command == "accuracy") {
     TestMoveAccuracy(engine, stream);
+#if defined(ENABLE_NNUE_BENCH)
+  } else if (sub_command == "bench_ft") {
+    std::uint64_t repeat_count;
+    if (ReadNnueBenchRepeatCount(stream, repeat_count))
+      TestFeatureTransformerBenchmark(repeat_count);
+  } else if (sub_command == "bench_network") {
+    std::uint64_t repeat_count;
+    if (ReadNnueBenchRepeatCount(stream, repeat_count))
+      TestNetworkBenchmark(repeat_count);
+  } else if (sub_command == "bench_network_compare") {
+    std::uint64_t repeat_count;
+    if (ReadNnueBenchRepeatCount(stream, repeat_count))
+      TestNetworkBenchmarkCompare(repeat_count);
+#endif
 #if defined(ENABLE_NNUE_TRACE)
   } else if (sub_command == "trace") {
     TraceNnue(stream, false);
@@ -1674,6 +2330,11 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << " test nnue test_accumulator" << std::endl;
     std::cout << " test nnue accuracy <sfenpack file>" << std::endl;
     std::cout << " test nnue info [path/to/" << kFileName << "...]" << std::endl;
+#if defined(ENABLE_NNUE_BENCH)
+    std::cout << " test nnue bench_ft [repeats]" << std::endl;
+    std::cout << " test nnue bench_network [repeats]" << std::endl;
+    std::cout << " test nnue bench_network_compare [repeats]" << std::endl;
+#endif
 #if defined(ENABLE_NNUE_TRACE)
     std::cout << " test nnue trace <SFEN>" << std::endl;
     std::cout << " test nnue trace_full <output file> <SFEN>" << std::endl;

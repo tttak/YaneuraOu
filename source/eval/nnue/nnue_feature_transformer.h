@@ -684,6 +684,19 @@ class FeatureTransformer {
 		accumulator.computed_score = false;
 	}
 
+#if defined(ENABLE_NNUE_BENCH)
+	public:
+	// Benchmark-only entry points. These are not compiled into normal builds.
+	void BenchmarkRefreshAccumulator(const Position& pos) const {
+		refresh_accumulator(pos);
+	}
+
+	static bool BenchmarkIsHalfKaIndex(const IndexType index) {
+		return index >= SPLIT_IDX;
+	}
+	private:
+#endif
+
 	// parameter type
 	// パラメータの型
 

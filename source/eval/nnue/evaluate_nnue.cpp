@@ -448,7 +448,7 @@ namespace {
         }
 
         // 2. Router 推論実行
-        router->Propagate(router_input, router_out);
+        router->PropagatePrefix<12>(router_input, router_out);
 
         // 3. 出力の中から最大値を持つバケットを選択 (Argmax)
         int chosen_bucket = 0;

@@ -152,6 +152,9 @@ struct Network {
 
 	static constexpr std::size_t kBufferSize = sizeof(Buffer);
 
+#if defined(ENABLE_NNUE_BENCH)
+	template<bool UsePhasePrefix = true>
+#endif
 	const OutputType* Propagate(const TransformedFeatureType* transformedFeatures, const TransformedFeatureType* diffFeatures, const TransformedFeatureType* absFeatures, const int bucket_id, char* buffer) const {
 		auto& buf = *reinterpret_cast<Buffer*>(buffer);
 
@@ -167,7 +170,14 @@ struct Network {
 		buf.phase_input[127] = static_cast<std::uint8_t>((bucket_id * 127) / 11);
 
 		// Phase Gate 推論と各パスへの係数算出 (0.1 ～ 1.0 の範囲に正規化)
-		phase_proj.Propagate(buf.phase_input, buf.phase_out);
+#if defined(ENABLE_NNUE_BENCH)
+		if constexpr (UsePhasePrefix)
+			phase_proj.PropagatePrefix<6>(buf.phase_input, buf.phase_out);
+		else
+			phase_proj.Propagate(buf.phase_input, buf.phase_out);
+#else
+		phase_proj.PropagatePrefix<6>(buf.phase_input, buf.phase_out);
+#endif
 		float phase_val[6];
 		for (int i = 0; i < 6; ++i) {
 			float logit = (static_cast<float>(buf.phase_out[i]) / 8128.0f) * 3.0f + 1.0f;

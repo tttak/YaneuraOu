@@ -273,6 +273,48 @@ class AffineTransformExplicit {
 #endif
         }
 
+        // Forward propagation for a prefix of the physical output rows.
+        // The AVX2 kernel computes whole groups of 8 outputs while retaining
+        // kOutputDimensions as the physical weight stride. Other targets use
+        // the regular full-output implementation.
+        template<IndexType RequiredOutputs>
+        void PropagatePrefix(const InputType* input, OutputType* output) const {
+                static_assert(RequiredOutputs > 0);
+                static_assert(RequiredOutputs <= kOutputDimensions);
+
+#if defined(USE_AVX2) && !defined(USE_AVX512)
+                static_assert(kOutputDimensions % 8 == 0);
+
+                constexpr IndexType kNumChunks =
+                  CeilToMultiple<IndexType>(kInputDimensions, 8) / 4;
+                constexpr IndexType kNumRegs =
+                  CeilToMultiple<IndexType>(RequiredOutputs, 8) / 8;
+
+                const auto     input32 = reinterpret_cast<const std::int32_t*>(input);
+                const __m256i* biasvec = reinterpret_cast<const __m256i*>(biases_);
+                __m256i        acc[kNumRegs];
+
+                for (IndexType k = 0; k < kNumRegs; ++k)
+                        acc[k] = biasvec[k];
+
+                for (IndexType i = 0; i < kNumChunks; ++i)
+                {
+                        const __m256i in = _mm256_set1_epi32(input32[i]);
+                        const auto col = reinterpret_cast<const __m256i*>(
+                          &weights_[i * kOutputDimensions * 4]);
+
+                        for (IndexType k = 0; k < kNumRegs; ++k)
+                                Simd::m256_add_dpbusd_epi32(acc[k], in, col[k]);
+                }
+
+                __m256i* outptr = reinterpret_cast<__m256i*>(output);
+                for (IndexType k = 0; k < kNumRegs; ++k)
+                        outptr[k] = acc[k];
+#else
+                Propagate(input, output);
+#endif
+        }
+
    private:
         using BiasType   = OutputType;
         using WeightType = std::int8_t;
