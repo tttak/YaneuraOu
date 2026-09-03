@@ -521,6 +521,73 @@ class FeatureTransformer {
 			b[i] = read ? b[i] * 2 : b[i] / 2;
 	}
 
+#if defined(USE_AVX2) && !defined(USE_AVX512)
+	template <bool Add, IndexType Offset>
+	static inline void update_fm_factor_chunk(
+		Accumulator::FactorGroup& group, const WeightType* values) {
+		const __m128i values16 =
+			_mm_loadu_si128(reinterpret_cast<const __m128i*>(values + Offset));
+		const __m256i values32 = _mm256_cvtepi16_epi32(values16);
+		const __m256i squares32 = _mm256_mullo_epi32(values32, values32);
+
+		const __m128i values32_low = _mm256_castsi256_si128(values32);
+		const __m128i values32_high = _mm256_extracti128_si256(values32, 1);
+		const __m128i squares32_low = _mm256_castsi256_si128(squares32);
+		const __m128i squares32_high = _mm256_extracti128_si256(squares32, 1);
+
+		const __m256i values64_low = _mm256_cvtepi32_epi64(values32_low);
+		const __m256i values64_high = _mm256_cvtepi32_epi64(values32_high);
+		const __m256i squares64_low = _mm256_cvtepi32_epi64(squares32_low);
+		const __m256i squares64_high = _mm256_cvtepi32_epi64(squares32_high);
+
+		auto* sum_v_low = reinterpret_cast<__m256i*>(group.sum_v + Offset);
+		auto* sum_v_high = reinterpret_cast<__m256i*>(group.sum_v + Offset + 4);
+		auto* sum_v2_low = reinterpret_cast<__m256i*>(group.sum_v2 + Offset);
+		auto* sum_v2_high = reinterpret_cast<__m256i*>(group.sum_v2 + Offset + 4);
+
+		const __m256i old_sum_v_low = _mm256_loadu_si256(sum_v_low);
+		const __m256i old_sum_v_high = _mm256_loadu_si256(sum_v_high);
+		const __m256i old_sum_v2_low = _mm256_loadu_si256(sum_v2_low);
+		const __m256i old_sum_v2_high = _mm256_loadu_si256(sum_v2_high);
+
+		if constexpr (Add) {
+			_mm256_storeu_si256(sum_v_low, _mm256_add_epi64(old_sum_v_low, values64_low));
+			_mm256_storeu_si256(sum_v_high, _mm256_add_epi64(old_sum_v_high, values64_high));
+			_mm256_storeu_si256(sum_v2_low, _mm256_add_epi64(old_sum_v2_low, squares64_low));
+			_mm256_storeu_si256(sum_v2_high, _mm256_add_epi64(old_sum_v2_high, squares64_high));
+		} else {
+			_mm256_storeu_si256(sum_v_low, _mm256_sub_epi64(old_sum_v_low, values64_low));
+			_mm256_storeu_si256(sum_v_high, _mm256_sub_epi64(old_sum_v_high, values64_high));
+			_mm256_storeu_si256(sum_v2_low, _mm256_sub_epi64(old_sum_v2_low, squares64_low));
+			_mm256_storeu_si256(sum_v2_high, _mm256_sub_epi64(old_sum_v2_high, squares64_high));
+		}
+	}
+#endif
+
+	template <bool Add>
+	static inline void update_fm_factor_group(
+		Accumulator::FactorGroup& group, const WeightType* values) {
+#if defined(USE_AVX2) && !defined(USE_AVX512)
+		static_assert(kFactorDimensions == 32,
+			"AVX2 FM accumulator update expects 32 factor dimensions");
+		update_fm_factor_chunk<Add, 0>(group, values);
+		update_fm_factor_chunk<Add, 8>(group, values);
+		update_fm_factor_chunk<Add, 16>(group, values);
+		update_fm_factor_chunk<Add, 24>(group, values);
+#else
+		for (IndexType j = 0; j < kFactorDimensions; ++j) {
+			const std::int64_t v = values[j];
+			if constexpr (Add) {
+				group.sum_v[j] += v;
+				group.sum_v2[j] += v * v;
+			} else {
+				group.sum_v[j] -= v;
+				group.sum_v2[j] -= v * v;
+			}
+		}
+#endif
+	}
+
 	// Calculate cumulative value without using difference calculation
 	// 差分計算を用いずに累積値を計算する
 	void refresh_accumulator(const Position& pos) const {
@@ -568,11 +635,7 @@ class FeatureTransformer {
 						auto& group = (index < SPLIT_IDX) ? 
 									  accumulator.factors[perspective].ksdg: 
 									  accumulator.factors[perspective].halfka;
-						for (IndexType j = 0; j < kFactorDimensions; ++j) {
-							const std::int64_t v = v_weights_[v_offset + j];
-							group.sum_v[j]  += v;
-							group.sum_v2[j] += (v * v);
-						}
+						update_fm_factor_group<true>(group, &v_weights_[v_offset]);
 					}
 				}
 			}
@@ -673,11 +736,7 @@ class FeatureTransformer {
 							auto& group = (index < SPLIT_IDX) ? 
 										  accumulator.factors[perspective].ksdg: 
 										  accumulator.factors[perspective].halfka;
-							for (IndexType j = 0; j < kFactorDimensions; ++j) {
-								const std::int64_t v = v_weights_[v_offset + j];
-								group.sum_v[j]  -= v;
-								group.sum_v2[j] -= (v * v);
-							}
+							update_fm_factor_group<false>(group, &v_weights_[v_offset]);
 						}
 					}
 				}
@@ -705,11 +764,7 @@ class FeatureTransformer {
 							auto& group = (index < SPLIT_IDX) ? 
 										  accumulator.factors[perspective].ksdg: 
 										  accumulator.factors[perspective].halfka;
-							for (IndexType j = 0; j < kFactorDimensions; ++j) {
-								const std::int64_t v = v_weights_[v_offset + j];
-								group.sum_v[j]  += v;
-								group.sum_v2[j] += (v * v);
-							}
+							update_fm_factor_group<true>(group, &v_weights_[v_offset]);
 						}
 					}
 				}
