@@ -359,6 +359,209 @@ struct Network {
 		buf.fc_2_out[0] = static_cast<int32_t>(combined / 16384);
 		return buf.fc_2_out;
 	}
+
+#if defined(ENABLE_NNUE_BENCH)
+	// Benchmark-only stage entry points. These intentionally duplicate the normal
+	// Propagate() arithmetic so isolated stage timing does not add branches or
+	// instrumentation to the production evaluation path.
+	struct BenchmarkPhaseScales {
+		float main_sqr;
+		float main_raw;
+		float diff;
+		float abs_raw;
+		float abs_sqr;
+		float cross;
+	};
+
+	BenchmarkPhaseScales BenchmarkPhase(
+		const TransformedFeatureType* transformed_features,
+		const TransformedFeatureType* diff_features,
+		const TransformedFeatureType* abs_features, const int bucket_id,
+		std::uint8_t* phase_input, std::int32_t* phase_output) const {
+		for (int j = 0; j < 128; ++j) {
+			const int32_t abs_value = static_cast<int32_t>(abs_features[j]);
+			phase_input[j] = static_cast<std::uint8_t>(
+				std::clamp((abs_value - 64) * 2, 0, 127));
+			phase_input[j + 128] = diff_features[j];
+			phase_input[j + 256] = transformed_features[j];
+		}
+		phase_input[127] = static_cast<std::uint8_t>((bucket_id * 127) / 11);
+		phase_proj.PropagatePrefix<6>(phase_input, phase_output);
+
+		float phase_value[6];
+		for (int i = 0; i < 6; ++i) {
+			const float logit =
+				(static_cast<float>(phase_output[i]) / 8128.0f) * 3.0f + 1.0f;
+			const float sigmoid = 1.0f / (1.0f + std::exp(-logit));
+			phase_value[i] = 0.1f + 0.9f * sigmoid;
+		}
+
+		return {
+			(0.5f + 0.5f * phase_value[0]) * 1.3f,
+			(0.5f + 0.5f * phase_value[1]) * 1.5f,
+			(0.5f + 0.5f * phase_value[2]) * 1.0f,
+			(0.5f + 0.5f * phase_value[3]) * 0.7f,
+			(0.5f + 0.5f * phase_value[4]) * 0.88f,
+			(0.5f + 0.5f * phase_value[5]) * 1.5f};
+	}
+
+	void BenchmarkFmAffine(const TransformedFeatureType* diff_features,
+		const TransformedFeatureType* abs_features, std::int32_t* diff_output,
+		std::int32_t* abs_output) const {
+		fc_diff.Propagate(diff_features, diff_output);
+		fc_abs.Propagate(abs_features, abs_output);
+	}
+
+	void BenchmarkFmActivation(const std::int32_t* diff_fc_output,
+		const std::int32_t* abs_fc_output, std::uint8_t* diff_output,
+		std::uint8_t* abs_output, std::uint8_t* abs_sqr_output) const {
+		float sum_sq_diff = 0.0f;
+		for (int j = 0; j < 32; ++j) {
+			const float value = static_cast<float>(diff_fc_output[j + 32]);
+			sum_sq_diff += value * value;
+		}
+		const float inv_rms =
+			1.0f / std::sqrt(sum_sq_diff / 32.0f + 1e-8f);
+
+		for (int j = 0; j < 32; ++j) {
+			const int32_t diff_value = diff_fc_output[j + 32];
+			const float normalized = static_cast<float>(diff_value) * inv_rms;
+			const int32_t diff_scaled =
+				static_cast<int32_t>(normalized * 25.4f) + 64;
+			diff_output[j] = static_cast<std::uint8_t>(
+				std::max(0, std::min(127, diff_scaled)));
+
+			const int32_t abs_gated =
+				sigmoid_gate_slow(abs_fc_output[j], abs_fc_output[j + 32]);
+			const float abs_value = static_cast<float>(abs_gated) / 8128.0f;
+			const int32_t abs_scaled = static_cast<int32_t>(std::round(
+				std::clamp(abs_value * 0.05f + 0.6f, 0.0f, 1.0f) * 127.0f));
+			abs_output[j] = static_cast<std::uint8_t>(abs_scaled);
+
+			const int32_t square_value = abs_output[j];
+			abs_sqr_output[j] = static_cast<std::uint8_t>(
+				(square_value * square_value) / 127);
+		}
+	}
+
+	void BenchmarkMainFc0(const TransformedFeatureType* transformed_features,
+		std::int32_t* fc_output) const {
+		fc_0.Propagate(transformed_features, fc_output);
+	}
+
+	void BenchmarkMainGate(const std::int32_t* fc_input,
+		const std::int32_t* diff_fc_output, std::int32_t* fc_output) const {
+		for (int j = 0; j < 32; ++j) {
+			const int32_t sigmoid_half =
+				sigmoid_gate_slow(diff_fc_output[j] - 2438, 64);
+			fc_output[j] = static_cast<int32_t>(
+				(fc_input[j] * (64 + sigmoid_half)) / 128);
+			if (j < 31)
+				fc_output[j] = std::clamp(fc_output[j], 0, 8128);
+		}
+	}
+
+	void BenchmarkMainSqrClippedRelu(const std::int32_t* fc_output,
+		std::uint8_t* sqr_output) const {
+		ac_sqr_0.Propagate(fc_output, sqr_output);
+	}
+
+	void BenchmarkMainClippedRelu(const std::int32_t* fc_output,
+		std::uint8_t* raw_output) const {
+		ac_0.Propagate(fc_output, raw_output);
+	}
+
+	void BenchmarkMain(const TransformedFeatureType* transformed_features,
+		const std::int32_t* diff_fc_output, std::int32_t* fc_output,
+		std::uint8_t* sqr_output, std::uint8_t* raw_output) const {
+		BenchmarkMainFc0(transformed_features, fc_output);
+		BenchmarkMainGate(fc_output, diff_fc_output, fc_output);
+		BenchmarkMainSqrClippedRelu(fc_output, sqr_output);
+		BenchmarkMainClippedRelu(fc_output, raw_output);
+	}
+
+	void BenchmarkLca(const std::uint8_t* main_raw,
+		const std::uint8_t* diff_input, const std::uint8_t* abs_input,
+		std::uint8_t* diff_output, std::uint8_t* fm_input,
+		std::int32_t* query_output, std::int32_t* key_output,
+		std::int32_t* value_output) const {
+		for (int j = 0; j < 32; ++j) {
+			fm_input[j] = diff_input[j];
+			fm_input[j + 32] = abs_input[j];
+		}
+		lca_q.Propagate(main_raw, query_output);
+		lca_k.Propagate(fm_input, key_output);
+		lca_v.Propagate(fm_input, value_output);
+
+		float dot_product = 0.0f;
+		for (int j = 0; j < 32; ++j)
+			dot_product += (static_cast<float>(query_output[j]) / 8128.0f)
+				* (static_cast<float>(key_output[j]) / 8128.0f);
+		const float attention_logit = (dot_product * 0.17677f) / lca_temp;
+		const float attention_score =
+			1.0f / (1.0f + std::exp(-attention_logit));
+
+		for (int j = 0; j < 32; ++j) {
+			const float current_diff = static_cast<float>(diff_input[j]) / 127.0f;
+			const float value = static_cast<float>(value_output[j]) / 8128.0f;
+			const float clamped_value =
+				std::max(0.0f, std::min(1.0f, value * 0.4f + 0.5f));
+			const float final_diff = current_diff * (1.0f - attention_score)
+				+ clamped_value * attention_score;
+			diff_output[j] = static_cast<std::uint8_t>(final_diff * 127.0f);
+		}
+	}
+
+	void BenchmarkCross(const std::uint8_t* main_sqr,
+		const std::uint8_t* main_raw, const std::uint8_t* diff_input,
+		const std::uint8_t* abs_input, std::uint8_t* cross_input,
+		std::int32_t* cross_fc_output, std::uint8_t* cross_output) const {
+		for (int j = 0; j < 16; ++j) {
+			cross_input[j] = static_cast<std::uint8_t>(
+				(main_sqr[j] * diff_input[j]) / 127);
+			cross_input[j + 16] = static_cast<std::uint8_t>(
+				(main_raw[j] * abs_input[j]) / 127);
+		}
+		fc_cross.Propagate(cross_input, cross_fc_output);
+		ac_cross.Propagate(cross_fc_output, cross_output);
+	}
+
+	void BenchmarkL2Assembly(const std::uint8_t* main_sqr,
+		const std::uint8_t* main_raw, const std::uint8_t* diff_input,
+		const std::uint8_t* abs_input, const std::uint8_t* abs_sqr,
+		const std::uint8_t* cross_input, const BenchmarkPhaseScales& scales,
+		std::uint8_t* output) const {
+		AssembleL2Channel<31>(main_sqr, output, scales.main_sqr);
+		AssembleL2Channel<31>(main_raw, output + 31, scales.main_raw);
+		AssembleL2Channel<32>(diff_input, output + 62, scales.diff);
+		AssembleL2Channel<32>(abs_input, output + 94, scales.abs_raw);
+		AssembleL2Channel<32>(abs_sqr, output + 126, scales.abs_sqr);
+		AssembleL2Channel<32>(cross_input, output + 158, scales.cross);
+		std::memset(output + 190, 0, 2);
+	}
+
+	void BenchmarkFc1Activation(const std::uint8_t* input,
+		std::int32_t* fc_output, std::uint8_t* activation_output) const {
+		fc_1.Propagate(input, fc_output);
+		ac_1.Propagate(fc_output, activation_output);
+	}
+
+	void BenchmarkFc2(const std::uint8_t* input,
+		std::int32_t* output) const {
+		fc_2.Propagate(input, output);
+	}
+
+	std::int32_t BenchmarkBlend(const std::int32_t bypass_input,
+		const std::int32_t deep_output) const {
+		const int32_t bypass_output =
+			(bypass_input * (600 * 16)) / (127 * 64);
+		const int64_t combined =
+			static_cast<int64_t>(deep_output) * bucket_blend_alpha
+			+ static_cast<int64_t>(bypass_output)
+				* (16384 - bucket_blend_alpha);
+		return static_cast<std::int32_t>(combined / 16384);
+	}
+#endif
 };
 
 }  // namespace Eval::NNUE

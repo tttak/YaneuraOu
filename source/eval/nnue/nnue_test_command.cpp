@@ -1184,6 +1184,685 @@ void TestNetworkBenchmarkCompare(const std::uint64_t repeat_count) {
             << std::endl;
 }
 
+enum class NetworkStageBenchOperation {
+  Phase,
+  FmAffine,
+  FmActivation,
+  MainFc0,
+  MainGate,
+  MainSqrClippedRelu,
+  MainClippedRelu,
+  Lca,
+  Cross,
+  L2Assembly,
+  Fc1Activation,
+  Fc2,
+  Blend,
+};
+
+constexpr std::array<NetworkStageBenchOperation, 13>
+    kNetworkStageBenchOperations = {
+        NetworkStageBenchOperation::Phase,
+        NetworkStageBenchOperation::FmAffine,
+        NetworkStageBenchOperation::FmActivation,
+        NetworkStageBenchOperation::MainFc0,
+        NetworkStageBenchOperation::MainGate,
+        NetworkStageBenchOperation::MainSqrClippedRelu,
+        NetworkStageBenchOperation::MainClippedRelu,
+        NetworkStageBenchOperation::Lca,
+        NetworkStageBenchOperation::Cross,
+        NetworkStageBenchOperation::L2Assembly,
+        NetworkStageBenchOperation::Fc1Activation,
+        NetworkStageBenchOperation::Fc2,
+        NetworkStageBenchOperation::Blend};
+
+constexpr std::array<const char*, kNetworkStageBenchOperations.size()>
+    kNetworkStageBenchNames = {
+        "phase input + phase_proj + scales",
+        "FM Diff / Abs affine",
+        "FM activation / gate / RMSNorm",
+        "Main fc_0",
+        "Main gate + clamp",
+        "Main SqrClippedReLU",
+        "Main ClippedReLU",
+        "LCA",
+        "Cross",
+        "L2 input assembly",
+        "fc_1 + ac_1",
+        "fc_2",
+        "bypass + blend + output"};
+
+const Network& NnueBenchSelectedNetwork(const int selected_bucket) {
+#if defined(SFNNwoPSQT)
+  return *network[selected_bucket];
+#else
+  (void) selected_bucket;
+  return *network;
+#endif
+}
+
+struct alignas(kCacheLineSize) NetworkStageBenchCase {
+  NetworkBenchCase input;
+  Network::Buffer intermediate;
+  std::array<std::uint8_t, 32> diff_before_lca;
+  std::array<std::int32_t, 32> main_before_gate;
+  Network::BenchmarkPhaseScales phase_scales{};
+  std::int32_t fc2_before_blend = 0;
+  std::int32_t final_output = 0;
+};
+
+std::uint32_t NnueBenchFloatBits(const float value) {
+  std::uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+void MixNnueBenchFloatBits(std::uint64_t& checksum, const float value) {
+  MixNnueBenchChecksum(checksum, NnueBenchFloatBits(value));
+}
+
+template<typename T>
+void MixNnueBenchRange(std::uint64_t& checksum, const T* values,
+                       const std::size_t count) {
+  for (std::size_t index = 0; index < count; ++index)
+    MixNnueBenchChecksum(checksum, values[index]);
+}
+
+void MixNnueBenchPhaseScales(
+    std::uint64_t& checksum, const Network::BenchmarkPhaseScales& scales) {
+  MixNnueBenchFloatBits(checksum, scales.main_sqr);
+  MixNnueBenchFloatBits(checksum, scales.main_raw);
+  MixNnueBenchFloatBits(checksum, scales.diff);
+  MixNnueBenchFloatBits(checksum, scales.abs_raw);
+  MixNnueBenchFloatBits(checksum, scales.abs_sqr);
+  MixNnueBenchFloatBits(checksum, scales.cross);
+}
+
+struct NnueNetworkStageMismatch {
+  std::uint64_t count = 0;
+  std::int64_t max_abs_diff = 0;
+  std::size_t first_sample = 0;
+  std::size_t first_element = 0;
+  std::int64_t first_captured = 0;
+  std::int64_t first_recomputed = 0;
+};
+
+template<typename T>
+void CompareNnueNetworkStageRange(
+    const T* captured, const T* recomputed, const std::size_t count,
+    const std::size_t sample_index, NnueNetworkStageMismatch& mismatch) {
+  for (std::size_t element = 0; element < count; ++element) {
+    const std::int64_t captured_value = captured[element];
+    const std::int64_t recomputed_value = recomputed[element];
+    if (captured_value == recomputed_value)
+      continue;
+    const std::int64_t difference =
+        std::abs(captured_value - recomputed_value);
+    if (mismatch.count == 0) {
+      mismatch.first_sample = sample_index;
+      mismatch.first_element = element;
+      mismatch.first_captured = captured_value;
+      mismatch.first_recomputed = recomputed_value;
+    }
+    ++mismatch.count;
+    mismatch.max_abs_diff = std::max(mismatch.max_abs_diff, difference);
+  }
+}
+
+std::vector<NetworkStageBenchCase> MakeNnueNetworkStageBenchCorpus() {
+  const auto input_corpus = MakeNnueNetworkBenchCorpus();
+  std::vector<NetworkStageBenchCase> corpus;
+  corpus.reserve(input_corpus.size());
+
+  alignas(kCacheLineSize) char network_buffer[Network::kBufferSize];
+  alignas(kCacheLineSize) Network::Buffer stage_work{};
+
+  for (const auto& input : input_corpus) {
+    NetworkStageBenchCase sample{};
+    sample.input = input;
+    const Network& selected_network =
+        NnueBenchSelectedNetwork(input.selected_bucket);
+    const auto output = selected_network.Propagate(
+        input.transformed.data(), input.diff_transformed.data(),
+        input.abs_transformed.data(), input.material_bucket, network_buffer);
+    sample.final_output = output[0];
+    sample.intermediate =
+        *reinterpret_cast<const Network::Buffer*>(network_buffer);
+
+    sample.phase_scales = selected_network.BenchmarkPhase(
+        input.transformed.data(), input.diff_transformed.data(),
+        input.abs_transformed.data(), input.material_bucket,
+        stage_work.phase_input, stage_work.phase_out);
+    selected_network.BenchmarkFmActivation(
+        sample.intermediate.diff_fc_out, sample.intermediate.abs_fc_out,
+        sample.diff_before_lca.data(), stage_work.abs_ac_out,
+        stage_work.abs_sqr_out);
+    selected_network.BenchmarkMainFc0(
+        input.transformed.data(), sample.main_before_gate.data());
+    selected_network.BenchmarkFc2(sample.intermediate.ac_1_out,
+                                  &sample.fc2_before_blend);
+    corpus.emplace_back(std::move(sample));
+  }
+  return corpus;
+}
+
+void ComputeNnueNetworkStageValidationChecksums(
+    const std::vector<NetworkStageBenchCase>& corpus,
+    std::array<std::uint64_t, kNetworkStageBenchOperations.size()>&
+        captured_checksums,
+    std::array<std::uint64_t, kNetworkStageBenchOperations.size()>&
+        recomputed_checksums,
+    std::array<NnueNetworkStageMismatch,
+               kNetworkStageBenchOperations.size()>& mismatches,
+    NnueNetworkStageMismatch& l2_padding_mismatch,
+    std::uint64_t& normal_output_checksum,
+    std::uint64_t& staged_output_checksum) {
+  captured_checksums.fill(UINT64_C(14695981039346656037));
+  recomputed_checksums.fill(UINT64_C(14695981039346656037));
+  mismatches.fill(NnueNetworkStageMismatch{});
+  l2_padding_mismatch = {};
+  normal_output_checksum = staged_output_checksum =
+      UINT64_C(14695981039346656037);
+
+  alignas(kCacheLineSize) Network::Buffer work{};
+  for (std::size_t sample_index = 0; sample_index < corpus.size();
+       ++sample_index) {
+    const auto& sample = corpus[sample_index];
+    const Network& selected_network =
+        NnueBenchSelectedNetwork(sample.input.selected_bucket);
+
+    MixNnueBenchRange(captured_checksums[0], sample.intermediate.phase_input,
+                      384);
+    MixNnueBenchRange(captured_checksums[0], sample.intermediate.phase_out, 6);
+    MixNnueBenchPhaseScales(captured_checksums[0], sample.phase_scales);
+    MixNnueBenchRange(captured_checksums[1], sample.intermediate.diff_fc_out,
+                      64);
+    MixNnueBenchRange(captured_checksums[1], sample.intermediate.abs_fc_out,
+                      64);
+    MixNnueBenchRange(captured_checksums[2], sample.diff_before_lca.data(), 32);
+    MixNnueBenchRange(captured_checksums[2], sample.intermediate.abs_ac_out,
+                      32);
+    MixNnueBenchRange(captured_checksums[2], sample.intermediate.abs_sqr_out,
+                      32);
+    MixNnueBenchRange(captured_checksums[3], sample.main_before_gate.data(),
+                      32);
+    MixNnueBenchRange(captured_checksums[4], sample.intermediate.fc_0_out, 32);
+    MixNnueBenchRange(captured_checksums[5],
+                      sample.intermediate.ac_sqr_0_out_temp,
+                      32);
+    MixNnueBenchRange(captured_checksums[6], sample.intermediate.ac_0_out, 32);
+    MixNnueBenchRange(captured_checksums[7], sample.intermediate.diff_ac_out,
+                      32);
+    MixNnueBenchRange(captured_checksums[8], sample.intermediate.cross_cat,
+                      32);
+    MixNnueBenchRange(captured_checksums[8], sample.intermediate.cross_fc_out,
+                      32);
+    MixNnueBenchRange(captured_checksums[8], sample.intermediate.cross_feat,
+                      32);
+    MixNnueBenchRange(captured_checksums[9], sample.intermediate.l2_input,
+                      190);
+    MixNnueBenchRange(captured_checksums[10], sample.intermediate.ac_1_out,
+                      kHidden2Dims);
+    MixNnueBenchChecksum(captured_checksums[11], sample.fc2_before_blend);
+    MixNnueBenchChecksum(captured_checksums[12], sample.final_output);
+
+    const auto scales = selected_network.BenchmarkPhase(
+        sample.input.transformed.data(), sample.input.diff_transformed.data(),
+        sample.input.abs_transformed.data(), sample.input.material_bucket,
+        work.phase_input, work.phase_out);
+    MixNnueBenchRange(recomputed_checksums[0], work.phase_input, 384);
+    MixNnueBenchRange(recomputed_checksums[0], work.phase_out, 6);
+    MixNnueBenchPhaseScales(recomputed_checksums[0], scales);
+
+    selected_network.BenchmarkFmAffine(
+        sample.input.diff_transformed.data(),
+        sample.input.abs_transformed.data(), work.diff_fc_out,
+        work.abs_fc_out);
+    MixNnueBenchRange(recomputed_checksums[1], work.diff_fc_out, 64);
+    MixNnueBenchRange(recomputed_checksums[1], work.abs_fc_out, 64);
+
+    selected_network.BenchmarkFmActivation(
+        sample.intermediate.diff_fc_out, sample.intermediate.abs_fc_out,
+        work.diff_ac_out, work.abs_ac_out, work.abs_sqr_out);
+    MixNnueBenchRange(recomputed_checksums[2], work.diff_ac_out, 32);
+    MixNnueBenchRange(recomputed_checksums[2], work.abs_ac_out, 32);
+    MixNnueBenchRange(recomputed_checksums[2], work.abs_sqr_out, 32);
+
+    selected_network.BenchmarkMainFc0(sample.input.transformed.data(),
+                                      work.fc_0_out);
+    MixNnueBenchRange(recomputed_checksums[3], work.fc_0_out, 32);
+    selected_network.BenchmarkMainGate(
+        sample.main_before_gate.data(), sample.intermediate.diff_fc_out,
+        work.fc_0_out);
+    MixNnueBenchRange(recomputed_checksums[4], work.fc_0_out, 32);
+    selected_network.BenchmarkMainSqrClippedRelu(
+        sample.intermediate.fc_0_out, work.ac_sqr_0_out_temp);
+    MixNnueBenchRange(recomputed_checksums[5],
+                      work.ac_sqr_0_out_temp, 32);
+    selected_network.BenchmarkMainClippedRelu(
+        sample.intermediate.fc_0_out, work.ac_0_out);
+    MixNnueBenchRange(recomputed_checksums[6], work.ac_0_out, 32);
+
+    selected_network.BenchmarkLca(
+        sample.intermediate.ac_0_out, sample.diff_before_lca.data(),
+        sample.intermediate.abs_ac_out, work.diff_ac_out,
+        work.fm_cat_uint8, work.lca_q_out, work.lca_k_out, work.lca_v_out);
+    MixNnueBenchRange(recomputed_checksums[7], work.diff_ac_out, 32);
+    CompareNnueNetworkStageRange(
+        sample.intermediate.diff_ac_out, work.diff_ac_out, 32, sample_index,
+        mismatches[7]);
+
+    selected_network.BenchmarkCross(
+        sample.intermediate.ac_sqr_0_out_temp,
+        sample.intermediate.ac_0_out, sample.intermediate.diff_ac_out,
+        sample.intermediate.abs_ac_out, work.cross_cat, work.cross_fc_out,
+        work.cross_feat);
+    MixNnueBenchRange(recomputed_checksums[8], work.cross_cat, 32);
+    MixNnueBenchRange(recomputed_checksums[8], work.cross_fc_out, 32);
+    MixNnueBenchRange(recomputed_checksums[8], work.cross_feat, 32);
+
+    selected_network.BenchmarkL2Assembly(
+        sample.intermediate.ac_sqr_0_out_temp,
+        sample.intermediate.ac_0_out, sample.intermediate.diff_ac_out,
+        sample.intermediate.abs_ac_out, sample.intermediate.abs_sqr_out,
+        sample.intermediate.cross_feat, sample.phase_scales, work.l2_input);
+    MixNnueBenchRange(recomputed_checksums[9], work.l2_input, 190);
+    CompareNnueNetworkStageRange(
+        sample.intermediate.l2_input, work.l2_input, 190, sample_index,
+        mismatches[9]);
+    CompareNnueNetworkStageRange(
+        sample.intermediate.l2_input + 190, work.l2_input + 190, 2,
+        sample_index, l2_padding_mismatch);
+
+    selected_network.BenchmarkFc1Activation(
+        sample.intermediate.l2_input, work.fc_1_out, work.ac_1_out);
+    MixNnueBenchRange(recomputed_checksums[10], work.ac_1_out,
+                      kHidden2Dims);
+    CompareNnueNetworkStageRange(
+        sample.intermediate.ac_1_out, work.ac_1_out, kHidden2Dims,
+        sample_index, mismatches[10]);
+
+    selected_network.BenchmarkFc2(sample.intermediate.ac_1_out,
+                                  work.fc_2_out);
+    MixNnueBenchChecksum(recomputed_checksums[11], work.fc_2_out[0]);
+    work.fc_2_out[0] = selected_network.BenchmarkBlend(
+        sample.intermediate.fc_0_out[31], sample.fc2_before_blend);
+    MixNnueBenchChecksum(recomputed_checksums[12], work.fc_2_out[0]);
+
+    MixNnueBenchChecksum(normal_output_checksum, sample.final_output);
+    MixNnueBenchChecksum(staged_output_checksum, work.fc_2_out[0]);
+  }
+}
+
+template<NetworkStageBenchOperation Operation>
+NnueBenchTiming MeasureNnueNetworkStageCorpus(
+    const std::vector<NetworkStageBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  alignas(kCacheLineSize) Network::Buffer work{};
+  NnueBenchTiming timing;
+
+  const auto begin = NnueBenchClock::now();
+  for (const auto& sample : corpus) {
+    const Network& selected_network =
+        NnueBenchSelectedNetwork(sample.input.selected_bucket);
+    const std::size_t index = static_cast<std::size_t>(timing.calls);
+    std::uint64_t representative = 0;
+
+    if constexpr (Operation == NetworkStageBenchOperation::Phase) {
+      const auto scales = selected_network.BenchmarkPhase(
+          sample.input.transformed.data(),
+          sample.input.diff_transformed.data(),
+          sample.input.abs_transformed.data(), sample.input.material_bucket,
+          work.phase_input, work.phase_out);
+      const float selected_scale = index % 2 == 0 ? scales.main_sqr
+                                                  : scales.cross;
+      representative = static_cast<std::uint32_t>(work.phase_out[index % 6])
+          ^ (static_cast<std::uint64_t>(NnueBenchFloatBits(selected_scale))
+             << 32);
+    } else if constexpr (Operation == NetworkStageBenchOperation::FmAffine) {
+      selected_network.BenchmarkFmAffine(
+          sample.input.diff_transformed.data(),
+          sample.input.abs_transformed.data(), work.diff_fc_out,
+          work.abs_fc_out);
+      representative = static_cast<std::uint32_t>(
+                           work.diff_fc_out[index % 64])
+          ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(
+                 work.abs_fc_out[index % 64])) << 32);
+    } else if constexpr (Operation ==
+                         NetworkStageBenchOperation::FmActivation) {
+      selected_network.BenchmarkFmActivation(
+          sample.intermediate.diff_fc_out, sample.intermediate.abs_fc_out,
+          work.diff_ac_out, work.abs_ac_out, work.abs_sqr_out);
+      representative = work.diff_ac_out[index % 32]
+          ^ (static_cast<std::uint64_t>(work.abs_ac_out[index % 32]) << 8)
+          ^ (static_cast<std::uint64_t>(work.abs_sqr_out[index % 32]) << 16);
+    } else if constexpr (Operation == NetworkStageBenchOperation::MainFc0) {
+      selected_network.BenchmarkMainFc0(sample.input.transformed.data(),
+                                        work.fc_0_out);
+      representative = static_cast<std::uint32_t>(work.fc_0_out[index % 32])
+          ^ (static_cast<std::uint64_t>(
+                 static_cast<std::uint32_t>(work.fc_0_out[(index + 17) % 32]))
+             << 32);
+    } else if constexpr (Operation == NetworkStageBenchOperation::MainGate) {
+      selected_network.BenchmarkMainGate(
+          sample.main_before_gate.data(), sample.intermediate.diff_fc_out,
+          work.fc_0_out);
+      representative = static_cast<std::uint32_t>(work.fc_0_out[index % 32])
+          ^ (static_cast<std::uint64_t>(
+                 static_cast<std::uint32_t>(work.fc_0_out[(index + 17) % 32]))
+             << 32);
+    } else if constexpr (Operation ==
+                         NetworkStageBenchOperation::MainSqrClippedRelu) {
+      selected_network.BenchmarkMainSqrClippedRelu(
+          sample.intermediate.fc_0_out, work.ac_sqr_0_out_temp);
+      representative = work.ac_sqr_0_out_temp[index % 32];
+    } else if constexpr (Operation ==
+                         NetworkStageBenchOperation::MainClippedRelu) {
+      selected_network.BenchmarkMainClippedRelu(
+          sample.intermediate.fc_0_out, work.ac_0_out);
+      representative = work.ac_0_out[index % 32];
+    } else if constexpr (Operation == NetworkStageBenchOperation::Lca) {
+      selected_network.BenchmarkLca(
+          sample.intermediate.ac_0_out, sample.diff_before_lca.data(),
+          sample.intermediate.abs_ac_out, work.diff_ac_out,
+          work.fm_cat_uint8, work.lca_q_out, work.lca_k_out,
+          work.lca_v_out);
+      representative = work.diff_ac_out[index % 32]
+          ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(
+                 work.lca_q_out[index % 32])) << 8)
+          ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(
+                 work.lca_k_out[index % 32])) << 24)
+          ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(
+                 work.lca_v_out[index % 32])) << 40);
+    } else if constexpr (Operation == NetworkStageBenchOperation::Cross) {
+      selected_network.BenchmarkCross(
+          sample.intermediate.ac_sqr_0_out_temp,
+          sample.intermediate.ac_0_out, sample.intermediate.diff_ac_out,
+          sample.intermediate.abs_ac_out, work.cross_cat,
+          work.cross_fc_out, work.cross_feat);
+      representative = work.cross_cat[index % 32]
+          ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(
+                 work.cross_fc_out[index % 32])) << 8)
+          ^ (static_cast<std::uint64_t>(work.cross_feat[index % 32]) << 48);
+    } else if constexpr (Operation ==
+                         NetworkStageBenchOperation::L2Assembly) {
+      selected_network.BenchmarkL2Assembly(
+          sample.intermediate.ac_sqr_0_out_temp,
+          sample.intermediate.ac_0_out, sample.intermediate.diff_ac_out,
+          sample.intermediate.abs_ac_out, sample.intermediate.abs_sqr_out,
+          sample.intermediate.cross_feat, sample.phase_scales,
+          work.l2_input);
+      representative = work.l2_input[index % L2_INPUT_SIZE];
+    } else if constexpr (Operation ==
+                         NetworkStageBenchOperation::Fc1Activation) {
+      selected_network.BenchmarkFc1Activation(
+          sample.intermediate.l2_input, work.fc_1_out, work.ac_1_out);
+      representative = static_cast<std::uint32_t>(
+                           work.fc_1_out[index % kHidden2Dims])
+          ^ (static_cast<std::uint64_t>(work.ac_1_out[index % kHidden2Dims])
+             << 48);
+    } else if constexpr (Operation == NetworkStageBenchOperation::Fc2) {
+      selected_network.BenchmarkFc2(sample.intermediate.ac_1_out,
+                                    work.fc_2_out);
+      representative = work.fc_2_out[0];
+    } else {
+      const std::int32_t output = selected_network.BenchmarkBlend(
+          sample.intermediate.fc_0_out[31], sample.fc2_before_blend);
+      representative = output;
+    }
+    MixNnueBenchChecksum(checksum, static_cast<std::int64_t>(representative));
+    ++timing.calls;
+  }
+  const auto end = NnueBenchClock::now();
+  timing.nanoseconds =
+      std::chrono::duration<double, std::nano>(end - begin).count();
+  return timing;
+}
+
+NnueBenchTiming MeasureNnueNetworkStageByIndex(
+    const std::vector<NetworkStageBenchCase>& corpus,
+    const std::size_t stage_index, std::uint64_t& checksum) {
+  switch (kNetworkStageBenchOperations[stage_index]) {
+    case NetworkStageBenchOperation::Phase:
+      return MeasureNnueNetworkStageCorpus<NetworkStageBenchOperation::Phase>(
+          corpus, checksum);
+    case NetworkStageBenchOperation::FmAffine:
+      return MeasureNnueNetworkStageCorpus<
+          NetworkStageBenchOperation::FmAffine>(corpus, checksum);
+    case NetworkStageBenchOperation::FmActivation:
+      return MeasureNnueNetworkStageCorpus<
+          NetworkStageBenchOperation::FmActivation>(corpus, checksum);
+    case NetworkStageBenchOperation::MainFc0:
+      return MeasureNnueNetworkStageCorpus<
+          NetworkStageBenchOperation::MainFc0>(corpus, checksum);
+    case NetworkStageBenchOperation::MainGate:
+      return MeasureNnueNetworkStageCorpus<
+          NetworkStageBenchOperation::MainGate>(corpus, checksum);
+    case NetworkStageBenchOperation::MainSqrClippedRelu:
+      return MeasureNnueNetworkStageCorpus<
+          NetworkStageBenchOperation::MainSqrClippedRelu>(corpus, checksum);
+    case NetworkStageBenchOperation::MainClippedRelu:
+      return MeasureNnueNetworkStageCorpus<
+          NetworkStageBenchOperation::MainClippedRelu>(corpus, checksum);
+    case NetworkStageBenchOperation::Lca:
+      return MeasureNnueNetworkStageCorpus<NetworkStageBenchOperation::Lca>(
+          corpus, checksum);
+    case NetworkStageBenchOperation::Cross:
+      return MeasureNnueNetworkStageCorpus<NetworkStageBenchOperation::Cross>(
+          corpus, checksum);
+    case NetworkStageBenchOperation::L2Assembly:
+      return MeasureNnueNetworkStageCorpus<
+          NetworkStageBenchOperation::L2Assembly>(corpus, checksum);
+    case NetworkStageBenchOperation::Fc1Activation:
+      return MeasureNnueNetworkStageCorpus<
+          NetworkStageBenchOperation::Fc1Activation>(corpus, checksum);
+    case NetworkStageBenchOperation::Fc2:
+      return MeasureNnueNetworkStageCorpus<NetworkStageBenchOperation::Fc2>(
+          corpus, checksum);
+    case NetworkStageBenchOperation::Blend:
+      return MeasureNnueNetworkStageCorpus<NetworkStageBenchOperation::Blend>(
+          corpus, checksum);
+  }
+  return {};
+}
+
+NnueBenchTiming MeasureNnueNetworkStageAfterWarmup(
+    const std::vector<NetworkStageBenchCase>& corpus,
+    const std::size_t stage_index, std::uint64_t& checksum) {
+  MeasureNnueNetworkStageByIndex(corpus, stage_index, checksum);
+  return MeasureNnueNetworkStageByIndex(corpus, stage_index, checksum);
+}
+
+NnueBenchTiming MeasureNnueFullNetworkStageCorpus(
+    const std::vector<NetworkStageBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  alignas(kCacheLineSize) char network_buffer[Network::kBufferSize];
+  NnueBenchTiming timing;
+  const auto begin = NnueBenchClock::now();
+  for (const auto& sample : corpus) {
+    const auto output = NnueBenchSelectedNetwork(sample.input.selected_bucket)
+        .Propagate(sample.input.transformed.data(),
+                   sample.input.diff_transformed.data(),
+                   sample.input.abs_transformed.data(),
+                   sample.input.material_bucket, network_buffer);
+    MixNnueBenchChecksum(checksum, output[0]);
+    ++timing.calls;
+  }
+  const auto end = NnueBenchClock::now();
+  timing.nanoseconds =
+      std::chrono::duration<double, std::nano>(end - begin).count();
+  return timing;
+}
+
+NnueBenchTiming MeasureNnueFullNetworkStageAfterWarmup(
+    const std::vector<NetworkStageBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  MeasureNnueFullNetworkStageCorpus(corpus, checksum);
+  return MeasureNnueFullNetworkStageCorpus(corpus, checksum);
+}
+
+void PrintNnueNetworkStageSamples(const char* const name,
+                                  const NnueBenchSamples& samples,
+                                  const double full_median) {
+  const NnueBenchSummary summary = SummarizeNnueBenchSamples(samples);
+  const double percentage = full_median == 0.0
+      ? 0.0
+      : summary.median * 100.0 / full_median;
+  std::cout << name << std::endl
+            << "  median ns/call : " << std::fixed << std::setprecision(1)
+            << summary.median << std::endl
+            << "  mean ns/call   : " << summary.mean << std::endl
+            << "  min ns/call    : " << summary.minimum << std::endl
+            << "  max ns/call    : " << summary.maximum << std::endl
+            << "  share of full  : " << std::setprecision(2) << percentage
+            << "%" << std::endl;
+}
+
+void TestNetworkStagesBenchmark(const std::uint64_t repeat_count) {
+  std::cout << "[NNUE benchmark: Network stages]" << std::endl
+            << "  seed         : " << kNnueBenchSeed << std::endl
+            << "  corpus games : " << kNnueBenchMeasuredGames << std::endl
+            << "  max ply/game : " << kNnueBenchMaxPly << std::endl
+            << "  repeats      : " << repeat_count << std::endl
+            << "  stage order  : rotated by one stage per repeat" << std::endl;
+
+  const auto corpus = MakeNnueNetworkStageBenchCorpus();
+  if (corpus.empty()) {
+    std::cout << "error: NNUE network stage benchmark corpus is empty"
+              << std::endl;
+    return;
+  }
+  std::cout << "  corpus calls : " << corpus.size() << std::endl
+            << "  warm-up calls: " << corpus.size()
+            << " before every timed sample" << std::endl;
+
+  std::array<std::uint64_t, kNetworkStageBenchOperations.size()>
+      captured_checksums;
+  std::array<std::uint64_t, kNetworkStageBenchOperations.size()>
+      recomputed_checksums;
+  std::array<NnueNetworkStageMismatch,
+             kNetworkStageBenchOperations.size()> mismatches{};
+  NnueNetworkStageMismatch l2_padding_mismatch{};
+  std::uint64_t normal_output_checksum;
+  std::uint64_t staged_output_checksum;
+  ComputeNnueNetworkStageValidationChecksums(
+      corpus, captured_checksums, recomputed_checksums, mismatches,
+      l2_padding_mismatch,
+      normal_output_checksum, staged_output_checksum);
+
+  std::array<NnueBenchSamples, kNetworkStageBenchOperations.size()>
+      stage_samples;
+  NnueBenchSamples full_samples;
+  std::array<std::uint64_t, kNetworkStageBenchOperations.size()>
+      stage_checksums;
+  stage_checksums.fill(UINT64_C(14695981039346656037));
+  std::uint64_t full_timing_checksum = UINT64_C(14695981039346656037);
+
+  constexpr std::size_t operation_count =
+      kNetworkStageBenchOperations.size() + 1;
+  for (std::uint64_t repeat = 0; repeat < repeat_count; ++repeat) {
+    const std::size_t rotation = repeat % operation_count;
+    for (std::size_t offset = 0; offset < operation_count; ++offset) {
+      const std::size_t operation = (rotation + offset) % operation_count;
+      if (operation == kNetworkStageBenchOperations.size()) {
+        full_samples.Add(MeasureNnueFullNetworkStageAfterWarmup(
+            corpus, full_timing_checksum));
+      } else {
+        stage_samples[operation].Add(MeasureNnueNetworkStageAfterWarmup(
+            corpus, operation, stage_checksums[operation]));
+      }
+    }
+  }
+
+  const NnueBenchSummary full_summary =
+      SummarizeNnueBenchSamples(full_samples);
+  double summed_stage_medians = 0.0;
+  bool all_intermediate_checksums_match = true;
+  for (std::size_t stage = 0;
+       stage < kNetworkStageBenchOperations.size(); ++stage) {
+    PrintNnueNetworkStageSamples(kNetworkStageBenchNames[stage],
+                                 stage_samples[stage], full_summary.median);
+    summed_stage_medians +=
+        SummarizeNnueBenchSamples(stage_samples[stage]).median;
+    std::cout << "  timing checksum : 0x" << std::hex
+              << stage_checksums[stage] << std::dec << std::endl
+              << "  captured checksum: 0x" << std::hex
+              << captured_checksums[stage] << std::endl
+              << "  recomputed checksum: 0x"
+              << recomputed_checksums[stage] << std::dec << std::endl
+              << "  intermediate match: "
+              << (captured_checksums[stage] == recomputed_checksums[stage]
+                      ? "yes"
+                      : "NO")
+              << std::endl;
+    if (mismatches[stage].count != 0) {
+      const auto& mismatch = mismatches[stage];
+      std::cout << "  first mismatch sample : " << mismatch.first_sample
+                << std::endl
+                << "  first mismatch element: " << mismatch.first_element
+                << std::endl
+                << "  captured value        : " << mismatch.first_captured
+                << std::endl
+                << "  recomputed value      : " << mismatch.first_recomputed
+                << std::endl
+                << "  max abs diff          : " << mismatch.max_abs_diff
+                << std::endl
+                << "  mismatch count        : " << mismatch.count
+                << std::endl;
+    }
+    if (stage == 9) {
+      std::cout << "  L2 real range         : [0, 190)" << std::endl
+                << "  L2 padding range      : [190, 192)" << std::endl
+                << "  L2 padding match      : "
+                << (l2_padding_mismatch.count == 0 ? "yes" : "NO")
+                << std::endl;
+      if (l2_padding_mismatch.count != 0) {
+        std::cout << "  padding first sample  : "
+                  << l2_padding_mismatch.first_sample << std::endl
+                  << "  padding first element : "
+                  << l2_padding_mismatch.first_element << std::endl
+                  << "  padding captured      : "
+                  << l2_padding_mismatch.first_captured << std::endl
+                  << "  padding recomputed    : "
+                  << l2_padding_mismatch.first_recomputed << std::endl
+                  << "  padding max abs diff  : "
+                  << l2_padding_mismatch.max_abs_diff << std::endl
+                  << "  padding mismatch count: "
+                  << l2_padding_mismatch.count << std::endl;
+      }
+    }
+    all_intermediate_checksums_match &=
+        captured_checksums[stage] == recomputed_checksums[stage];
+  }
+  all_intermediate_checksums_match &= l2_padding_mismatch.count == 0;
+
+  PrintNnueNetworkStageSamples("full Network::Propagate", full_samples,
+                               full_summary.median);
+  std::cout << "  timing checksum : 0x" << std::hex
+            << full_timing_checksum << std::dec << std::endl
+            << "summed isolated stage medians : " << std::fixed
+            << std::setprecision(1) << summed_stage_medians << " ns/call"
+            << std::endl
+            << "full Network median           : " << full_summary.median
+            << " ns/call" << std::endl
+            << "all intermediate stages match : "
+            << (all_intermediate_checksums_match ? "yes" : "NO")
+            << std::endl
+            << "normal output checksum        : 0x" << std::hex
+            << normal_output_checksum << std::endl
+            << "staged output checksum        : 0x"
+            << staged_output_checksum << std::dec << std::endl
+            << "final output checksum match   : "
+            << (normal_output_checksum == staged_output_checksum ? "yes"
+                                                                  : "NO")
+            << std::endl
+            << "note: isolated stage medians need not sum to the full median;"
+            << std::endl
+            << "      cache state, materialized buffers, call boundaries, and"
+            << std::endl
+            << "      producer/consumer locality differ." << std::endl;
+}
+
 struct alignas(kCacheLineSize) SqrClippedReluBenchCase {
   std::array<std::int32_t, 32> input;
   int selected_bucket = 0;
@@ -2495,6 +3174,10 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::uint64_t repeat_count;
     if (ReadNnueBenchRepeatCount(stream, repeat_count))
       TestNetworkBenchmarkCompare(repeat_count);
+  } else if (sub_command == "bench_network_stages") {
+    std::uint64_t repeat_count;
+    if (ReadNnueBenchRepeatCount(stream, repeat_count))
+      TestNetworkStagesBenchmark(repeat_count);
   } else if (sub_command == "bench_sqr_clipped_relu_compare") {
     std::uint64_t repeat_count;
     if (ReadNnueBenchRepeatCount(stream, repeat_count))
@@ -2516,6 +3199,7 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << " test nnue bench_ft [repeats]" << std::endl;
     std::cout << " test nnue bench_network [repeats]" << std::endl;
     std::cout << " test nnue bench_network_compare [repeats]" << std::endl;
+    std::cout << " test nnue bench_network_stages [repeats]" << std::endl;
     std::cout << " test nnue bench_sqr_clipped_relu_compare [repeats]"
               << std::endl;
 #endif
