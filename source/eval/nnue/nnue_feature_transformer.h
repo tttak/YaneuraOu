@@ -730,36 +730,44 @@ class FeatureTransformer {
 				} else {
 					// Difference calculation for the feature amount changed from 1 to 0
 					// 1から0に変化した特徴量に関する差分計算
-					std::memcpy(accumulator.accumulation[perspective][i], prev_accumulator.accumulation[perspective][i],
-					            kHalfDimensions * sizeof(BiasType));
+					const bool direct_fused_main_update =
+						removed_indices[perspective].size() == 1
+						&& added_indices[perspective].size() == 1;
+
+					if (!direct_fused_main_update) {
+						std::memcpy(accumulator.accumulation[perspective][i],
+						            prev_accumulator.accumulation[perspective][i],
+						            kHalfDimensions * sizeof(BiasType));
+					}
 
 					if (i == 0) {
 						std::memcpy(&accumulator.factors[perspective], &prev_accumulator.factors[perspective], sizeof(accumulator.factors[perspective]));
 					}
 
-					// Fuse the common one-remove/one-add Main FT update so each
-					// accumulator chunk is loaded and stored only once. FM updates
-					// remain in the existing removed/added loops below.
-					if (removed_indices[perspective].size() == 1
-						&& added_indices[perspective].size() == 1) {
+					// Build the common one-remove/one-add Main FT update directly
+					// from the previous accumulator, avoiding the preceding Main copy.
+					// FM updates remain in the existing removed/added loops below.
+					if (direct_fused_main_update) {
 						const IndexType removed_offset =
 							kHalfDimensions * removed_indices[perspective][0];
 						const IndexType added_offset =
 							kHalfDimensions * added_indices[perspective][0];
 #if defined(VECTOR)
+						auto previous_accumulation = reinterpret_cast<const vec_t*>(
+							&prev_accumulator.accumulation[perspective][i][0]);
 						auto removed_column =
 							reinterpret_cast<const vec_t*>(&weights_[removed_offset]);
 						auto added_column =
 							reinterpret_cast<const vec_t*>(&weights_[added_offset]);
 						for (IndexType j = 0; j < kNumChunks; ++j) {
 							const vec_t after_remove =
-								vec_sub_16(accumulation[j], removed_column[j]);
+								vec_sub_16(previous_accumulation[j], removed_column[j]);
 							accumulation[j] = vec_add_16(after_remove, added_column[j]);
 						}
 #else
 						for (IndexType j = 0; j < kHalfDimensions; ++j) {
 							BiasType after_remove = static_cast<BiasType>(
-								accumulator.accumulation[perspective][i][j]
+								prev_accumulator.accumulation[perspective][i][j]
 								- weights_[removed_offset + j]);
 							accumulator.accumulation[perspective][i][j] =
 								static_cast<BiasType>(after_remove
