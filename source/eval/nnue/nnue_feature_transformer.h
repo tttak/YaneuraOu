@@ -703,7 +703,7 @@ class FeatureTransformer {
 	// Calculate cumulative value using difference calculation
 	// 差分計算を用いて累積値を計算する
 	void update_accumulator(const Position& pos) const {
-		const auto prev_accumulator = pos.state()->previous->accumulator;
+		const auto& prev_accumulator = pos.state()->previous->accumulator;
 		auto&      accumulator      = pos.state()->accumulator;
 		for (IndexType i = 0; i < kRefreshTriggers.size(); ++i) {
 			Features::IndexList removed_indices[2], added_indices[2];
