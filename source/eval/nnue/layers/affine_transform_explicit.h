@@ -315,6 +315,69 @@ class AffineTransformExplicit {
 #endif
         }
 
+#if defined(ENABLE_NNUE_BENCH) && defined(USE_AVX2) \
+        && !defined(USE_AVX512)
+        // Benchmark-only candidate for AffineTransformExplicit<192, 96>.
+        // It retains the physical 96-output weight stride and the per-output
+        // input-block accumulation order, but computes 64 and 32 output tiles
+        // in separate passes to reduce live YMM accumulators from 12 to 8/4.
+        void BenchmarkPropagateOutputTiled64And32(
+          const InputType* input, OutputType* output) const {
+                static_assert(kInputDimensions == 192);
+                static_assert(kPaddedInputDimensions == 192);
+                static_assert(kOutputDimensions == 96);
+
+                constexpr IndexType kNumChunks = kInputDimensions / 4;
+                const auto input32 =
+                  reinterpret_cast<const std::int32_t*>(input);
+                const auto biasvec =
+                  reinterpret_cast<const __m256i*>(biases_);
+                auto outptr = reinterpret_cast<__m256i*>(output);
+
+                {
+                        __m256i acc[8];
+                        for (IndexType k = 0; k < 8; ++k)
+                                acc[k] = biasvec[k];
+
+                        for (IndexType i = 0; i < kNumChunks; ++i)
+                        {
+                                const __m256i in =
+                                  _mm256_set1_epi32(input32[i]);
+                                const auto col =
+                                  reinterpret_cast<const __m256i*>(
+                                    &weights_[i * kOutputDimensions * 4]);
+                                for (IndexType k = 0; k < 8; ++k)
+                                        Simd::m256_add_dpbusd_epi32(
+                                          acc[k], in, col[k]);
+                        }
+
+                        for (IndexType k = 0; k < 8; ++k)
+                                outptr[k] = acc[k];
+                }
+
+                {
+                        __m256i acc[4];
+                        for (IndexType k = 0; k < 4; ++k)
+                                acc[k] = biasvec[k + 8];
+
+                        for (IndexType i = 0; i < kNumChunks; ++i)
+                        {
+                                const __m256i in =
+                                  _mm256_set1_epi32(input32[i]);
+                                const auto col =
+                                  reinterpret_cast<const __m256i*>(
+                                    &weights_[i * kOutputDimensions * 4]);
+                                for (IndexType k = 0; k < 4; ++k)
+                                        Simd::m256_add_dpbusd_epi32(
+                                          acc[k], in, col[k + 8]);
+                        }
+
+                        for (IndexType k = 0; k < 4; ++k)
+                                outptr[k + 8] = acc[k];
+                }
+        }
+#endif
+
    private:
         using BiasType   = OutputType;
         using WeightType = std::int8_t;

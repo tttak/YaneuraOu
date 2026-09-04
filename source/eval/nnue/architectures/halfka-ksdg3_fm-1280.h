@@ -115,6 +115,44 @@ struct Network {
 		return static_cast<int32_t>(value * sig);
 	}
 
+	static inline void ComputeAbsSquaredScalar(const std::uint8_t* input,
+		std::uint8_t* output) {
+		for (int j = 0; j < 32; ++j) {
+			const int32_t value = input[j];
+			output[j] = static_cast<std::uint8_t>((value * value) / 127);
+		}
+	}
+
+	static inline void ComputeAbsSquared(const std::uint8_t* input,
+		std::uint8_t* output) {
+#if defined(USE_AVX2)
+		// input is the clamped Abs activation in [0, 127]. For this range,
+		// mulhi_u16((x * x) + 1, 516) is exactly floor((x * x) / 127).
+		const __m256i input_bytes = _mm256_loadu_si256(
+			reinterpret_cast<const __m256i*>(input));
+		const __m256i low = _mm256_cvtepu8_epi16(
+			_mm256_castsi256_si128(input_bytes));
+		const __m256i high = _mm256_cvtepu8_epi16(
+			_mm256_extracti128_si256(input_bytes, 1));
+		const __m256i one = _mm256_set1_epi16(1);
+		const __m256i division_magic = _mm256_set1_epi16(516);
+
+		const __m256i low_squared = _mm256_mullo_epi16(low, low);
+		const __m256i high_squared = _mm256_mullo_epi16(high, high);
+		const __m256i low_quotient = _mm256_mulhi_epu16(
+			_mm256_add_epi16(low_squared, one), division_magic);
+		const __m256i high_quotient = _mm256_mulhi_epu16(
+			_mm256_add_epi16(high_squared, one), division_magic);
+
+		const __m256i packed = _mm256_packus_epi16(
+			low_quotient, high_quotient);
+		const __m256i ordered = _mm256_permute4x64_epi64(packed, 0xd8);
+		_mm256_storeu_si256(reinterpret_cast<__m256i*>(output), ordered);
+#else
+		ComputeAbsSquaredScalar(input, output);
+#endif
+	}
+
 	template<IndexType Dimensions>
 	static inline void AssembleL2Channel(const std::uint8_t* input,
 		std::uint8_t* output, const float scale) {
@@ -263,11 +301,9 @@ struct Network {
 			);
 			buf.abs_ac_out[j] = static_cast<uint8_t>(a_scaled);
 
-			// Abs Sqr Path: 二乗による非線形強調
-			int32_t val_sq = buf.abs_ac_out[j];
-			int32_t sqr_full = (val_sq * val_sq) / 127;
-			buf.abs_sqr_out[j] = static_cast<uint8_t>(sqr_full);
 		}
+		// Abs Sqr Path: 二乗による非線形強調
+		ComputeAbsSquared(buf.abs_ac_out, buf.abs_sqr_out);
 
 
 		// --- 3. Main Path: 基本骨格パスと FM による動的フィルタリング ---
@@ -373,21 +409,8 @@ struct Network {
 		float cross;
 	};
 
-	BenchmarkPhaseScales BenchmarkPhase(
-		const TransformedFeatureType* transformed_features,
-		const TransformedFeatureType* diff_features,
-		const TransformedFeatureType* abs_features, const int bucket_id,
-		std::uint8_t* phase_input, std::int32_t* phase_output) const {
-		for (int j = 0; j < 128; ++j) {
-			const int32_t abs_value = static_cast<int32_t>(abs_features[j]);
-			phase_input[j] = static_cast<std::uint8_t>(
-				std::clamp((abs_value - 64) * 2, 0, 127));
-			phase_input[j + 128] = diff_features[j];
-			phase_input[j + 256] = transformed_features[j];
-		}
-		phase_input[127] = static_cast<std::uint8_t>((bucket_id * 127) / 11);
-		phase_proj.PropagatePrefix<6>(phase_input, phase_output);
-
+	BenchmarkPhaseScales BenchmarkPhaseScalesFromOutput(
+		const std::int32_t* phase_output) const {
 		float phase_value[6];
 		for (int i = 0; i < 6; ++i) {
 			const float logit =
@@ -405,11 +428,39 @@ struct Network {
 			(0.5f + 0.5f * phase_value[5]) * 1.5f};
 	}
 
+	BenchmarkPhaseScales BenchmarkPhase(
+		const TransformedFeatureType* transformed_features,
+		const TransformedFeatureType* diff_features,
+		const TransformedFeatureType* abs_features, const int bucket_id,
+		std::uint8_t* phase_input, std::int32_t* phase_output) const {
+		for (int j = 0; j < 128; ++j) {
+			const int32_t abs_value = static_cast<int32_t>(abs_features[j]);
+			phase_input[j] = static_cast<std::uint8_t>(
+				std::clamp((abs_value - 64) * 2, 0, 127));
+			phase_input[j + 128] = diff_features[j];
+			phase_input[j + 256] = transformed_features[j];
+		}
+		phase_input[127] = static_cast<std::uint8_t>((bucket_id * 127) / 11);
+		phase_proj.PropagatePrefix<6>(phase_input, phase_output);
+
+		return BenchmarkPhaseScalesFromOutput(phase_output);
+	}
+
 	void BenchmarkFmAffine(const TransformedFeatureType* diff_features,
 		const TransformedFeatureType* abs_features, std::int32_t* diff_output,
 		std::int32_t* abs_output) const {
 		fc_diff.Propagate(diff_features, diff_output);
 		fc_abs.Propagate(abs_features, abs_output);
+	}
+
+	void BenchmarkFcDiff(const TransformedFeatureType* input,
+		std::int32_t* output) const {
+		fc_diff.Propagate(input, output);
+	}
+
+	void BenchmarkFcAbs(const TransformedFeatureType* input,
+		std::int32_t* output) const {
+		fc_abs.Propagate(input, output);
 	}
 
 	void BenchmarkFmActivation(const std::int32_t* diff_fc_output,
@@ -438,16 +489,111 @@ struct Network {
 				std::clamp(abs_value * 0.05f + 0.6f, 0.0f, 1.0f) * 127.0f));
 			abs_output[j] = static_cast<std::uint8_t>(abs_scaled);
 
-			const int32_t square_value = abs_output[j];
-			abs_sqr_output[j] = static_cast<std::uint8_t>(
-				(square_value * square_value) / 127);
+		}
+		ComputeAbsSquared(abs_output, abs_sqr_output);
+	}
+
+	void BenchmarkDiffRmsNorm(const std::int32_t* diff_fc_output,
+		float* sum_sq, float* inv_rms) const {
+		*sum_sq = 0.0f;
+		for (int j = 0; j < 32; ++j) {
+			const float value = static_cast<float>(diff_fc_output[j + 32]);
+			*sum_sq += value * value;
+		}
+		*inv_rms = 1.0f / std::sqrt(*sum_sq / 32.0f + 1e-8f);
+	}
+
+	void BenchmarkDiffQuantize(const std::int32_t* diff_fc_output,
+		const float inv_rms, std::uint8_t* diff_output) const {
+		for (int j = 0; j < 32; ++j) {
+			const int32_t diff_value = diff_fc_output[j + 32];
+			const float normalized = static_cast<float>(diff_value) * inv_rms;
+			const int32_t diff_scaled =
+				static_cast<int32_t>(normalized * 25.4f) + 64;
+			diff_output[j] = static_cast<std::uint8_t>(
+				std::max(0, std::min(127, diff_scaled)));
 		}
 	}
+
+	void BenchmarkAbsSigmoidGate(const std::int32_t* abs_fc_output,
+		std::int32_t* abs_gated_output) const {
+		for (int j = 0; j < 32; ++j)
+			abs_gated_output[j] =
+				sigmoid_gate_slow(abs_fc_output[j], abs_fc_output[j + 32]);
+	}
+
+	void BenchmarkAbsGateQuantize(const std::int32_t* abs_gated_input,
+		std::uint8_t* abs_output) const {
+		for (int j = 0; j < 32; ++j) {
+			const float abs_value =
+				static_cast<float>(abs_gated_input[j]) / 8128.0f;
+			const int32_t abs_scaled = static_cast<int32_t>(std::round(
+				std::clamp(abs_value * 0.05f + 0.6f, 0.0f, 1.0f) * 127.0f));
+			abs_output[j] = static_cast<std::uint8_t>(abs_scaled);
+		}
+	}
+
+	void BenchmarkAbsSquared(const std::uint8_t* abs_input,
+		std::uint8_t* abs_sqr_output) const {
+		ComputeAbsSquared(abs_input, abs_sqr_output);
+	}
+
+#if defined(USE_AVX2)
+	void BenchmarkAbsSquaredScalar(const std::uint8_t* abs_input,
+		std::uint8_t* abs_sqr_output) const {
+		ComputeAbsSquaredScalar(abs_input, abs_sqr_output);
+	}
+
+	void BenchmarkAbsSquaredAvx2(const std::uint8_t* abs_input,
+		std::uint8_t* abs_sqr_output) const {
+		ComputeAbsSquared(abs_input, abs_sqr_output);
+	}
+#endif
 
 	void BenchmarkMainFc0(const TransformedFeatureType* transformed_features,
 		std::int32_t* fc_output) const {
 		fc_0.Propagate(transformed_features, fc_output);
 	}
+
+#if defined(USE_AVX2) && !defined(USE_AVX512)
+	static constexpr IndexType kBenchmarkFc0InputBlocks =
+		decltype(fc_0)::kBenchmarkInputBlocks;
+
+	IndexType BenchmarkMainFc0FindNnz(
+		const TransformedFeatureType* transformed_features,
+		std::uint16_t* nnz) const {
+		return fc_0.BenchmarkFindNnz(transformed_features, nnz);
+	}
+
+	void BenchmarkMainFc0AccumulatePreparedNnz(
+		const TransformedFeatureType* transformed_features,
+		const std::uint16_t* nnz, const IndexType count,
+		std::int32_t* fc_output) const {
+		fc_0.BenchmarkAccumulatePreparedNnz(
+			transformed_features, nnz, count, fc_output);
+	}
+
+	void BenchmarkMainFc0AccumulatePreparedNnzTwoBank(
+		const TransformedFeatureType* transformed_features,
+		const std::uint16_t* nnz, const IndexType count,
+		std::int32_t* fc_output) const {
+		fc_0.BenchmarkAccumulatePreparedNnzTwoBank(
+			transformed_features, nnz, count, fc_output);
+	}
+
+	void BenchmarkMainFc0StreamingSparse(
+		const TransformedFeatureType* transformed_features,
+		std::int32_t* fc_output) const {
+		fc_0.BenchmarkPropagateStreamingSparse(
+			transformed_features, fc_output);
+	}
+
+	void BenchmarkMainFc0Dense(
+		const TransformedFeatureType* transformed_features,
+		std::int32_t* fc_output) const {
+		fc_0.BenchmarkPropagateDense(transformed_features, fc_output);
+	}
+#endif
 
 	void BenchmarkMainGate(const std::int32_t* fc_input,
 		const std::int32_t* diff_fc_output, std::int32_t* fc_output) const {
@@ -544,6 +690,23 @@ struct Network {
 		std::int32_t* fc_output, std::uint8_t* activation_output) const {
 		fc_1.Propagate(input, fc_output);
 		ac_1.Propagate(fc_output, activation_output);
+	}
+
+	void BenchmarkFc1(const std::uint8_t* input,
+		std::int32_t* output) const {
+		fc_1.Propagate(input, output);
+	}
+
+#if defined(USE_AVX2) && !defined(USE_AVX512)
+	void BenchmarkFc1OutputTiled(const std::uint8_t* input,
+		std::int32_t* output) const {
+		fc_1.BenchmarkPropagateOutputTiled64And32(input, output);
+	}
+#endif
+
+	void BenchmarkAc1(const std::int32_t* input,
+		std::uint8_t* output) const {
+		ac_1.Propagate(input, output);
 	}
 
 	void BenchmarkFc2(const std::uint8_t* input,

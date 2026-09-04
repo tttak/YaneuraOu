@@ -348,6 +348,173 @@ public:
 #endif
         }
 
+#if defined(ENABLE_NNUE_BENCH) && defined(USE_AVX2) && !defined(USE_AVX512)
+        // Benchmark-only entry points for comparing the current two-pass sparse
+        // kernel with streaming-sparse and dense traversal. The production
+        // Propagate() path above is intentionally left unchanged.
+        static constexpr IndexType kBenchmarkInputBlocks =
+          kPaddedInputDimensions / kChunkSize;
+
+        IndexType BenchmarkFindNnz(const InputType* input,
+                                   std::uint16_t* nnz) const {
+                IndexType count;
+                find_nnz_explicit<kBenchmarkInputBlocks>(
+                  reinterpret_cast<const std::int32_t*>(input), nnz, count);
+                return count;
+        }
+
+        void BenchmarkAccumulatePreparedNnz(const InputType* input,
+                                            const std::uint16_t* nnz,
+                                            const IndexType count,
+                                            OutputType* output) const {
+                static_assert(kOutputDimensions % 8 == 0);
+                constexpr IndexType kNumRegs = kOutputDimensions / 8;
+                const auto input32 =
+                  reinterpret_cast<const std::int32_t*>(input);
+                const __m256i* biasvec =
+                  reinterpret_cast<const __m256i*>(biases_);
+                __m256i acc[kNumRegs];
+
+                for (IndexType k = 0; k < kNumRegs; ++k)
+                        acc[k] = biasvec[k];
+
+                for (IndexType j = 0; j < count; ++j) {
+                        const IndexType i = nnz[j];
+                        const __m256i in = _mm256_set1_epi32(input32[i]);
+                        const auto col = reinterpret_cast<const __m256i*>(
+                          &weights_[i * kOutputDimensions * kChunkSize]);
+                        for (IndexType k = 0; k < kNumRegs; ++k)
+                                Simd::m256_add_dpbusd_epi32(acc[k], in, col[k]);
+                }
+
+                __m256i* outptr = reinterpret_cast<__m256i*>(output);
+                for (IndexType k = 0; k < kNumRegs; ++k)
+                        outptr[k] = acc[k];
+        }
+
+        void BenchmarkAccumulatePreparedNnzTwoBank(
+          const InputType* input, const std::uint16_t* nnz,
+          const IndexType count, OutputType* output) const {
+                static_assert(kOutputDimensions % 8 == 0);
+                constexpr IndexType kNumRegs = kOutputDimensions / 8;
+                const auto input32 =
+                  reinterpret_cast<const std::int32_t*>(input);
+                const __m256i* biasvec =
+                  reinterpret_cast<const __m256i*>(biases_);
+                __m256i acc_even[kNumRegs];
+                __m256i acc_odd[kNumRegs];
+
+                for (IndexType k = 0; k < kNumRegs; ++k) {
+                        acc_even[k] = biasvec[k];
+                        acc_odd[k] = _mm256_setzero_si256();
+                }
+
+                // Alternate by active-block traversal ordinal, not feature
+                // block ID, so every consecutive dependency goes to the
+                // other accumulator bank while weight reads stay in the same
+                // ascending nnz order as the current kernel.
+                IndexType j = 0;
+                for (; j + 1 < count; j += 2) {
+                        const IndexType i_even = nnz[j];
+                        const __m256i in_even =
+                          _mm256_set1_epi32(input32[i_even]);
+                        const auto col_even = reinterpret_cast<const __m256i*>(
+                          &weights_[i_even * kOutputDimensions * kChunkSize]);
+                        for (IndexType k = 0; k < kNumRegs; ++k)
+                                Simd::m256_add_dpbusd_epi32(
+                                  acc_even[k], in_even, col_even[k]);
+
+                        const IndexType i_odd = nnz[j + 1];
+                        const __m256i in_odd =
+                          _mm256_set1_epi32(input32[i_odd]);
+                        const auto col_odd = reinterpret_cast<const __m256i*>(
+                          &weights_[i_odd * kOutputDimensions * kChunkSize]);
+                        for (IndexType k = 0; k < kNumRegs; ++k)
+                                Simd::m256_add_dpbusd_epi32(
+                                  acc_odd[k], in_odd, col_odd[k]);
+                }
+                if (j < count) {
+                        const IndexType i = nnz[j];
+                        const __m256i in = _mm256_set1_epi32(input32[i]);
+                        const auto col = reinterpret_cast<const __m256i*>(
+                          &weights_[i * kOutputDimensions * kChunkSize]);
+                        for (IndexType k = 0; k < kNumRegs; ++k)
+                                Simd::m256_add_dpbusd_epi32(
+                                  acc_even[k], in, col[k]);
+                }
+
+                __m256i* outptr = reinterpret_cast<__m256i*>(output);
+                for (IndexType k = 0; k < kNumRegs; ++k)
+                        outptr[k] = _mm256_add_epi32(acc_even[k], acc_odd[k]);
+        }
+
+        void BenchmarkPropagateStreamingSparse(const InputType* input,
+                                               OutputType* output) const {
+                static_assert(kOutputDimensions % 8 == 0);
+                static_assert(kBenchmarkInputBlocks % 8 == 0);
+                constexpr IndexType kNumRegs = kOutputDimensions / 8;
+                const auto input32 =
+                  reinterpret_cast<const std::int32_t*>(input);
+                const __m256i* biasvec =
+                  reinterpret_cast<const __m256i*>(biases_);
+                __m256i acc[kNumRegs];
+
+                for (IndexType k = 0; k < kNumRegs; ++k)
+                        acc[k] = biasvec[k];
+
+                const __m256i zero = _mm256_setzero_si256();
+                for (IndexType base = 0; base < kBenchmarkInputBlocks;
+                     base += 8) {
+                        const __m256i input_chunk = _mm256_load_si256(
+                          reinterpret_cast<const __m256i*>(input32 + base));
+                        unsigned mask = static_cast<unsigned>(_mm256_movemask_ps(
+                          _mm256_castsi256_ps(
+                            _mm256_cmpgt_epi32(input_chunk, zero))));
+
+                        while (mask != 0) {
+                                const IndexType i = base + pop_lsb(mask);
+                                const __m256i in =
+                                  _mm256_set1_epi32(input32[i]);
+                                const auto col = reinterpret_cast<const __m256i*>(
+                                  &weights_[i * kOutputDimensions * kChunkSize]);
+                                for (IndexType k = 0; k < kNumRegs; ++k)
+                                        Simd::m256_add_dpbusd_epi32(
+                                          acc[k], in, col[k]);
+                        }
+                }
+
+                __m256i* outptr = reinterpret_cast<__m256i*>(output);
+                for (IndexType k = 0; k < kNumRegs; ++k)
+                        outptr[k] = acc[k];
+        }
+
+        void BenchmarkPropagateDense(const InputType* input,
+                                     OutputType* output) const {
+                static_assert(kOutputDimensions % 8 == 0);
+                constexpr IndexType kNumRegs = kOutputDimensions / 8;
+                const auto input32 =
+                  reinterpret_cast<const std::int32_t*>(input);
+                const __m256i* biasvec =
+                  reinterpret_cast<const __m256i*>(biases_);
+                __m256i acc[kNumRegs];
+
+                for (IndexType k = 0; k < kNumRegs; ++k)
+                        acc[k] = biasvec[k];
+
+                for (IndexType i = 0; i < kBenchmarkInputBlocks; ++i) {
+                        const __m256i in = _mm256_set1_epi32(input32[i]);
+                        const auto col = reinterpret_cast<const __m256i*>(
+                          &weights_[i * kOutputDimensions * kChunkSize]);
+                        for (IndexType k = 0; k < kNumRegs; ++k)
+                                Simd::m256_add_dpbusd_epi32(acc[k], in, col[k]);
+                }
+
+                __m256i* outptr = reinterpret_cast<__m256i*>(output);
+                for (IndexType k = 0; k < kNumRegs; ++k)
+                        outptr[k] = acc[k];
+        }
+#endif
+
    private:
         using BiasType   = OutputType;
         using WeightType = std::int8_t;
