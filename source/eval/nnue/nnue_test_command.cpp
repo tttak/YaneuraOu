@@ -30,6 +30,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <system_error>
 #endif
 
@@ -655,6 +656,19 @@ void MixNnueBenchChecksum(std::uint64_t& checksum, const std::int64_t value) {
   checksum *= UINT64_C(1099511628211);
 }
 
+template<typename T>
+inline void KeepNnueBenchObject(const T& object) {
+#if defined(__GNUC__) || defined(__clang__)
+  // A compiler barrier, not a runtime operation. It makes every byte of a
+  // benchmark output observable without adding a hash loop to the timed body.
+  asm volatile("" : : "m"(object) : "memory");
+#else
+  volatile const unsigned char* bytes =
+      reinterpret_cast<volatile const unsigned char*>(&object);
+  (void)bytes[0];
+#endif
+}
+
 void ChecksumAccumulator(const Position& pos, std::uint64_t& checksum) {
   const auto& accumulator = pos.state()->accumulator;
   for (const Color perspective : {BLACK, WHITE}) {
@@ -903,6 +917,545 @@ void TestFeatureTransformerBenchmark(const std::uint64_t repeat_count) {
             << "  checksum                    : 0x" << std::hex << checksum
             << std::dec << std::endl;
 }
+
+enum class FtTransformStageOperation {
+  MainPairAndPacking,
+  FmInteractions,
+  FmScalingAndPacking,
+  FullTransform,
+};
+
+constexpr std::array<FtTransformStageOperation, 4>
+    kFtTransformStageOperations = {
+        FtTransformStageOperation::MainPairAndPacking,
+        FtTransformStageOperation::FmInteractions,
+        FtTransformStageOperation::FmScalingAndPacking,
+        FtTransformStageOperation::FullTransform,
+    };
+
+constexpr std::array<const char*, kFtTransformStageOperations.size()>
+    kFtTransformStageNames = {
+        "A. Main FT + PairWeight 3-way blend + Main packing",
+        "B. FM interaction generation",
+        "C. FM diff/abs scaling + clamp + output",
+        "D. full Transform (precomputed accumulator)",
+    };
+
+struct FtTransformBenchCase {
+  std::unique_ptr<StateInfo> state;
+  std::unique_ptr<Position> position;
+  int material_bucket = 0;
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType,
+                 FeatureTransformer::kOutputDimensions> expected_main{};
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType, 128> expected_diff{};
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType, 128> expected_abs{};
+  FeatureTransformer::BenchmarkFmInteractions interactions{};
+};
+
+std::vector<FtTransformBenchCase> MakeFtTransformStageBenchCorpus() {
+  Position generator_position;
+  StateInfo generator_root;
+  std::vector<StateInfo> generator_states(kNnueBenchMaxPly);
+  PRNG prng(kNnueBenchSeed);
+  std::vector<FtTransformBenchCase> corpus;
+  corpus.reserve(kNnueBenchMeasuredGames * kNnueBenchMaxPly);
+
+  for (std::uint64_t game = 0; game < kNnueBenchMeasuredGames; ++game) {
+    generator_position.set_hirate(&generator_root);
+    for (int ply = 0; ply < kNnueBenchMaxPly; ++ply) {
+      MoveList<LEGAL_ALL> moves(generator_position);
+      if (moves.size() == 0)
+        break;
+
+      const Move move = moves.begin()[prng.rand(moves.size())];
+      generator_position.do_move(move, generator_states[ply]);
+
+      FtTransformBenchCase sample;
+      sample.position = std::make_unique<Position>();
+      sample.state = std::make_unique<StateInfo>();
+      sample.position->set(generator_position.sfen(), sample.state.get());
+      sample.material_bucket = NnueBenchMaterialBucket(*sample.position);
+      feature_transformer->Transform(
+          *sample.position, sample.expected_main.data(),
+          sample.expected_diff.data(), sample.expected_abs.data(), false,
+          sample.material_bucket);
+      feature_transformer->BenchmarkTransformFmInteractionsOnly(
+          *sample.position, sample.interactions);
+      corpus.emplace_back(std::move(sample));
+    }
+  }
+  return corpus;
+}
+
+template<FtTransformStageOperation Operation>
+NnueBenchTiming MeasureFtTransformStageCorpus(
+    const std::vector<FtTransformBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType,
+                 FeatureTransformer::kOutputDimensions> main_output{};
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType, 128> diff_output{};
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType, 128> abs_output{};
+  FeatureTransformer::BenchmarkFmInteractions interactions{};
+  NnueBenchTiming timing;
+
+  const auto begin = NnueBenchClock::now();
+  for (const auto& sample : corpus) {
+    if constexpr (Operation == FtTransformStageOperation::MainPairAndPacking) {
+      feature_transformer->BenchmarkTransformMain(
+          *sample.position, main_output.data(), sample.material_bucket);
+      KeepNnueBenchObject(main_output);
+      MixNnueBenchChecksum(
+          checksum, main_output[static_cast<std::size_t>(timing.calls)
+                                % main_output.size()]);
+    } else if constexpr (Operation ==
+                         FtTransformStageOperation::FmInteractions) {
+      feature_transformer->BenchmarkTransformFmInteractionsOnly(
+          *sample.position, interactions);
+      KeepNnueBenchObject(interactions);
+      const std::size_t flat_index =
+          static_cast<std::size_t>(timing.calls) % (4 * 32);
+      MixNnueBenchChecksum(
+          checksum, interactions.values[flat_index / 32][flat_index % 32]);
+    } else if constexpr (Operation ==
+                         FtTransformStageOperation::FmScalingAndPacking) {
+      feature_transformer->BenchmarkTransformFmOutputsOnly(
+          *sample.position, sample.interactions, diff_output.data(),
+          abs_output.data());
+      KeepNnueBenchObject(diff_output);
+      KeepNnueBenchObject(abs_output);
+      const std::size_t index =
+          static_cast<std::size_t>(timing.calls) % diff_output.size();
+      MixNnueBenchChecksum(checksum, diff_output[index]);
+      MixNnueBenchChecksum(checksum, abs_output[index]);
+    } else {
+      feature_transformer->Transform(
+          *sample.position, main_output.data(), diff_output.data(),
+          abs_output.data(), false, sample.material_bucket);
+      KeepNnueBenchObject(main_output);
+      KeepNnueBenchObject(diff_output);
+      KeepNnueBenchObject(abs_output);
+      const std::size_t main_index =
+          static_cast<std::size_t>(timing.calls) % main_output.size();
+      const std::size_t fm_index =
+          static_cast<std::size_t>(timing.calls) % diff_output.size();
+      MixNnueBenchChecksum(checksum, main_output[main_index]);
+      MixNnueBenchChecksum(checksum, diff_output[fm_index]);
+      MixNnueBenchChecksum(checksum, abs_output[fm_index]);
+    }
+    ++timing.calls;
+  }
+  const auto end = NnueBenchClock::now();
+  timing.nanoseconds =
+      std::chrono::duration<double, std::nano>(end - begin).count();
+  return timing;
+}
+
+NnueBenchTiming MeasureFtTransformStageByIndex(
+    const std::vector<FtTransformBenchCase>& corpus,
+    const std::size_t stage_index, std::uint64_t& checksum) {
+  switch (kFtTransformStageOperations[stage_index]) {
+    case FtTransformStageOperation::MainPairAndPacking:
+      return MeasureFtTransformStageCorpus<
+          FtTransformStageOperation::MainPairAndPacking>(corpus, checksum);
+    case FtTransformStageOperation::FmInteractions:
+      return MeasureFtTransformStageCorpus<
+          FtTransformStageOperation::FmInteractions>(corpus, checksum);
+    case FtTransformStageOperation::FmScalingAndPacking:
+      return MeasureFtTransformStageCorpus<
+          FtTransformStageOperation::FmScalingAndPacking>(corpus, checksum);
+    case FtTransformStageOperation::FullTransform:
+      return MeasureFtTransformStageCorpus<
+          FtTransformStageOperation::FullTransform>(corpus, checksum);
+  }
+  return {};
+}
+
+NnueBenchTiming MeasureFtTransformStageAfterWarmup(
+    const std::vector<FtTransformBenchCase>& corpus,
+    const std::size_t stage_index, std::uint64_t& checksum) {
+  std::uint64_t warmup_checksum = UINT64_C(14695981039346656037);
+  MeasureFtTransformStageByIndex(corpus, stage_index, warmup_checksum);
+  MixNnueBenchChecksum(checksum, warmup_checksum);
+  return MeasureFtTransformStageByIndex(corpus, stage_index, checksum);
+}
+
+void TestFeatureTransformerStagesBenchmark(
+    const std::uint64_t repeat_count) {
+  std::cout << "[NNUE benchmark: FeatureTransformer Transform stages]"
+            << std::endl
+            << "  seed         : " << kNnueBenchSeed << std::endl
+            << "  corpus games : " << kNnueBenchMeasuredGames << std::endl
+            << "  max ply/game : " << kNnueBenchMaxPly << std::endl
+            << "  repeats      : " << repeat_count << std::endl
+            << "  stage order  : rotated by one stage per repeat" << std::endl
+            << "  corpus build : real positions and precomputed accumulators..."
+            << std::flush;
+
+  const auto corpus = MakeFtTransformStageBenchCorpus();
+  std::cout << "done (" << corpus.size() << ")" << std::endl;
+  if (corpus.empty()) {
+    std::cout << "error: NNUE FT Transform stage benchmark corpus is empty"
+              << std::endl;
+    return;
+  }
+  std::cout << "  warm-up calls: " << corpus.size()
+            << " before every timed sample" << std::endl;
+
+  std::array<NnueBenchSamples, kFtTransformStageOperations.size()> samples;
+  std::array<std::uint64_t, kFtTransformStageOperations.size()>
+      timing_checksums;
+  timing_checksums.fill(UINT64_C(14695981039346656037));
+
+  for (std::uint64_t repeat = 0; repeat < repeat_count; ++repeat) {
+    const std::size_t rotation = repeat % kFtTransformStageOperations.size();
+    for (std::size_t offset = 0;
+         offset < kFtTransformStageOperations.size(); ++offset) {
+      const std::size_t stage =
+          (rotation + offset) % kFtTransformStageOperations.size();
+      samples[stage].Add(MeasureFtTransformStageAfterWarmup(
+          corpus, stage, timing_checksums[stage]));
+    }
+  }
+
+  std::uint64_t captured_checksum = UINT64_C(14695981039346656037);
+  std::uint64_t reconstructed_checksum = UINT64_C(14695981039346656037);
+  std::uint64_t mismatch_count = 0;
+  std::size_t first_mismatch_sample = 0;
+  const char* first_mismatch_target = nullptr;
+  std::size_t first_mismatch_element = 0;
+  int first_captured = 0;
+  int first_recomputed = 0;
+
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType,
+                 FeatureTransformer::kOutputDimensions> main_output{};
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType, 128> diff_output{};
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType, 128> abs_output{};
+
+  auto compare_range = [&](const auto& captured, const auto& recomputed,
+                           const char* target, std::size_t sample_index) {
+    for (std::size_t element = 0; element < captured.size(); ++element) {
+      MixNnueBenchChecksum(captured_checksum, captured[element]);
+      MixNnueBenchChecksum(reconstructed_checksum, recomputed[element]);
+      if (captured[element] != recomputed[element]) {
+        if (mismatch_count == 0) {
+          first_mismatch_sample = sample_index;
+          first_mismatch_target = target;
+          first_mismatch_element = element;
+          first_captured = captured[element];
+          first_recomputed = recomputed[element];
+        }
+        ++mismatch_count;
+      }
+    }
+  };
+
+  for (std::size_t sample_index = 0; sample_index < corpus.size();
+       ++sample_index) {
+    const auto& sample = corpus[sample_index];
+    feature_transformer->BenchmarkTransformReconstructed(
+        *sample.position, main_output.data(), diff_output.data(),
+        abs_output.data(), sample.material_bucket);
+    compare_range(sample.expected_main, main_output, "main", sample_index);
+    compare_range(sample.expected_diff, diff_output, "diff", sample_index);
+    compare_range(sample.expected_abs, abs_output, "abs", sample_index);
+  }
+
+  for (std::size_t stage = 0;
+       stage < kFtTransformStageOperations.size(); ++stage) {
+    PrintNnueBenchSamples(kFtTransformStageNames[stage], samples[stage]);
+    std::cout << "  timing checksum : 0x" << std::hex
+              << timing_checksums[stage] << std::dec << std::endl;
+  }
+
+  const auto main_summary = SummarizeNnueBenchSamples(samples[0]);
+  const auto interaction_summary = SummarizeNnueBenchSamples(samples[1]);
+  const auto scaling_summary = SummarizeNnueBenchSamples(samples[2]);
+  const auto full_summary = SummarizeNnueBenchSamples(samples[3]);
+  const double summed_stage_medians = main_summary.median
+      + interaction_summary.median + scaling_summary.median;
+  std::cout << "summed isolated stage medians : " << std::fixed
+            << std::setprecision(1) << summed_stage_medians << " ns/call"
+            << std::endl
+            << "full Transform median         : " << full_summary.median
+            << " ns/call" << std::endl
+            << "captured checksum             : 0x" << std::hex
+            << captured_checksum << std::endl
+            << "reconstructed checksum        : 0x"
+            << reconstructed_checksum << std::dec << std::endl
+            << "full reconstruction match     : "
+            << (mismatch_count == 0 ? "yes" : "NO") << std::endl
+            << "mismatch count                : " << mismatch_count
+            << std::endl;
+  if (mismatch_count != 0) {
+    std::cout << "first mismatch sample         : "
+              << first_mismatch_sample << std::endl
+              << "first mismatch target         : "
+              << first_mismatch_target << std::endl
+              << "first mismatch element        : "
+              << first_mismatch_element << std::endl
+              << "captured value                : " << first_captured
+              << std::endl
+              << "recomputed value              : " << first_recomputed
+              << std::endl;
+  }
+  std::cout << "note: isolated stage medians need not sum to the full median;"
+            << std::endl
+            << "      stage outputs are materialized and cache locality differs."
+            << std::endl;
+}
+
+#if defined(USE_AVX2)
+
+enum class FtFmScalingImplementation {
+  CurrentScalar,
+  HybridAvx2,
+};
+
+template<FtFmScalingImplementation Implementation, bool FullTransform>
+NnueBenchTiming MeasureFtFmScalingCorpus(
+    const std::vector<FtTransformBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType,
+                 FeatureTransformer::kOutputDimensions> main_output{};
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType, 128> diff_output{};
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType, 128> abs_output{};
+  NnueBenchTiming timing;
+
+  const auto begin = NnueBenchClock::now();
+  for (const auto& sample : corpus) {
+    if constexpr (FullTransform) {
+      if constexpr (Implementation ==
+                    FtFmScalingImplementation::CurrentScalar) {
+        feature_transformer->BenchmarkTransformReconstructedScalarFm(
+            *sample.position, main_output.data(), diff_output.data(),
+            abs_output.data(), sample.material_bucket);
+      } else {
+        feature_transformer->BenchmarkTransformReconstructed(
+            *sample.position, main_output.data(), diff_output.data(),
+            abs_output.data(), sample.material_bucket);
+      }
+      KeepNnueBenchObject(main_output);
+    } else {
+      if constexpr (Implementation ==
+                    FtFmScalingImplementation::CurrentScalar) {
+        feature_transformer->BenchmarkTransformFmOutputsScalarOnly(
+            *sample.position, sample.interactions, diff_output.data(),
+            abs_output.data());
+      } else {
+        feature_transformer->BenchmarkTransformFmOutputsHybridOnly(
+            *sample.position, sample.interactions, diff_output.data(),
+            abs_output.data());
+      }
+    }
+    KeepNnueBenchObject(diff_output);
+    KeepNnueBenchObject(abs_output);
+    const std::size_t main_index =
+        static_cast<std::size_t>(timing.calls) % main_output.size();
+    const std::size_t fm_index =
+        static_cast<std::size_t>(timing.calls) % diff_output.size();
+    if constexpr (FullTransform)
+      MixNnueBenchChecksum(checksum, main_output[main_index]);
+    MixNnueBenchChecksum(checksum, diff_output[fm_index]);
+    MixNnueBenchChecksum(checksum, abs_output[fm_index]);
+    ++timing.calls;
+  }
+  const auto end = NnueBenchClock::now();
+  timing.nanoseconds =
+      std::chrono::duration<double, std::nano>(end - begin).count();
+  return timing;
+}
+
+template<FtFmScalingImplementation Implementation, bool FullTransform>
+NnueBenchTiming MeasureFtFmScalingCorpusAfterWarmup(
+    const std::vector<FtTransformBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  std::uint64_t warmup_checksum = UINT64_C(14695981039346656037);
+  MeasureFtFmScalingCorpus<Implementation, FullTransform>(
+      corpus, warmup_checksum);
+  MixNnueBenchChecksum(checksum, warmup_checksum);
+  return MeasureFtFmScalingCorpus<Implementation, FullTransform>(
+      corpus, checksum);
+}
+
+void PrintFtFmScalingComparison(const char* const title,
+                                const NnueBenchSamples& scalar_samples,
+                                const NnueBenchSamples& hybrid_samples) {
+  const auto scalar = SummarizeNnueBenchSamples(scalar_samples);
+  const auto hybrid = SummarizeNnueBenchSamples(hybrid_samples);
+  const double saved = scalar.median - hybrid.median;
+  const double improvement = scalar.median == 0.0
+      ? 0.0
+      : saved * 100.0 / scalar.median;
+  std::cout << title << std::endl;
+  PrintNnueBenchSamples("  A. current scalar", scalar_samples);
+  PrintNnueBenchSamples("  B. hybrid AVX2", hybrid_samples);
+  std::cout << "  improvement ns/call : " << std::fixed
+            << std::setprecision(1) << saved << std::endl
+            << "  improvement         : " << std::setprecision(2)
+            << improvement << "%" << std::endl;
+}
+
+void TestFeatureTransformerFmScalingCompare(
+    const std::uint64_t repeat_count) {
+  std::cout << "[NNUE benchmark: FM scaling scalar / hybrid AVX2]"
+            << std::endl
+            << "  seed         : " << kNnueBenchSeed << std::endl
+            << "  corpus games : " << kNnueBenchMeasuredGames << std::endl
+            << "  max ply/game : " << kNnueBenchMaxPly << std::endl
+            << "  repeats      : " << repeat_count << std::endl
+            << "  candidate    : scalar ih/ik + AVX2 diff/abs sh/sk"
+            << std::endl
+            << "  order        : even=scalar,hybrid odd=hybrid,scalar"
+            << std::endl
+            << "  corpus build : real positions and precomputed accumulators..."
+            << std::flush;
+
+  const auto corpus = MakeFtTransformStageBenchCorpus();
+  std::cout << "done (" << corpus.size() << ")" << std::endl;
+  if (corpus.empty()) {
+    std::cout << "error: NNUE FM scaling benchmark corpus is empty"
+              << std::endl;
+    return;
+  }
+  std::cout << "  warm-up calls: " << corpus.size()
+            << " before every timed sample" << std::endl;
+
+  NnueBenchSamples scalar_scaling;
+  NnueBenchSamples hybrid_scaling;
+  NnueBenchSamples scalar_full;
+  NnueBenchSamples hybrid_full;
+  std::uint64_t scalar_scaling_timing = UINT64_C(14695981039346656037);
+  std::uint64_t hybrid_scaling_timing = UINT64_C(14695981039346656037);
+  std::uint64_t scalar_full_timing = UINT64_C(14695981039346656037);
+  std::uint64_t hybrid_full_timing = UINT64_C(14695981039346656037);
+
+  for (std::uint64_t repeat = 0; repeat < repeat_count; ++repeat) {
+    if ((repeat & 1) == 0) {
+      scalar_scaling.Add(MeasureFtFmScalingCorpusAfterWarmup<
+          FtFmScalingImplementation::CurrentScalar, false>(
+              corpus, scalar_scaling_timing));
+      hybrid_scaling.Add(MeasureFtFmScalingCorpusAfterWarmup<
+          FtFmScalingImplementation::HybridAvx2, false>(
+              corpus, hybrid_scaling_timing));
+      scalar_full.Add(MeasureFtFmScalingCorpusAfterWarmup<
+          FtFmScalingImplementation::CurrentScalar, true>(
+              corpus, scalar_full_timing));
+      hybrid_full.Add(MeasureFtFmScalingCorpusAfterWarmup<
+          FtFmScalingImplementation::HybridAvx2, true>(
+              corpus, hybrid_full_timing));
+    } else {
+      hybrid_scaling.Add(MeasureFtFmScalingCorpusAfterWarmup<
+          FtFmScalingImplementation::HybridAvx2, false>(
+              corpus, hybrid_scaling_timing));
+      scalar_scaling.Add(MeasureFtFmScalingCorpusAfterWarmup<
+          FtFmScalingImplementation::CurrentScalar, false>(
+              corpus, scalar_scaling_timing));
+      hybrid_full.Add(MeasureFtFmScalingCorpusAfterWarmup<
+          FtFmScalingImplementation::HybridAvx2, true>(
+              corpus, hybrid_full_timing));
+      scalar_full.Add(MeasureFtFmScalingCorpusAfterWarmup<
+          FtFmScalingImplementation::CurrentScalar, true>(
+              corpus, scalar_full_timing));
+    }
+  }
+
+  std::uint64_t scalar_checksum = UINT64_C(14695981039346656037);
+  std::uint64_t hybrid_checksum = UINT64_C(14695981039346656037);
+  std::uint64_t mismatch_count = 0;
+  std::size_t first_sample = 0;
+  const char* first_target = nullptr;
+  std::size_t first_element = 0;
+  int first_scalar = 0;
+  int first_hybrid = 0;
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType, 128> scalar_diff{};
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType, 128> scalar_abs{};
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType, 128> hybrid_diff{};
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType, 128> hybrid_abs{};
+
+  auto compare = [&](const auto& scalar_values, const auto& hybrid_values,
+                     const char* target, const std::size_t sample_index) {
+    for (std::size_t element = 0; element < scalar_values.size(); ++element) {
+      MixNnueBenchChecksum(scalar_checksum, scalar_values[element]);
+      MixNnueBenchChecksum(hybrid_checksum, hybrid_values[element]);
+      if (scalar_values[element] != hybrid_values[element]) {
+        if (mismatch_count == 0) {
+          first_sample = sample_index;
+          first_target = target;
+          first_element = element;
+          first_scalar = scalar_values[element];
+          first_hybrid = hybrid_values[element];
+        }
+        ++mismatch_count;
+      }
+    }
+  };
+
+  for (std::size_t sample_index = 0; sample_index < corpus.size();
+       ++sample_index) {
+    const auto& sample = corpus[sample_index];
+    feature_transformer->BenchmarkTransformFmOutputsScalarOnly(
+        *sample.position, sample.interactions, scalar_diff.data(),
+        scalar_abs.data());
+    feature_transformer->BenchmarkTransformFmOutputsHybridOnly(
+        *sample.position, sample.interactions, hybrid_diff.data(),
+        hybrid_abs.data());
+    compare(scalar_diff, hybrid_diff, "diff_output", sample_index);
+    compare(scalar_abs, hybrid_abs, "abs_output", sample_index);
+  }
+
+  PrintFtFmScalingComparison("C. FM scaling + clamp + output",
+                             scalar_scaling, hybrid_scaling);
+  PrintFtFmScalingComparison("full reconstructed Transform",
+                             scalar_full, hybrid_full);
+  std::cout << "[correctness]" << std::endl
+            << "  scalar checksum : 0x" << std::hex << scalar_checksum
+            << std::endl
+            << "  hybrid checksum : 0x" << hybrid_checksum << std::dec
+            << std::endl
+            << "  checksum match  : "
+            << (scalar_checksum == hybrid_checksum ? "yes" : "NO")
+            << std::endl
+            << "  mismatch count : " << mismatch_count << std::endl;
+  if (mismatch_count != 0) {
+    std::cout << "  first mismatch sample : " << first_sample << std::endl
+              << "  first mismatch target : " << first_target << std::endl
+              << "  first mismatch element: " << first_element << std::endl
+              << "  scalar value          : " << first_scalar << std::endl
+              << "  hybrid value          : " << first_hybrid << std::endl;
+  }
+  std::cout << "[timing checksums]" << std::endl
+            << "  C scalar : 0x" << std::hex << scalar_scaling_timing
+            << std::endl
+            << "  C hybrid : 0x" << hybrid_scaling_timing << std::endl
+            << "  full scalar: 0x" << scalar_full_timing << std::endl
+            << "  full hybrid: 0x" << hybrid_full_timing << std::dec
+            << std::endl
+            << "  C timing checksum match   : "
+            << (scalar_scaling_timing == hybrid_scaling_timing ? "yes"
+                                                                : "NO")
+            << std::endl
+            << "  full timing checksum match: "
+            << (scalar_full_timing == hybrid_full_timing ? "yes" : "NO")
+            << std::endl;
+}
+
+#endif  // defined(USE_AVX2)
 
 struct alignas(kCacheLineSize) NetworkBenchCase {
   std::array<FeatureTransformer::OutputType,
@@ -5947,6 +6500,16 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::uint64_t repeat_count;
     if (ReadNnueBenchRepeatCount(stream, repeat_count))
       TestFeatureTransformerBenchmark(repeat_count);
+  } else if (sub_command == "bench_ft_transform_stages") {
+    std::uint64_t repeat_count;
+    if (ReadNnueBenchRepeatCount(stream, repeat_count))
+      TestFeatureTransformerStagesBenchmark(repeat_count);
+#if defined(USE_AVX2)
+  } else if (sub_command == "bench_ft_fm_scaling_compare") {
+    std::uint64_t repeat_count;
+    if (ReadNnueBenchRepeatCount(stream, repeat_count))
+      TestFeatureTransformerFmScalingCompare(repeat_count);
+#endif
   } else if (sub_command == "bench_network") {
     std::uint64_t repeat_count;
     if (ReadNnueBenchRepeatCount(stream, repeat_count))
@@ -6008,6 +6571,12 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << " test nnue info [path/to/" << kFileName << "...]" << std::endl;
 #if defined(ENABLE_NNUE_BENCH)
     std::cout << " test nnue bench_ft [repeats]" << std::endl;
+    std::cout << " test nnue bench_ft_transform_stages [repeats]"
+              << std::endl;
+#if defined(USE_AVX2)
+    std::cout << " test nnue bench_ft_fm_scaling_compare [repeats]"
+              << std::endl;
+#endif
     std::cout << " test nnue bench_network [repeats]" << std::endl;
     std::cout << " test nnue bench_network_compare [repeats]" << std::endl;
     std::cout << " test nnue bench_network_stages [repeats]" << std::endl;

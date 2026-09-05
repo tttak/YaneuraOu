@@ -264,6 +264,59 @@ class FeatureTransformer {
 		return static_cast<OutputType>(std::clamp(shifted_value + 63, 0LL, 127LL));
 	}
 
+#if defined(USE_AVX2)
+   private:
+	// Scale four signed FM linear terms and pack them to four output bytes.
+	// HalfKA has at most 40 active factors and KSDG3 at most 24. Since every
+	// factor weight is int16, |sum_v| <= 40 * 32768 = 1,310,720 and
+	// |sum_v(us)-sum_v(them)| <= 2,621,440. Both operands therefore fit in
+	// signed 32 bits, and even the maximum supported FMScale (1,000,000,000)
+	// produces a signed 64-bit product. _mm256_mul_epi32 is consequently exact.
+	static inline std::uint32_t ScaleAndPackFmLinear4(
+		const __m256i values, const int scale) {
+		const __m256i zero = _mm256_setzero_si256();
+		const __m256i scale32 = _mm256_set1_epi32(scale);
+		const __m256i product = _mm256_mul_epi32(values, scale32);
+
+		// Match the arithmetic signed >> 22 emitted for the scalar expression.
+		const __m256i negative_product = _mm256_cmpgt_epi64(zero, product);
+		const __m256i shifted = _mm256_or_si256(
+			_mm256_srli_epi64(product, 22),
+			_mm256_slli_epi64(negative_product, 64 - 22));
+		const __m256i centered =
+			_mm256_add_epi64(shifted, _mm256_set1_epi64x(63));
+
+		const __m256i negative_centered =
+			_mm256_cmpgt_epi64(zero, centered);
+		const __m256i clipped_low =
+			_mm256_andnot_si256(negative_centered, centered);
+		const __m256i upper = _mm256_set1_epi64x(127);
+		const __m256i above_upper =
+			_mm256_cmpgt_epi64(clipped_low, upper);
+		const __m256i clipped =
+			_mm256_blendv_epi8(clipped_low, upper, above_upper);
+
+		// Each qword is in [0,127]. Select its low dword, then saturating-pack
+		// four dwords to the low four bytes without changing their order.
+		const __m256i low_dword_indices =
+			_mm256_setr_epi32(0, 2, 4, 6, 0, 0, 0, 0);
+		const __m128i dwords = _mm256_castsi256_si128(
+			_mm256_permutevar8x32_epi32(clipped, low_dword_indices));
+		const __m128i words = _mm_packus_epi32(dwords, dwords);
+		const __m128i bytes = _mm_packus_epi16(words, words);
+		return static_cast<std::uint32_t>(_mm_cvtsi128_si32(bytes));
+	}
+
+	static inline void StoreFmLinear4(OutputType* output,
+	                                  const __m256i values,
+	                                  const int scale) {
+		const std::uint32_t packed = ScaleAndPackFmLinear4(values, scale);
+		std::memcpy(output, &packed, sizeof(packed));
+	}
+
+   public:
+#endif
+
 	// Convert input features
 	// 入力特徴量を変換する
 	void Transform(const Position& pos, OutputType* output, OutputType* diff_output, OutputType* abs_output, bool refresh, const int bucket_id) const {
@@ -367,23 +420,17 @@ class FeatureTransformer {
 		const Color us = pos.side_to_move();
 		const Color them = ~us;
 
-		auto write_fm_outputs = [&](IndexType j, int64_t ih_u, int64_t ik_u,
-			int64_t sh_u, int64_t sk_u, int64_t ih_t, int64_t ik_t,
-			int64_t sh_t, int64_t sk_t) {
+		auto write_fm_quadratic_outputs = [&](IndexType j, int64_t ih_u,
+			int64_t ik_u, int64_t ih_t, int64_t ik_t) {
 			// 差分(Diff)と合計(Abs)の両方のパスを生成し、後段のネットワークに渡す
 			// スケーリングとビットシフトにより 0-127 の範囲へ収める
 
-			// --- Diff Path (128次元) ---
+			// ih/ik are true int64 interaction values. Keep their existing scalar
+			// multiply, shift, clamp, and narrowing sequence unchanged.
 			diff_output[ 0 + j] = ToOutputRange(((ih_u - ih_t) * FMScale1) >> 37); // ih(2次)差分
 			diff_output[32 + j] = ToOutputRange(((ik_u - ik_t) * FMScale2) >> 37); // ik(2次)差分
-			diff_output[64 + j] = ToOutputRange(((sh_u - sh_t) * FMScale3) >> 22); // sh(1次)差分
-			diff_output[96 + j] = ToOutputRange(((sk_u - sk_t) * FMScale4) >> 22); // sk(1次)差分
-
-			// --- Abs Path (128次元) ---
 			abs_output [ 0 + j] = ToOutputRange((ih_u * FMScale5) >> 37); // ih(2次)和
 			abs_output [32 + j] = ToOutputRange((ik_u * FMScale6) >> 37); // ik(2次)和
-			abs_output [64 + j] = ToOutputRange((sh_u * FMScale7) >> 22); // sh(1次)和
-			abs_output [96 + j] = ToOutputRange((sk_u * FMScale8) >> 22); // sk(1次)和
 		};
 
 #if defined(USE_AVX2)
@@ -433,28 +480,54 @@ class FeatureTransformer {
 
 			for (IndexType lane = 0; lane < 4; ++lane) {
 				const IndexType index = j + lane;
-				write_fm_outputs(
+				write_fm_quadratic_outputs(
 					index,
 					interactions[0][lane], interactions[1][lane],
-					factors[us].halfka.sum_v[index],
-					factors[us].ksdg.sum_v[index],
-					interactions[2][lane], interactions[3][lane],
-					factors[them].halfka.sum_v[index],
-					factors[them].ksdg.sum_v[index]);
+					interactions[2][lane], interactions[3][lane]);
 			}
+
+			const __m256i sh_u = _mm256_loadu_si256(
+				reinterpret_cast<const __m256i*>(
+					factors[us].halfka.sum_v + j));
+			const __m256i sk_u = _mm256_loadu_si256(
+				reinterpret_cast<const __m256i*>(
+					factors[us].ksdg.sum_v + j));
+			const __m256i sh_t = _mm256_loadu_si256(
+				reinterpret_cast<const __m256i*>(
+					factors[them].halfka.sum_v + j));
+			const __m256i sk_t = _mm256_loadu_si256(
+				reinterpret_cast<const __m256i*>(
+					factors[them].ksdg.sum_v + j));
+			StoreFmLinear4(diff_output + 64 + j,
+				_mm256_sub_epi64(sh_u, sh_t), FMScale3);
+			StoreFmLinear4(diff_output + 96 + j,
+				_mm256_sub_epi64(sk_u, sk_t), FMScale4);
+			StoreFmLinear4(abs_output + 64 + j, sh_u, FMScale7);
+			StoreFmLinear4(abs_output + 96 + j, sk_u, FMScale8);
 		}
 #else
 		for (IndexType j = 0; j < kFactorDimensions; ++j) {
 			// 2次相互作用項の公式: (Σv)^2 - Σ(v^2)
 			auto get_inter = [](int64_t v, int64_t v2) { return (v * v - v2) / 2; };
-			write_fm_outputs(
-				j,
-				get_inter(factors[us].halfka.sum_v[j], factors[us].halfka.sum_v2[j]),
-				get_inter(factors[us].ksdg.sum_v[j], factors[us].ksdg.sum_v2[j]),
-				factors[us].halfka.sum_v[j], factors[us].ksdg.sum_v[j],
-				get_inter(factors[them].halfka.sum_v[j], factors[them].halfka.sum_v2[j]),
-				get_inter(factors[them].ksdg.sum_v[j], factors[them].ksdg.sum_v2[j]),
-				factors[them].halfka.sum_v[j], factors[them].ksdg.sum_v[j]);
+			const int64_t ih_u = get_inter(
+				factors[us].halfka.sum_v[j], factors[us].halfka.sum_v2[j]);
+			const int64_t ik_u = get_inter(
+				factors[us].ksdg.sum_v[j], factors[us].ksdg.sum_v2[j]);
+			const int64_t ih_t = get_inter(
+				factors[them].halfka.sum_v[j], factors[them].halfka.sum_v2[j]);
+			const int64_t ik_t = get_inter(
+				factors[them].ksdg.sum_v[j], factors[them].ksdg.sum_v2[j]);
+			write_fm_quadratic_outputs(j, ih_u, ik_u, ih_t, ik_t);
+			const int64_t sh_u = factors[us].halfka.sum_v[j];
+			const int64_t sk_u = factors[us].ksdg.sum_v[j];
+			const int64_t sh_t = factors[them].halfka.sum_v[j];
+			const int64_t sk_t = factors[them].ksdg.sum_v[j];
+			diff_output[64 + j] = ToOutputRange(
+				((sh_u - sh_t) * FMScale3) >> 22);
+			diff_output[96 + j] = ToOutputRange(
+				((sk_u - sk_t) * FMScale4) >> 22);
+			abs_output[64 + j] = ToOutputRange((sh_u * FMScale7) >> 22);
+			abs_output[96 + j] = ToOutputRange((sk_u * FMScale8) >> 22);
 		}
 #endif
 	}
@@ -843,6 +916,278 @@ class FeatureTransformer {
 	// Benchmark-only entry points. These are not compiled into normal builds.
 	void BenchmarkRefreshAccumulator(const Position& pos) const {
 		refresh_accumulator(pos);
+	}
+
+	struct alignas(32) BenchmarkFmInteractions {
+		std::int64_t values[4][32];
+	};
+
+	// Recompute only the Main FT + PairWeight portion of Transform().
+	// This intentionally duplicates the production expression so the benchmark
+	// can isolate it without inserting callbacks or timers into Transform().
+	void BenchmarkTransformMain(const Position& pos, OutputType* output,
+	                            const int bucket_id) const {
+		const auto& accumulation = pos.state()->accumulator.accumulation;
+		const int pair_bucket =
+			std::clamp(bucket_id, 0, static_cast<int>(kPairWeightBuckets) - 1);
+		const int16_t* curr_w_mul  = pair_weights_mul[pair_bucket];
+		const int16_t* curr_w_diff = pair_weights_diff[pair_bucket];
+		const int16_t* curr_w_sum  = pair_weights_sum[pair_bucket];
+		const Color perspectives[2] = {pos.side_to_move(), ~pos.side_to_move()};
+
+		for (IndexType p = 0; p < 2; ++p) {
+			const IndexType offset = (kHalfDimensions / 2) * p;
+			const Color side = perspectives[p];
+#if defined(VECTOR)
+			constexpr IndexType NumOutputChunks = kHalfDimensions / 2 / 32;
+			const vec_t* in0 = reinterpret_cast<const vec_t*>(
+				&(accumulation[side][0][0]));
+			const vec_t* in1 = reinterpret_cast<const vec_t*>(
+				&(accumulation[side][0][kHalfDimensions / 2]));
+
+			auto blend_vec_3way = [&](vec_t a, vec_t b, IndexType j) {
+				const __m256i V_Zero = _mm256_setzero_si256();
+				const __m256i V_127  = _mm256_set1_epi16(127);
+				const __m256i V_64   = _mm256_set1_epi32(64);
+				a = _mm256_max_epi16(_mm256_min_epi16(a, V_127), V_Zero);
+				b = _mm256_max_epi16(_mm256_min_epi16(b, V_127), V_Zero);
+
+				auto compute8 = [&](__m128i a16, __m128i b16, IndexType idx) {
+					const __m256i a32 = _mm256_cvtepi16_epi32(a16);
+					const __m256i b32 = _mm256_cvtepi16_epi32(b16);
+					const __m256i w_mul = _mm256_cvtepi16_epi32(
+						_mm_loadu_si128(reinterpret_cast<const __m128i*>(
+							&curr_w_mul[idx])));
+					const __m256i w_diff = _mm256_cvtepi16_epi32(
+						_mm_loadu_si128(reinterpret_cast<const __m128i*>(
+							&curr_w_diff[idx])));
+					const __m256i w_sum = _mm256_cvtepi16_epi32(
+						_mm_loadu_si128(reinterpret_cast<const __m128i*>(
+							&curr_w_sum[idx])));
+					const __m256i term_mul = _mm256_mullo_epi32(
+						_mm256_mullo_epi32(a32, b32), w_mul);
+					const __m256i diff = _mm256_sub_epi32(a32, b32);
+					const __m256i term_diff = _mm256_mullo_epi32(
+						_mm256_mullo_epi32(diff, diff), w_diff);
+					const __m256i term_sum = _mm256_mullo_epi32(
+						_mm256_mullo_epi32(_mm256_add_epi32(a32, b32), w_sum),
+						V_64);
+					return _mm256_srai_epi32(_mm256_add_epi32(
+						_mm256_add_epi32(term_mul, term_diff), term_sum), 21);
+				};
+
+				const __m256i res_lo = compute8(
+					_mm256_extracti128_si256(a, 0),
+					_mm256_extracti128_si256(b, 0), j);
+				const __m256i res_hi = compute8(
+					_mm256_extracti128_si256(a, 1),
+					_mm256_extracti128_si256(b, 1), j + 8);
+				return _mm256_permute4x64_epi64(
+					_mm256_packs_epi32(res_lo, res_hi),
+					_MM_SHUFFLE(3, 1, 2, 0));
+			};
+
+			for (IndexType j = 0; j < NumOutputChunks; ++j) {
+				const vec_t blended0 = blend_vec_3way(
+					in0[j * 2], in1[j * 2], j * 32);
+				const vec_t blended1 = blend_vec_3way(
+					in0[j * 2 + 1], in1[j * 2 + 1], j * 32 + 16);
+				const __m256i packed8 = _mm256_permute4x64_epi64(
+					_mm256_packus_epi16(blended0, blended1),
+					_MM_SHUFFLE(3, 1, 2, 0));
+				_mm256_storeu_si256(
+					reinterpret_cast<__m256i*>(&output[offset + j * 32]), packed8);
+			}
+#else
+			for (IndexType j = 0; j < kHalfDimensions / 2; ++j) {
+				const int32_t a = std::clamp<int32_t>(
+					accumulation[side][0][j], 0, 127);
+				const int32_t b = std::clamp<int32_t>(
+					accumulation[side][0][j + kHalfDimensions / 2], 0, 127);
+				const int32_t diff = a - b;
+				const int32_t blended_total =
+					a * b * curr_w_mul[j]
+					+ diff * diff * curr_w_diff[j]
+					+ (a + b) * 64 * curr_w_sum[j];
+				output[offset + j] =
+					static_cast<OutputType>(blended_total >> 21);
+			}
+#endif
+		}
+	}
+
+	// Recompute the four 32-element FM interaction vectors. The stored layout
+	// is us.HalfKA, us.KSDG3, them.HalfKA, them.KSDG3.
+	void BenchmarkTransformFmInteractionsOnly(
+		const Position& pos, BenchmarkFmInteractions& interactions) const {
+		const auto& factors = pos.state()->accumulator.factors;
+		const Color us = pos.side_to_move();
+		const Color them = ~us;
+#if defined(USE_AVX2)
+		const __m256i zero64 = _mm256_setzero_si256();
+		const __m256i one64 = _mm256_set1_epi64x(1);
+		auto get_inter4 = [&](const int64_t* sum_v, const int64_t* sum_v2,
+		                      IndexType offset) {
+			const __m256i v = _mm256_loadu_si256(
+				reinterpret_cast<const __m256i*>(sum_v + offset));
+			const __m256i v2 = _mm256_loadu_si256(
+				reinterpret_cast<const __m256i*>(sum_v2 + offset));
+			const __m256i numerator =
+				_mm256_sub_epi64(_mm256_mul_epi32(v, v), v2);
+			const __m256i negative = _mm256_cmpgt_epi64(zero64, numerator);
+			const __m256i arithmetic_half = _mm256_or_si256(
+				_mm256_srli_epi64(numerator, 1),
+				_mm256_slli_epi64(negative, 63));
+			const __m256i correction = _mm256_and_si256(
+				_mm256_and_si256(negative, numerator), one64);
+			return _mm256_add_epi64(arithmetic_half, correction);
+		};
+
+		for (IndexType j = 0; j < kFactorDimensions; j += 4) {
+			_mm256_store_si256(
+				reinterpret_cast<__m256i*>(&interactions.values[0][j]),
+				get_inter4(factors[us].halfka.sum_v,
+				           factors[us].halfka.sum_v2, j));
+			_mm256_store_si256(
+				reinterpret_cast<__m256i*>(&interactions.values[1][j]),
+				get_inter4(factors[us].ksdg.sum_v,
+				           factors[us].ksdg.sum_v2, j));
+			_mm256_store_si256(
+				reinterpret_cast<__m256i*>(&interactions.values[2][j]),
+				get_inter4(factors[them].halfka.sum_v,
+				           factors[them].halfka.sum_v2, j));
+			_mm256_store_si256(
+				reinterpret_cast<__m256i*>(&interactions.values[3][j]),
+				get_inter4(factors[them].ksdg.sum_v,
+				           factors[them].ksdg.sum_v2, j));
+		}
+#else
+		auto get_inter = [](int64_t v, int64_t v2) {
+			return (v * v - v2) / 2;
+		};
+		for (IndexType j = 0; j < kFactorDimensions; ++j) {
+			interactions.values[0][j] = get_inter(
+				factors[us].halfka.sum_v[j], factors[us].halfka.sum_v2[j]);
+			interactions.values[1][j] = get_inter(
+				factors[us].ksdg.sum_v[j], factors[us].ksdg.sum_v2[j]);
+			interactions.values[2][j] = get_inter(
+				factors[them].halfka.sum_v[j], factors[them].halfka.sum_v2[j]);
+			interactions.values[3][j] = get_inter(
+				factors[them].ksdg.sum_v[j], factors[them].ksdg.sum_v2[j]);
+		}
+#endif
+	}
+
+	void BenchmarkTransformFmOutputsScalarOnly(
+		const Position& pos, const BenchmarkFmInteractions& interactions,
+		OutputType* diff_output, OutputType* abs_output) const {
+		const auto& factors = pos.state()->accumulator.factors;
+		const Color us = pos.side_to_move();
+		const Color them = ~us;
+		for (IndexType j = 0; j < kFactorDimensions; ++j) {
+			const int64_t ih_u = interactions.values[0][j];
+			const int64_t ik_u = interactions.values[1][j];
+			const int64_t ih_t = interactions.values[2][j];
+			const int64_t ik_t = interactions.values[3][j];
+			const int64_t sh_u = factors[us].halfka.sum_v[j];
+			const int64_t sk_u = factors[us].ksdg.sum_v[j];
+			const int64_t sh_t = factors[them].halfka.sum_v[j];
+			const int64_t sk_t = factors[them].ksdg.sum_v[j];
+
+			diff_output[0 + j] = ToOutputRange(((ih_u - ih_t) * FMScale1) >> 37);
+			diff_output[32 + j] = ToOutputRange(((ik_u - ik_t) * FMScale2) >> 37);
+			diff_output[64 + j] = ToOutputRange(((sh_u - sh_t) * FMScale3) >> 22);
+			diff_output[96 + j] = ToOutputRange(((sk_u - sk_t) * FMScale4) >> 22);
+			abs_output[0 + j] = ToOutputRange((ih_u * FMScale5) >> 37);
+			abs_output[32 + j] = ToOutputRange((ik_u * FMScale6) >> 37);
+			abs_output[64 + j] = ToOutputRange((sh_u * FMScale7) >> 22);
+			abs_output[96 + j] = ToOutputRange((sk_u * FMScale8) >> 22);
+		}
+	}
+
+	void BenchmarkTransformFmOutputsHybridOnly(
+		const Position& pos, const BenchmarkFmInteractions& interactions,
+		OutputType* diff_output, OutputType* abs_output) const {
+		const auto& factors = pos.state()->accumulator.factors;
+		const Color us = pos.side_to_move();
+		const Color them = ~us;
+
+		// Preserve the production scalar ih/ik path exactly.
+		for (IndexType j = 0; j < kFactorDimensions; ++j) {
+			const int64_t ih_u = interactions.values[0][j];
+			const int64_t ik_u = interactions.values[1][j];
+			const int64_t ih_t = interactions.values[2][j];
+			const int64_t ik_t = interactions.values[3][j];
+			diff_output[0 + j] = ToOutputRange(
+				((ih_u - ih_t) * FMScale1) >> 37);
+			diff_output[32 + j] = ToOutputRange(
+				((ik_u - ik_t) * FMScale2) >> 37);
+			abs_output[0 + j] = ToOutputRange((ih_u * FMScale5) >> 37);
+			abs_output[32 + j] = ToOutputRange((ik_u * FMScale6) >> 37);
+		}
+
+#if defined(USE_AVX2)
+		for (IndexType j = 0; j < kFactorDimensions; j += 4) {
+			const __m256i sh_u = _mm256_loadu_si256(
+				reinterpret_cast<const __m256i*>(
+					factors[us].halfka.sum_v + j));
+			const __m256i sk_u = _mm256_loadu_si256(
+				reinterpret_cast<const __m256i*>(
+					factors[us].ksdg.sum_v + j));
+			const __m256i sh_t = _mm256_loadu_si256(
+				reinterpret_cast<const __m256i*>(
+					factors[them].halfka.sum_v + j));
+			const __m256i sk_t = _mm256_loadu_si256(
+				reinterpret_cast<const __m256i*>(
+					factors[them].ksdg.sum_v + j));
+			StoreFmLinear4(diff_output + 64 + j,
+				_mm256_sub_epi64(sh_u, sh_t), FMScale3);
+			StoreFmLinear4(diff_output + 96 + j,
+				_mm256_sub_epi64(sk_u, sk_t), FMScale4);
+			StoreFmLinear4(abs_output + 64 + j, sh_u, FMScale7);
+			StoreFmLinear4(abs_output + 96 + j, sk_u, FMScale8);
+		}
+#else
+		for (IndexType j = 0; j < kFactorDimensions; ++j) {
+			const int64_t sh_u = factors[us].halfka.sum_v[j];
+			const int64_t sk_u = factors[us].ksdg.sum_v[j];
+			const int64_t sh_t = factors[them].halfka.sum_v[j];
+			const int64_t sk_t = factors[them].ksdg.sum_v[j];
+			diff_output[64 + j] = ToOutputRange(
+				((sh_u - sh_t) * FMScale3) >> 22);
+			diff_output[96 + j] = ToOutputRange(
+				((sk_u - sk_t) * FMScale4) >> 22);
+			abs_output[64 + j] = ToOutputRange((sh_u * FMScale7) >> 22);
+			abs_output[96 + j] = ToOutputRange((sk_u * FMScale8) >> 22);
+		}
+#endif
+	}
+
+	void BenchmarkTransformFmOutputsOnly(
+		const Position& pos, const BenchmarkFmInteractions& interactions,
+		OutputType* diff_output, OutputType* abs_output) const {
+		BenchmarkTransformFmOutputsHybridOnly(
+			pos, interactions, diff_output, abs_output);
+	}
+
+	void BenchmarkTransformReconstructed(
+		const Position& pos, OutputType* output, OutputType* diff_output,
+		OutputType* abs_output, const int bucket_id) const {
+		BenchmarkFmInteractions interactions;
+		BenchmarkTransformMain(pos, output, bucket_id);
+		BenchmarkTransformFmInteractionsOnly(pos, interactions);
+		BenchmarkTransformFmOutputsOnly(
+			pos, interactions, diff_output, abs_output);
+	}
+
+	void BenchmarkTransformReconstructedScalarFm(
+		const Position& pos, OutputType* output, OutputType* diff_output,
+		OutputType* abs_output, const int bucket_id) const {
+		BenchmarkFmInteractions interactions;
+		BenchmarkTransformMain(pos, output, bucket_id);
+		BenchmarkTransformFmInteractionsOnly(pos, interactions);
+		BenchmarkTransformFmOutputsScalarOnly(
+			pos, interactions, diff_output, abs_output);
 	}
 
 	static bool BenchmarkIsHalfKaIndex(const IndexType index) {
