@@ -371,6 +371,13 @@
 // ここ以降では、↑↑↑で設定した内容に基づき必要なdefineを行う。
 // ===============================================================
 
+// SFNNwoP1536ではFinny Tablesを標準使用する。
+// 比較・検証用buildではDISABLE_FINNY_TABLESを定義して無効化できる。
+#if defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536) \
+	&& !defined(DISABLE_FINNY_TABLES)
+	#define USE_FINNY_TABLES
+#endif
+
 // 通常探索時の最大探索深さ
 constexpr int MAX_PLY_NUM = 246;
 
