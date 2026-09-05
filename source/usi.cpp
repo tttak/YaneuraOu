@@ -754,10 +754,10 @@ void USIEngine::bench(std::istream& args) {
 
     dbg_print();
 
-    std::cerr << "\n==========================="    //
+    sync_cout << "\n==========================="    //
               << "\nTotal time (ms) : " << elapsed  //
               << "\nNodes searched  : " << nodes    //
-              << "\nNodes/second    : " << 1000 * nodes / elapsed << std::endl;
+              << "\nNodes/second    : " << 1000 * nodes / elapsed << sync_endl;
 
     // reset callback, to not capture a dangling reference to nodesSearched
     // コールバックをリセットする。nodesSearched へのダングリング参照を捕捉しないようにするため。

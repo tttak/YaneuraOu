@@ -5,6 +5,8 @@
 #include "../features/half_ka.h"
 #include "../features/king_safety3_distinguishgolds.h"
 
+#include <array>
+#include <cmath>
 #include <cstring>
 
 #include "../layers/affine_transform_explicit.h"
@@ -110,8 +112,63 @@ struct Network {
 		return true;
 	}
 
+#if defined(USE_NNUE_APPROX_SIGMOID_LUT)
+	// Accuracy-comparison candidate for the Main and FM Abs gates.
+	// The Phase gate intentionally keeps its existing std::exp calculation.
+	static constexpr int kApproxSigmoidLutMinimum = -10;
+	static constexpr int kApproxSigmoidLutMaximum = 8;
+	static constexpr int kApproxSigmoidLutStepsPerUnit = 32;
+	static constexpr int kApproxSigmoidLutRawStep =
+		8128 / kApproxSigmoidLutStepsPerUnit;
+	static constexpr int kApproxSigmoidLutRawMinimum =
+		kApproxSigmoidLutMinimum * 8128;
+	static constexpr int kApproxSigmoidLutRawMaximum =
+		kApproxSigmoidLutMaximum * 8128;
+	static constexpr int kApproxSigmoidLutPoints =
+		(kApproxSigmoidLutMaximum - kApproxSigmoidLutMinimum)
+			* kApproxSigmoidLutStepsPerUnit + 1;
+	static_assert(8128 % kApproxSigmoidLutStepsPerUnit == 0);
+
+	static const std::array<float, kApproxSigmoidLutPoints>&
+	ApproxSigmoidLut() {
+		static const auto lut = []() {
+			std::array<float, kApproxSigmoidLutPoints> values{};
+			for (int i = 0; i < kApproxSigmoidLutPoints; ++i) {
+				const float input =
+					static_cast<float>(kApproxSigmoidLutMinimum)
+					+ static_cast<float>(i)
+						/ static_cast<float>(kApproxSigmoidLutStepsPerUnit);
+				values[i] = 1.0f / (1.0f + std::exp(-input));
+			}
+			return values;
+		}();
+		return lut;
+	}
+
+	static inline float sigmoid_lut_approx(const std::int32_t raw_x) {
+		const auto& lut = ApproxSigmoidLut();
+		if (raw_x <= kApproxSigmoidLutRawMinimum)
+			return lut.front();
+		if (raw_x >= kApproxSigmoidLutRawMaximum)
+			return lut.back();
+
+		const int offset = raw_x - kApproxSigmoidLutRawMinimum;
+		const int index = offset / kApproxSigmoidLutRawStep;
+		const int remainder = offset - index * kApproxSigmoidLutRawStep;
+		const float fraction = static_cast<float>(remainder)
+			/ static_cast<float>(kApproxSigmoidLutRawStep);
+		return lut[index]
+			+ (lut[index + 1] - lut[index])
+				* fraction;
+	}
+#endif
+
 	static inline int32_t sigmoid_gate_slow(int32_t x, int32_t value) {
+#if defined(USE_NNUE_APPROX_SIGMOID_LUT)
+		const float sig = sigmoid_lut_approx(x);
+#else
 		float sig = 1.0f / (1.0f + std::exp(-static_cast<float>(x) / 8128.0f));
+#endif
 		return static_cast<int32_t>(value * sig);
 	}
 
@@ -422,6 +479,113 @@ struct Network {
 	// Benchmark-only stage entry points. These intentionally duplicate the normal
 	// Propagate() arithmetic so isolated stage timing does not add branches or
 	// instrumentation to the production evaluation path.
+	enum class BenchmarkSigmoidImplementation {
+		StdExp,
+		FloatLutMinus8To8Step16,
+		FloatLutMinus10To8Step16,
+		FloatLutMinus8To8Step32,
+		FloatLutMinus10To8Step32,
+	};
+
+	template<int Minimum, int Maximum, int StepsPerUnit>
+	static const auto& BenchmarkConfiguredFloatSigmoidLut() {
+		static_assert(8128 % StepsPerUnit == 0);
+		constexpr int kPoints =
+			(Maximum - Minimum) * StepsPerUnit + 1;
+		static const auto lut = []() {
+			std::array<float, kPoints> values{};
+			for (int i = 0; i < kPoints; ++i) {
+				const float x = static_cast<float>(Minimum)
+					+ static_cast<float>(i) /
+						static_cast<float>(StepsPerUnit);
+				values[i] = 1.0f / (1.0f + std::exp(-x));
+			}
+			return values;
+		}();
+		return lut;
+	}
+
+	template<int Minimum, int Maximum, int StepsPerUnit>
+	static float BenchmarkConfiguredSigmoidFloatLutLinear(
+		const std::int32_t raw_x) {
+		constexpr int kRawStep = 8128 / StepsPerUnit;
+		constexpr int kRawMinimum = Minimum * 8128;
+		constexpr int kRawMaximum = Maximum * 8128;
+		const auto& lut = BenchmarkConfiguredFloatSigmoidLut<
+			Minimum, Maximum, StepsPerUnit>();
+		if (raw_x <= kRawMinimum)
+			return lut.front();
+		if (raw_x >= kRawMaximum)
+			return lut.back();
+
+		const int offset = raw_x - kRawMinimum;
+		const int index = offset / kRawStep;
+		const int remainder = offset - index * kRawStep;
+		const float fraction =
+			static_cast<float>(remainder) / static_cast<float>(kRawStep);
+		return lut[index] + (lut[index + 1] - lut[index]) * fraction;
+	}
+
+	template<BenchmarkSigmoidImplementation Implementation>
+	static float BenchmarkSigmoidValue(const std::int32_t raw_x) {
+		if constexpr (Implementation == BenchmarkSigmoidImplementation::StdExp)
+			return 1.0f /
+				(1.0f + std::exp(-static_cast<float>(raw_x) / 8128.0f));
+		else if constexpr (Implementation ==
+			BenchmarkSigmoidImplementation::FloatLutMinus8To8Step16)
+			return BenchmarkConfiguredSigmoidFloatLutLinear<-8, 8, 16>(raw_x);
+		else if constexpr (Implementation ==
+			BenchmarkSigmoidImplementation::FloatLutMinus10To8Step16)
+			return BenchmarkConfiguredSigmoidFloatLutLinear<-10, 8, 16>(raw_x);
+		else if constexpr (Implementation ==
+			BenchmarkSigmoidImplementation::FloatLutMinus8To8Step32)
+			return BenchmarkConfiguredSigmoidFloatLutLinear<-8, 8, 32>(raw_x);
+		else if constexpr (Implementation ==
+			BenchmarkSigmoidImplementation::FloatLutMinus10To8Step32) {
+#if defined(USE_NNUE_APPROX_SIGMOID_LUT)
+			return sigmoid_lut_approx(raw_x);
+#else
+			return BenchmarkConfiguredSigmoidFloatLutLinear<-10, 8, 32>(raw_x);
+#endif
+		}
+	}
+
+	template<BenchmarkSigmoidImplementation Implementation>
+	static std::int32_t BenchmarkSigmoidGate(const std::int32_t raw_x,
+		const std::int32_t value) {
+		return static_cast<std::int32_t>(
+			static_cast<float>(value) *
+			BenchmarkSigmoidValue<Implementation>(raw_x));
+	}
+
+	template<BenchmarkSigmoidImplementation Implementation>
+	void BenchmarkMainGateSigmoidCandidate(
+		const std::int32_t* diff_fc_output, std::int32_t* gate_q64) const {
+		for (int j = 0; j < 32; ++j)
+			gate_q64[j] = BenchmarkSigmoidGate<Implementation>(
+				diff_fc_output[j] - 2438, 64);
+	}
+
+	template<BenchmarkSigmoidImplementation Implementation>
+	void BenchmarkAbsSigmoidGateCandidate(
+		const std::int32_t* abs_fc_output,
+		std::int32_t* abs_gated_output) const {
+		for (int j = 0; j < 32; ++j)
+			abs_gated_output[j] = BenchmarkSigmoidGate<Implementation>(
+				abs_fc_output[j], abs_fc_output[j + 32]);
+	}
+
+	template<BenchmarkSigmoidImplementation Implementation>
+	void BenchmarkMainGateCandidate(const std::int32_t* fc_input,
+		const std::int32_t* diff_fc_output, std::int32_t* fc_output) const {
+		std::int32_t gate_q64[32];
+		std::int32_t before_clamp[32];
+		BenchmarkMainGateSigmoidCandidate<Implementation>(
+			diff_fc_output, gate_q64);
+		ComputeMainGateApply(fc_input, gate_q64, before_clamp);
+		ComputeMainGateClamp(before_clamp, fc_output);
+	}
+
 	struct BenchmarkPhaseScales {
 		float main_sqr;
 		float main_raw;

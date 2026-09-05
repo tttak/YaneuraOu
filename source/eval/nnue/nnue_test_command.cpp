@@ -1302,7 +1302,9 @@ struct alignas(kCacheLineSize) NetworkStageBenchCase {
   float diff_inv_rms = 0.0f;
   std::array<std::int32_t, 32> abs_gated{};
   std::array<std::uint8_t, 32> diff_before_lca;
-  std::array<std::int32_t, 32> main_before_gate;
+  // BenchmarkMainFc0() uses the AVX2 affine kernel, whose output stores require
+  // the same SIMD alignment as Network::Buffer::fc_0_out.
+  alignas(kCacheLineSize) std::array<std::int32_t, 32> main_before_gate;
   std::array<std::int32_t, 32> main_gate_q64;
   std::array<std::int32_t, 32> main_after_gate_before_clamp;
   std::array<float, 6> phase_values{};
@@ -1458,11 +1460,15 @@ NnueBenchLcaDerivedDiagnostics MakeNnueBenchLcaDerivedDiagnostics(
 }
 
 std::vector<NetworkStageBenchCase> MakeNnueNetworkStageBenchCorpus() {
+  std::cout << "  corpus build : network inputs..." << std::flush;
   const auto input_corpus = MakeNnueNetworkBenchCorpus();
+  std::cout << "done (" << input_corpus.size() << "), stage captures..."
+            << std::flush;
   std::vector<NetworkStageBenchCase> corpus;
   corpus.reserve(input_corpus.size());
 
-  alignas(kCacheLineSize) char network_buffer[Network::kBufferSize];
+  alignas(kCacheLineSize) Network::Buffer network_buffer{};
+  std::size_t input_index = 0;
   for (const auto& input : input_corpus) {
     NetworkStageBenchCase sample{};
     sample.input = input;
@@ -1470,10 +1476,10 @@ std::vector<NetworkStageBenchCase> MakeNnueNetworkStageBenchCorpus() {
         NnueBenchSelectedNetwork(input.selected_bucket);
     const auto output = selected_network.Propagate(
         input.transformed.data(), input.diff_transformed.data(),
-        input.abs_transformed.data(), input.material_bucket, network_buffer);
+        input.abs_transformed.data(), input.material_bucket,
+        reinterpret_cast<char*>(&network_buffer));
     sample.final_output = output[0];
-    sample.intermediate =
-        *reinterpret_cast<const Network::Buffer*>(network_buffer);
+    sample.intermediate = network_buffer;
 
     sample.phase_scales = selected_network.BenchmarkPhaseScalesFromOutput(
         sample.intermediate.phase_out);
@@ -1512,7 +1518,11 @@ std::vector<NetworkStageBenchCase> MakeNnueNetworkStageBenchCorpus() {
     selected_network.BenchmarkFc2(sample.intermediate.ac_1_out,
                                   &sample.fc2_before_blend);
     corpus.emplace_back(std::move(sample));
+    ++input_index;
+    if (input_index % 1000 == 0)
+      std::cout << "." << std::flush;
   }
+  std::cout << "done" << std::endl;
   return corpus;
 }
 
@@ -4000,6 +4010,816 @@ void TestFc1OutputTilingBenchmark(const std::uint64_t repeat_count) {
 
 #endif  // defined(USE_AVX2) && !defined(USE_AVX512)
 
+using SigmoidBenchImplementation = Network::BenchmarkSigmoidImplementation;
+
+enum class SigmoidBenchOperation {
+  MainSigmoid,
+  AbsSigmoidAndValueGate,
+  MainAndAbs,
+  FullNetwork,
+};
+
+template<SigmoidBenchImplementation MainImplementation,
+         SigmoidBenchImplementation AbsImplementation>
+std::int32_t ComputeNnueNetworkSigmoidBenchOutput(
+    const NetworkBenchCase& input, Network::Buffer& work) {
+  const Network& selected_network =
+      NnueBenchSelectedNetwork(input.selected_bucket);
+  const auto scales = selected_network.BenchmarkPhase(
+      input.transformed.data(), input.diff_transformed.data(),
+      input.abs_transformed.data(), input.material_bucket,
+      work.phase_input, work.phase_out);
+
+  selected_network.BenchmarkFmAffine(
+      input.diff_transformed.data(), input.abs_transformed.data(),
+      work.diff_fc_out, work.abs_fc_out);
+  float diff_sum_sq = 0.0f;
+  float diff_inv_rms = 0.0f;
+  selected_network.BenchmarkDiffRmsNorm(
+      work.diff_fc_out, &diff_sum_sq, &diff_inv_rms);
+  selected_network.BenchmarkDiffQuantize(
+      work.diff_fc_out, diff_inv_rms, work.diff_ac_out);
+  alignas(kCacheLineSize) std::int32_t abs_gated[32];
+  selected_network
+      .template BenchmarkAbsSigmoidGateCandidate<AbsImplementation>(
+          work.abs_fc_out, abs_gated);
+  selected_network.BenchmarkAbsGateQuantize(abs_gated, work.abs_ac_out);
+  selected_network.BenchmarkAbsSquared(work.abs_ac_out, work.abs_sqr_out);
+
+  selected_network.BenchmarkMainFc0(
+      input.transformed.data(), work.fc_0_out);
+  selected_network.template BenchmarkMainGateCandidate<MainImplementation>(
+      work.fc_0_out, work.diff_fc_out, work.fc_0_out);
+  selected_network.BenchmarkMainSqrClippedRelu(
+      work.fc_0_out, work.ac_sqr_0_out_temp);
+  selected_network.BenchmarkMainClippedRelu(work.fc_0_out, work.ac_0_out);
+
+  selected_network.BenchmarkLca(
+      work.ac_0_out, work.diff_ac_out, work.abs_ac_out, work.diff_ac_out,
+      work.fm_cat_uint8, work.lca_q_out, work.lca_k_out, work.lca_v_out);
+  selected_network.BenchmarkCross(
+      work.ac_sqr_0_out_temp, work.ac_0_out, work.diff_ac_out,
+      work.abs_ac_out, work.cross_cat, work.cross_fc_out, work.cross_feat);
+  selected_network.BenchmarkL2Assembly(
+      work.ac_sqr_0_out_temp, work.ac_0_out, work.diff_ac_out,
+      work.abs_ac_out, work.abs_sqr_out, work.cross_feat, scales,
+      work.l2_input);
+  selected_network.BenchmarkFc1(work.l2_input, work.fc_1_out);
+  selected_network.BenchmarkAc1(work.fc_1_out, work.ac_1_out);
+  selected_network.BenchmarkFc2(work.ac_1_out, work.fc_2_out);
+  return selected_network.BenchmarkBlend(work.fc_0_out[31],
+                                         work.fc_2_out[0]);
+}
+
+template<SigmoidBenchImplementation Implementation,
+         SigmoidBenchOperation Operation>
+NnueBenchTiming MeasureSigmoidApproximationCorpus(
+    const std::vector<NetworkStageBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  alignas(kCacheLineSize) std::int32_t main_gate_q64[32];
+  alignas(kCacheLineSize) std::int32_t abs_gated[32];
+  alignas(kCacheLineSize) Network::Buffer work{};
+  NnueBenchTiming timing;
+
+  const auto begin = NnueBenchClock::now();
+  for (const auto& sample : corpus) {
+    const Network& selected_network =
+        NnueBenchSelectedNetwork(sample.input.selected_bucket);
+    if constexpr (Operation == SigmoidBenchOperation::MainSigmoid
+                  || Operation == SigmoidBenchOperation::MainAndAbs) {
+      selected_network
+          .template BenchmarkMainGateSigmoidCandidate<Implementation>(
+              sample.intermediate.diff_fc_out, main_gate_q64);
+    }
+    if constexpr (Operation == SigmoidBenchOperation::AbsSigmoidAndValueGate
+                  || Operation == SigmoidBenchOperation::MainAndAbs) {
+      selected_network
+          .template BenchmarkAbsSigmoidGateCandidate<Implementation>(
+              sample.intermediate.abs_fc_out, abs_gated);
+    }
+
+    if constexpr (Operation == SigmoidBenchOperation::FullNetwork) {
+      const std::int32_t output =
+          ComputeNnueNetworkSigmoidBenchOutput<Implementation,
+                                                Implementation>(sample.input,
+                                                                work);
+      MixNnueBenchChecksum(checksum, output);
+    } else {
+      const std::size_t index = static_cast<std::size_t>(timing.calls) & 31;
+      if constexpr (Operation == SigmoidBenchOperation::MainSigmoid)
+        MixNnueBenchChecksum(checksum, main_gate_q64[index]);
+      else if constexpr (
+          Operation == SigmoidBenchOperation::AbsSigmoidAndValueGate)
+        MixNnueBenchChecksum(checksum, abs_gated[index]);
+      else {
+        MixNnueBenchChecksum(checksum, main_gate_q64[index]);
+        MixNnueBenchChecksum(checksum, abs_gated[(index + 17) & 31]);
+      }
+    }
+    ++timing.calls;
+  }
+  const auto end = NnueBenchClock::now();
+  timing.nanoseconds =
+      std::chrono::duration<double, std::nano>(end - begin).count();
+  return timing;
+}
+
+template<SigmoidBenchImplementation Implementation,
+         SigmoidBenchOperation Operation>
+NnueBenchTiming MeasureSigmoidApproximationCorpusAfterWarmup(
+    const std::vector<NetworkStageBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  std::uint64_t warmup_checksum = UINT64_C(14695981039346656037);
+  MeasureSigmoidApproximationCorpus<Implementation, Operation>(
+      corpus, warmup_checksum);
+  MixNnueBenchChecksum(checksum, warmup_checksum);
+  return MeasureSigmoidApproximationCorpus<Implementation, Operation>(
+      corpus, checksum);
+}
+
+template<SigmoidBenchOperation Operation>
+NnueBenchTiming DispatchSigmoidApproximationMeasurement(
+    const SigmoidBenchImplementation implementation,
+    const std::vector<NetworkStageBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  switch (implementation) {
+    case SigmoidBenchImplementation::StdExp:
+      return MeasureSigmoidApproximationCorpusAfterWarmup<
+          SigmoidBenchImplementation::StdExp, Operation>(corpus, checksum);
+    case SigmoidBenchImplementation::FloatLutMinus8To8Step16:
+      return MeasureSigmoidApproximationCorpusAfterWarmup<
+          SigmoidBenchImplementation::FloatLutMinus8To8Step16, Operation>(
+              corpus, checksum);
+    case SigmoidBenchImplementation::FloatLutMinus10To8Step16:
+      return MeasureSigmoidApproximationCorpusAfterWarmup<
+          SigmoidBenchImplementation::FloatLutMinus10To8Step16, Operation>(
+              corpus, checksum);
+    case SigmoidBenchImplementation::FloatLutMinus8To8Step32:
+      return MeasureSigmoidApproximationCorpusAfterWarmup<
+          SigmoidBenchImplementation::FloatLutMinus8To8Step32, Operation>(
+              corpus, checksum);
+    case SigmoidBenchImplementation::FloatLutMinus10To8Step32:
+      return MeasureSigmoidApproximationCorpusAfterWarmup<
+          SigmoidBenchImplementation::FloatLutMinus10To8Step32, Operation>(
+              corpus, checksum);
+  }
+  return {};
+}
+
+NnueBenchTiming DispatchSigmoidApproximationOperation(
+    const SigmoidBenchImplementation implementation,
+    const SigmoidBenchOperation operation,
+    const std::vector<NetworkStageBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  switch (operation) {
+    case SigmoidBenchOperation::MainSigmoid:
+      return DispatchSigmoidApproximationMeasurement<
+          SigmoidBenchOperation::MainSigmoid>(
+              implementation, corpus, checksum);
+    case SigmoidBenchOperation::AbsSigmoidAndValueGate:
+      return DispatchSigmoidApproximationMeasurement<
+          SigmoidBenchOperation::AbsSigmoidAndValueGate>(
+              implementation, corpus, checksum);
+    case SigmoidBenchOperation::MainAndAbs:
+      return DispatchSigmoidApproximationMeasurement<
+          SigmoidBenchOperation::MainAndAbs>(
+              implementation, corpus, checksum);
+    case SigmoidBenchOperation::FullNetwork:
+      return DispatchSigmoidApproximationMeasurement<
+          SigmoidBenchOperation::FullNetwork>(
+              implementation, corpus, checksum);
+  }
+  return {};
+}
+
+struct SigmoidApproximationError {
+  double maximum = 0.0;
+  double sum = 0.0;
+  std::uint64_t count = 0;
+
+  void Add(const float reference, const float candidate) {
+    const double error = std::abs(
+        static_cast<double>(reference) - static_cast<double>(candidate));
+    maximum = std::max(maximum, error);
+    sum += error;
+    ++count;
+  }
+
+  double Mean() const {
+    return count == 0 ? 0.0 : sum / static_cast<double>(count);
+  }
+};
+
+struct SigmoidIntegerDifference {
+  std::uint64_t count = 0;
+  std::int64_t maximum = 0;
+
+  void Add(const std::int32_t reference, const std::int32_t candidate) {
+    const std::int64_t difference = std::abs(
+        static_cast<std::int64_t>(reference) - candidate);
+    if (difference != 0)
+      ++count;
+    maximum = std::max(maximum, difference);
+  }
+};
+
+double NnueBenchPercentile(std::vector<double> values,
+                           const double percentile) {
+  if (values.empty())
+    return 0.0;
+  std::sort(values.begin(), values.end());
+  const std::size_t index = static_cast<std::size_t>(
+      std::floor((values.size() - 1) * percentile));
+  return values[index];
+}
+
+void PrintSigmoidDistribution(const char* const name,
+                              const std::vector<double>& values) {
+  if (values.empty())
+    return;
+  std::vector<double> sorted = values;
+  std::sort(sorted.begin(), sorted.end());
+  double mean = 0.0;
+  for (const double value : sorted)
+    mean += value;
+  mean /= static_cast<double>(sorted.size());
+  const auto percentile = [&](const double p) {
+    return sorted[static_cast<std::size_t>(
+        std::floor((sorted.size() - 1) * p))];
+  };
+  std::cout << name << std::endl
+            << "  min    : " << sorted.front() << std::endl
+            << "  p1     : " << percentile(0.01) << std::endl
+            << "  p10    : " << percentile(0.10) << std::endl
+            << "  median : " << percentile(0.50) << std::endl
+            << "  mean   : " << mean << std::endl
+            << "  p90    : " << percentile(0.90) << std::endl
+            << "  p99    : " << percentile(0.99) << std::endl
+            << "  max    : " << sorted.back() << std::endl;
+}
+
+void PrintSigmoidTimingComparison(
+    const char* const name, const std::array<NnueBenchSamples, 5>& samples) {
+  constexpr std::array<const char*, 5> names = {
+      "Reference. std::exp",
+      "A. float32 LUT [-8, 8], step 1/16",
+      "B. float32 LUT [-10, 8], step 1/16",
+      "C. float32 LUT [-8, 8], step 1/32",
+      "D. float32 LUT [-10, 8], step 1/32"};
+  const auto baseline = SummarizeNnueBenchSamples(samples[0]);
+  std::cout << name << std::endl;
+  for (std::size_t i = 0; i < samples.size(); ++i) {
+    const auto summary = SummarizeNnueBenchSamples(samples[i]);
+    const double improvement = baseline.median == 0.0
+        ? 0.0
+        : (baseline.median - summary.median) * 100.0 / baseline.median;
+    std::cout << "  " << names[i] << std::endl
+              << "    median ns/call : " << std::fixed << std::setprecision(1)
+              << summary.median << std::endl
+              << "    mean ns/call   : " << summary.mean << std::endl
+              << "    min ns/call    : " << summary.minimum << std::endl
+              << "    max ns/call    : " << summary.maximum << std::endl
+              << "    improvement    : " << std::setprecision(2)
+              << improvement << "%" << std::endl;
+  }
+}
+
+std::int32_t NnueBenchNetworkOutputToEval(const std::int32_t output) {
+  return std::clamp(output / FV_SCALE, -VALUE_MAX_EVAL, VALUE_MAX_EVAL);
+}
+
+void PrintEvalDifference(const char* const name,
+                         const std::vector<double>& absolute_differences) {
+  double mean = 0.0;
+  double maximum = 0.0;
+  for (const double difference : absolute_differences) {
+    mean += difference;
+    maximum = std::max(maximum, difference);
+  }
+  if (!absolute_differences.empty())
+    mean /= static_cast<double>(absolute_differences.size());
+  std::cout << name << std::endl
+            << "  max abs eval diff  : " << maximum << std::endl
+            << "  mean abs eval diff : " << mean << std::endl
+            << "  p50 / p90 / p95 / p99 : "
+            << NnueBenchPercentile(absolute_differences, 0.50) << " / "
+            << NnueBenchPercentile(absolute_differences, 0.90) << " / "
+            << NnueBenchPercentile(absolute_differences, 0.95) << " / "
+            << NnueBenchPercentile(absolute_differences, 0.99) << std::endl;
+}
+
+template<SigmoidBenchImplementation Candidate>
+void ValidateSigmoidApproximationCandidate(
+    const char* const name, const std::vector<NetworkStageBenchCase>& corpus,
+    const std::vector<std::int32_t>& baseline_outputs) {
+  SigmoidApproximationError main_sigmoid_error;
+  SigmoidIntegerDifference main_q64_difference;
+  SigmoidIntegerDifference main_gate_output_difference;
+  NnueNetworkStageMismatch main_final_output_difference{};
+  std::vector<double> main_eval_differences;
+  main_eval_differences.reserve(corpus.size());
+
+  SigmoidApproximationError abs_sigmoid_error;
+  SigmoidIntegerDifference abs_raw_difference;
+  SigmoidIntegerDifference abs_byte_difference;
+  NnueNetworkStageMismatch abs_final_output_difference{};
+  NnueNetworkStageMismatch combined_final_output_difference{};
+  std::vector<double> combined_eval_differences;
+  combined_eval_differences.reserve(corpus.size());
+
+  alignas(kCacheLineSize) std::int32_t main_q64_a[32];
+  alignas(kCacheLineSize) std::int32_t main_q64_b[32];
+  alignas(kCacheLineSize) std::int32_t main_gate_a[32];
+  alignas(kCacheLineSize) std::int32_t main_gate_b[32];
+  alignas(kCacheLineSize) std::int32_t abs_raw_a[32];
+  alignas(kCacheLineSize) std::int32_t abs_raw_b[32];
+  alignas(kCacheLineSize) std::uint8_t abs_byte_a[32];
+  alignas(kCacheLineSize) std::uint8_t abs_byte_b[32];
+  alignas(kCacheLineSize) Network::Buffer work{};
+
+  for (std::size_t sample_index = 0; sample_index < corpus.size();
+       ++sample_index) {
+    const auto& sample = corpus[sample_index];
+    const Network& selected_network =
+        NnueBenchSelectedNetwork(sample.input.selected_bucket);
+    selected_network.template BenchmarkMainGateSigmoidCandidate<
+        SigmoidBenchImplementation::StdExp>(
+            sample.intermediate.diff_fc_out, main_q64_a);
+    selected_network.template BenchmarkMainGateSigmoidCandidate<Candidate>(
+        sample.intermediate.diff_fc_out, main_q64_b);
+    selected_network.template BenchmarkMainGateCandidate<
+        SigmoidBenchImplementation::StdExp>(
+            sample.main_before_gate.data(), sample.intermediate.diff_fc_out,
+            main_gate_a);
+    selected_network.template BenchmarkMainGateCandidate<Candidate>(
+        sample.main_before_gate.data(), sample.intermediate.diff_fc_out,
+        main_gate_b);
+
+    selected_network.template BenchmarkAbsSigmoidGateCandidate<
+        SigmoidBenchImplementation::StdExp>(
+            sample.intermediate.abs_fc_out, abs_raw_a);
+    selected_network.template BenchmarkAbsSigmoidGateCandidate<Candidate>(
+        sample.intermediate.abs_fc_out, abs_raw_b);
+    selected_network.BenchmarkAbsGateQuantize(abs_raw_a, abs_byte_a);
+    selected_network.BenchmarkAbsGateQuantize(abs_raw_b, abs_byte_b);
+
+    for (int j = 0; j < 32; ++j) {
+      const std::int32_t main_raw_x =
+          sample.intermediate.diff_fc_out[j] - 2438;
+      main_sigmoid_error.Add(
+          Network::BenchmarkSigmoidValue<
+              SigmoidBenchImplementation::StdExp>(main_raw_x),
+          Network::BenchmarkSigmoidValue<Candidate>(main_raw_x));
+      main_q64_difference.Add(main_q64_a[j], main_q64_b[j]);
+      main_gate_output_difference.Add(main_gate_a[j], main_gate_b[j]);
+
+      const std::int32_t abs_raw_x = sample.intermediate.abs_fc_out[j];
+      abs_sigmoid_error.Add(
+          Network::BenchmarkSigmoidValue<
+              SigmoidBenchImplementation::StdExp>(abs_raw_x),
+          Network::BenchmarkSigmoidValue<Candidate>(abs_raw_x));
+      abs_raw_difference.Add(abs_raw_a[j], abs_raw_b[j]);
+      abs_byte_difference.Add(abs_byte_a[j], abs_byte_b[j]);
+    }
+
+    const std::int32_t main_only_output =
+        ComputeNnueNetworkSigmoidBenchOutput<Candidate,
+            SigmoidBenchImplementation::StdExp>(sample.input, work);
+    CompareNnueNetworkStageRange(
+        &baseline_outputs[sample_index], &main_only_output, 1, sample_index,
+        main_final_output_difference);
+    main_eval_differences.push_back(std::abs(
+        NnueBenchNetworkOutputToEval(main_only_output)
+        - NnueBenchNetworkOutputToEval(baseline_outputs[sample_index])));
+
+    const std::int32_t abs_only_output =
+        ComputeNnueNetworkSigmoidBenchOutput<
+            SigmoidBenchImplementation::StdExp, Candidate>(sample.input,
+                                                            work);
+    CompareNnueNetworkStageRange(
+        &baseline_outputs[sample_index], &abs_only_output, 1, sample_index,
+        abs_final_output_difference);
+
+    const std::int32_t combined_output =
+        ComputeNnueNetworkSigmoidBenchOutput<Candidate, Candidate>(
+            sample.input, work);
+    CompareNnueNetworkStageRange(
+        &baseline_outputs[sample_index], &combined_output, 1, sample_index,
+        combined_final_output_difference);
+    combined_eval_differences.push_back(std::abs(
+        NnueBenchNetworkOutputToEval(combined_output)
+        - NnueBenchNetworkOutputToEval(baseline_outputs[sample_index])));
+  }
+
+  const double main_q64_rate = main_q64_difference.count * 100.0 /
+      static_cast<double>(corpus.size() * 32);
+  const double abs_byte_rate = abs_byte_difference.count * 100.0 /
+      static_cast<double>(corpus.size() * 32);
+  std::cout << "[" << name << " correctness / error]" << std::endl
+            << "Main sigmoid" << std::endl
+            << "  max / mean abs error : " << std::scientific
+            << main_sigmoid_error.maximum << " / "
+            << main_sigmoid_error.Mean() << std::fixed << std::endl
+            << "  q64 mismatch count/rate : "
+            << main_q64_difference.count << " / "
+            << std::setprecision(6) << main_q64_rate << "%" << std::endl
+            << "  q64 max integer diff    : "
+            << main_q64_difference.maximum << std::endl
+            << "  gate-applied int32 mismatch : "
+            << main_gate_output_difference.count << std::endl
+            << "  gate-applied max diff       : "
+            << main_gate_output_difference.maximum << std::endl
+            << "  final Network output mismatch: "
+            << main_final_output_difference.count << std::endl
+            << "FM Abs sigmoid + value gate" << std::endl
+            << "  max / mean abs error : " << std::scientific
+            << abs_sigmoid_error.maximum << " / "
+            << abs_sigmoid_error.Mean() << std::fixed << std::endl
+            << "  a_gated raw mismatch : " << abs_raw_difference.count
+            << std::endl
+            << "  a_gated max diff     : " << abs_raw_difference.maximum
+            << std::endl
+            << "  abs_ac_out mismatch/rate : " << abs_byte_difference.count
+            << " / " << std::setprecision(6) << abs_byte_rate << "%"
+            << std::endl
+            << "  abs_ac_out max diff       : "
+            << abs_byte_difference.maximum << std::endl
+            << "  final Network output mismatch: "
+            << abs_final_output_difference.count << std::endl
+            << "Main + FM combined final Network output mismatch: "
+            << combined_final_output_difference.count << std::endl;
+  PrintEvalDifference("Main-only eval difference", main_eval_differences);
+  PrintEvalDifference("Main+FM combined eval difference",
+                      combined_eval_differences);
+}
+
+constexpr std::uint64_t kSigmoidCandidateValidationGames = 1000;
+constexpr int kSigmoidCandidateValidationMaxPly = 256;
+
+std::size_t SigmoidCandidateEvalHistogramBin(const std::int32_t difference) {
+  if (difference == 0) return 0;
+  if (difference == 1) return 1;
+  if (difference == 2) return 2;
+  if (difference <= 4) return 3;
+  if (difference <= 8) return 4;
+  if (difference <= 16) return 5;
+  if (difference <= 32) return 6;
+  if (difference <= 64) return 7;
+  return 8;
+}
+
+void PrintSigmoidCandidateEvalHistogram(
+    const std::array<std::uint64_t, 9>& histogram,
+    const std::uint64_t total_positions) {
+  constexpr std::array<const char*, 9> labels = {
+      "0", "1", "2", "3-4", "5-8", "9-16", "17-32", "33-64", "65+"};
+  std::cout << "[absolute eval/cp difference histogram]" << std::endl;
+  for (std::size_t index = 0; index < histogram.size(); ++index) {
+    const double rate = total_positions == 0
+        ? 0.0
+        : 100.0 * static_cast<double>(histogram[index])
+            / static_cast<double>(total_positions);
+    std::cout << "  " << std::setw(5) << labels[index] << " : "
+              << std::setw(8) << histogram[index] << " ("
+              << std::fixed << std::setprecision(6) << rate << "%)"
+              << std::endl;
+  }
+}
+
+void ValidateProductionSigmoidCandidate() {
+  constexpr auto kReference = SigmoidBenchImplementation::StdExp;
+  constexpr auto kCandidate =
+      SigmoidBenchImplementation::FloatLutMinus10To8Step32;
+
+  std::cout << "[NNUE validation: production sigmoid candidate]" << std::endl
+            << "  reference    : current std::exp" << std::endl
+            << "  candidate    : float32 LUT [-10, 8], step 1/32"
+            << std::endl
+            << "  seed         : " << kNnueBenchSeed << std::endl
+            << "  corpus games : " << kSigmoidCandidateValidationGames
+            << std::endl
+            << "  max ply/game : " << kSigmoidCandidateValidationMaxPly
+            << std::endl
+            << "  generation   : fixed-seed random legal games, streamed"
+            << std::endl;
+
+  Position pos;
+  StateInfo root_state;
+  std::vector<StateInfo> states(kSigmoidCandidateValidationMaxPly);
+  PRNG prng(kNnueBenchSeed);
+  alignas(kCacheLineSize) std::int32_t router_output[32];
+  alignas(kCacheLineSize) std::int32_t main_q64_reference[32];
+  alignas(kCacheLineSize) std::int32_t main_q64_candidate[32];
+  alignas(kCacheLineSize) std::int32_t abs_gated_reference[32];
+  alignas(kCacheLineSize) std::int32_t abs_gated_candidate[32];
+  alignas(kCacheLineSize) std::uint8_t abs_output_reference[32];
+  alignas(kCacheLineSize) std::uint8_t abs_output_candidate[32];
+  alignas(kCacheLineSize) std::int32_t diff_fc_output[64];
+  alignas(kCacheLineSize) std::int32_t abs_fc_output[64];
+  alignas(kCacheLineSize) char normal_network_buffer[Network::kBufferSize];
+  alignas(kCacheLineSize) Network::Buffer reference_work{};
+  alignas(kCacheLineSize) Network::Buffer candidate_work{};
+
+  SigmoidIntegerDifference main_q64_difference;
+  SigmoidIntegerDifference abs_output_difference;
+  NnueNetworkStageMismatch reference_vs_normal{};
+  NnueNetworkStageMismatch candidate_vs_normal{};
+  NnueNetworkStageMismatch candidate_final_difference{};
+  std::vector<double> eval_differences;
+  std::array<std::uint64_t, 9> eval_histogram{};
+  std::uint64_t total_positions = 0;
+  std::uint64_t reference_checksum = UINT64_C(14695981039346656037);
+  std::uint64_t candidate_checksum = UINT64_C(14695981039346656037);
+
+  std::cout << "  processing   : " << std::flush;
+  for (std::uint64_t game = 0; game < kSigmoidCandidateValidationGames;
+       ++game) {
+    pos.set_hirate(&root_state);
+    for (int ply = 0; ply < kSigmoidCandidateValidationMaxPly; ++ply) {
+      MoveList<LEGAL_ALL> moves(pos);
+      if (moves.size() == 0)
+        break;
+
+      const Move move = moves.begin()[prng.rand(moves.size())];
+      pos.do_move(move, states[ply]);
+
+      NetworkBenchCase input{};
+      input.material_bucket = NnueBenchMaterialBucket(pos);
+      feature_transformer->Transform(
+          pos, input.transformed.data(), input.diff_transformed.data(),
+          input.abs_transformed.data(), false, input.material_bucket);
+      FillNnueBenchRouterInput(input);
+      router->PropagatePrefix<12>(input.router_input.data(), router_output);
+      input.selected_bucket = SelectNnueBenchBucket(router_output);
+
+      const Network& selected_network =
+          NnueBenchSelectedNetwork(input.selected_bucket);
+      selected_network.BenchmarkFmAffine(
+          input.diff_transformed.data(), input.abs_transformed.data(),
+          diff_fc_output, abs_fc_output);
+
+      selected_network.template BenchmarkMainGateSigmoidCandidate<kReference>(
+          diff_fc_output, main_q64_reference);
+      selected_network.template BenchmarkMainGateSigmoidCandidate<kCandidate>(
+          diff_fc_output, main_q64_candidate);
+      selected_network.template BenchmarkAbsSigmoidGateCandidate<kReference>(
+          abs_fc_output, abs_gated_reference);
+      selected_network.template BenchmarkAbsSigmoidGateCandidate<kCandidate>(
+          abs_fc_output, abs_gated_candidate);
+      selected_network.BenchmarkAbsGateQuantize(
+          abs_gated_reference, abs_output_reference);
+      selected_network.BenchmarkAbsGateQuantize(
+          abs_gated_candidate, abs_output_candidate);
+
+      for (int index = 0; index < 32; ++index) {
+        main_q64_difference.Add(main_q64_reference[index],
+                                main_q64_candidate[index]);
+        abs_output_difference.Add(abs_output_reference[index],
+                                  abs_output_candidate[index]);
+      }
+
+      const std::int32_t reference_output =
+          ComputeNnueNetworkSigmoidBenchOutput<kReference, kReference>(
+              input, reference_work);
+      const std::int32_t candidate_output =
+          ComputeNnueNetworkSigmoidBenchOutput<kCandidate, kCandidate>(
+              input, candidate_work);
+      const std::int32_t normal_output = selected_network.Propagate(
+          input.transformed.data(), input.diff_transformed.data(),
+          input.abs_transformed.data(), input.material_bucket,
+          normal_network_buffer)[0];
+      CompareNnueNetworkStageRange(
+          &normal_output, &reference_output, 1, total_positions,
+          reference_vs_normal);
+      CompareNnueNetworkStageRange(
+          &normal_output, &candidate_output, 1, total_positions,
+          candidate_vs_normal);
+      CompareNnueNetworkStageRange(
+          &reference_output, &candidate_output, 1, total_positions,
+          candidate_final_difference);
+
+      const std::int32_t reference_eval =
+          NnueBenchNetworkOutputToEval(reference_output);
+      const std::int32_t candidate_eval =
+          NnueBenchNetworkOutputToEval(candidate_output);
+      const std::int32_t eval_difference = static_cast<std::int32_t>(
+          std::abs(static_cast<std::int64_t>(candidate_eval)
+                   - reference_eval));
+      eval_differences.push_back(eval_difference);
+      ++eval_histogram[SigmoidCandidateEvalHistogramBin(eval_difference)];
+      MixNnueBenchChecksum(reference_checksum, reference_output);
+      MixNnueBenchChecksum(candidate_checksum, candidate_output);
+      ++total_positions;
+    }
+    if (game < 10 || (game + 1) % 10 == 0)
+      std::cout << "." << std::flush;
+  }
+  std::cout << std::endl;
+
+  if (total_positions == 0) {
+    std::cout << "error: sigmoid candidate validation corpus is empty"
+              << std::endl;
+    return;
+  }
+
+  double eval_sum = 0.0;
+  double eval_maximum = 0.0;
+  for (const double difference : eval_differences) {
+    eval_sum += difference;
+    eval_maximum = std::max(eval_maximum, difference);
+  }
+  const double eval_mean = eval_sum / eval_differences.size();
+  const std::uint64_t gate_values = total_positions * 32;
+  const auto rate = [](const std::uint64_t count,
+                       const std::uint64_t total) {
+    return total == 0
+        ? 0.0
+        : 100.0 * static_cast<double>(count) / static_cast<double>(total);
+  };
+
+  std::cout << "[validation results]" << std::endl
+            << "  positions                  : " << total_positions
+            << std::endl
+            << "  gate values                : " << gate_values << std::endl
+            << "  reference staged vs normal : "
+            << reference_vs_normal.count << " mismatches" << std::endl
+            << "  candidate staged vs normal : "
+            << candidate_vs_normal.count << " mismatches" << std::endl
+            << "  final Network mismatch     : "
+            << candidate_final_difference.count << " / " << total_positions
+            << " (" << std::fixed << std::setprecision(6)
+            << rate(candidate_final_difference.count, total_positions)
+            << "%)" << std::endl
+            << "  final Network max raw diff : "
+            << candidate_final_difference.max_abs_diff << std::endl
+            << "  Main Q64 mismatch          : "
+            << main_q64_difference.count << " / " << gate_values << " ("
+            << rate(main_q64_difference.count, gate_values) << "%)"
+            << std::endl
+            << "  Main Q64 max diff          : "
+            << main_q64_difference.maximum << std::endl
+            << "  FM abs_ac_out mismatch     : "
+            << abs_output_difference.count << " / " << gate_values << " ("
+            << rate(abs_output_difference.count, gate_values) << "%)"
+            << std::endl
+            << "  FM abs_ac_out max diff     : "
+            << abs_output_difference.maximum << std::endl
+            << "[absolute eval/cp difference]" << std::endl
+            << "  max   : " << eval_maximum << std::endl
+            << "  mean  : " << eval_mean << std::endl
+            << "  p90   : " << NnueBenchPercentile(eval_differences, 0.90)
+            << std::endl
+            << "  p95   : " << NnueBenchPercentile(eval_differences, 0.95)
+            << std::endl
+            << "  p99   : " << NnueBenchPercentile(eval_differences, 0.99)
+            << std::endl
+            << "  p99.9 : " << NnueBenchPercentile(eval_differences, 0.999)
+            << std::endl;
+  PrintSigmoidCandidateEvalHistogram(eval_histogram, total_positions);
+  std::cout << "[checksums]" << std::endl
+            << "  reference : 0x" << std::hex << reference_checksum
+            << std::endl
+            << "  candidate : 0x" << candidate_checksum << std::dec
+            << std::endl;
+}
+
+void TestSigmoidApproximationBenchmark(const std::uint64_t repeat_count) {
+  std::cout << "[NNUE benchmark: Main / FM sigmoid approximations]"
+            << std::endl
+            << "  seed         : " << kNnueBenchSeed << std::endl
+            << "  corpus games : " << kNnueBenchMeasuredGames << std::endl
+            << "  max ply/game : " << kNnueBenchMaxPly << std::endl
+            << "  repeats      : " << repeat_count << std::endl
+            << "  candidates   : A [-8,8] /16 (257 points)" << std::endl
+            << "                 B [-10,8] /16 (289 points)" << std::endl
+            << "                 C [-8,8] /32 (513 points)" << std::endl
+            << "                 D [-10,8] /32 (577 points)" << std::endl
+            << "  outside LUT  : saturate at each endpoint" << std::endl
+            << "  lookup       : scalar float32 + linear interpolation" << std::endl
+            << "  order        : reference/A/B/C/D rotated per repeat" << std::endl;
+
+  const auto corpus = MakeNnueNetworkStageBenchCorpus();
+  if (corpus.empty()) {
+    std::cout << "error: sigmoid approximation benchmark corpus is empty"
+              << std::endl;
+    return;
+  }
+  std::cout << "  corpus calls : " << corpus.size() << std::endl
+            << "  compared gate values: " << corpus.size() * 32 << std::endl
+            << "  warm-up calls: " << corpus.size()
+            << " before every timed sample" << std::endl;
+
+  std::vector<double> main_logits;
+  std::vector<double> main_q64;
+  main_logits.reserve(corpus.size() * 32);
+  main_q64.reserve(corpus.size() * 32);
+  std::vector<std::int32_t> baseline_outputs;
+  baseline_outputs.reserve(corpus.size());
+  NnueNetworkStageMismatch baseline_vs_normal{};
+  alignas(kCacheLineSize) std::int32_t q64[32];
+  alignas(kCacheLineSize) Network::Buffer work{};
+  for (const auto& sample : corpus) {
+    const Network& selected_network =
+        NnueBenchSelectedNetwork(sample.input.selected_bucket);
+    selected_network.template BenchmarkMainGateSigmoidCandidate<
+        SigmoidBenchImplementation::StdExp>(
+            sample.intermediate.diff_fc_out, q64);
+    for (int j = 0; j < 32; ++j) {
+      main_logits.push_back(
+          static_cast<double>(sample.intermediate.diff_fc_out[j] - 2438)
+          / 8128.0);
+      main_q64.push_back(q64[j]);
+    }
+    const std::int32_t baseline_output =
+        ComputeNnueNetworkSigmoidBenchOutput<
+            SigmoidBenchImplementation::StdExp,
+            SigmoidBenchImplementation::StdExp>(sample.input, work);
+    CompareNnueNetworkStageRange(
+        &sample.final_output, &baseline_output, 1, baseline_outputs.size(),
+        baseline_vs_normal);
+    baseline_outputs.push_back(baseline_output);
+  }
+  PrintSigmoidDistribution("[Main normalized logit z distribution]",
+                           main_logits);
+  PrintSigmoidDistribution("[Main gate Q64 distribution]", main_q64);
+  std::cout << "[benchmark staged-path validation]" << std::endl
+            << "  Reference std::exp staged vs normal Propagate mismatch: "
+            << baseline_vs_normal.count << std::endl
+            << "  max integer diff: " << baseline_vs_normal.max_abs_diff
+            << std::endl;
+
+  ValidateSigmoidApproximationCandidate<
+      SigmoidBenchImplementation::FloatLutMinus8To8Step16>(
+          "A. float32 LUT [-8, 8], step 1/16", corpus,
+          baseline_outputs);
+  ValidateSigmoidApproximationCandidate<
+      SigmoidBenchImplementation::FloatLutMinus10To8Step16>(
+          "B. float32 LUT [-10, 8], step 1/16", corpus,
+          baseline_outputs);
+  ValidateSigmoidApproximationCandidate<
+      SigmoidBenchImplementation::FloatLutMinus8To8Step32>(
+          "C. float32 LUT [-8, 8], step 1/32", corpus,
+          baseline_outputs);
+  ValidateSigmoidApproximationCandidate<
+      SigmoidBenchImplementation::FloatLutMinus10To8Step32>(
+          "D. float32 LUT [-10, 8], step 1/32", corpus,
+          baseline_outputs);
+
+  constexpr std::array<SigmoidBenchOperation, 4> operations = {
+      SigmoidBenchOperation::MainSigmoid,
+      SigmoidBenchOperation::AbsSigmoidAndValueGate,
+      SigmoidBenchOperation::MainAndAbs,
+      SigmoidBenchOperation::FullNetwork};
+  constexpr std::array<const char*, 4> operation_names = {
+      "Main sigmoid only", "FM Abs sigmoid + value gate",
+      "Main + FM combined", "Network::Propagate-equivalent staged path"};
+  constexpr std::array<SigmoidBenchImplementation, 5> implementations = {
+      SigmoidBenchImplementation::StdExp,
+      SigmoidBenchImplementation::FloatLutMinus8To8Step16,
+      SigmoidBenchImplementation::FloatLutMinus10To8Step16,
+      SigmoidBenchImplementation::FloatLutMinus8To8Step32,
+      SigmoidBenchImplementation::FloatLutMinus10To8Step32};
+  std::array<std::array<NnueBenchSamples, 5>, 4> samples;
+  std::array<std::array<std::uint64_t, 5>, 4> checksums;
+  for (auto& operation_checksums : checksums)
+    operation_checksums.fill(UINT64_C(14695981039346656037));
+
+  for (std::size_t operation_index = 0;
+       operation_index < operations.size(); ++operation_index) {
+    for (std::uint64_t repeat = 0; repeat < repeat_count; ++repeat) {
+      for (std::size_t offset = 0; offset < implementations.size(); ++offset) {
+        const std::size_t implementation_index =
+            (static_cast<std::size_t>(repeat) + offset)
+            % implementations.size();
+        samples[operation_index][implementation_index].Add(
+            DispatchSigmoidApproximationOperation(
+                implementations[implementation_index],
+                operations[operation_index], corpus,
+                checksums[operation_index][implementation_index]));
+      }
+    }
+  }
+
+  std::cout << "[timing]" << std::endl;
+  for (std::size_t operation_index = 0;
+       operation_index < operations.size(); ++operation_index) {
+    PrintSigmoidTimingComparison(operation_names[operation_index],
+                                 samples[operation_index]);
+    std::cout << "  checksums reference/A/B/C/D: 0x" << std::hex
+              << checksums[operation_index][0] << " / 0x"
+              << checksums[operation_index][1] << " / 0x"
+              << checksums[operation_index][2] << " / 0x"
+              << checksums[operation_index][3] << " / 0x"
+              << checksums[operation_index][4] << std::dec << std::endl;
+  }
+  std::cout << "  note: the full-network timing uses the same benchmark-only"
+            << std::endl
+            << "        staged path for reference/A/B/C/D; production Propagate()"
+            << std::endl
+            << "        is unchanged."
+            << std::endl;
+}
+
 #endif  // defined(ENABLE_NNUE_BENCH)
 
 #if defined(ENABLE_NNUE_TRACE)
@@ -5143,6 +5963,12 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::uint64_t repeat_count;
     if (ReadNnueBenchRepeatCount(stream, repeat_count))
       TestMainGateBenchmarkCompare(repeat_count);
+  } else if (sub_command == "bench_sigmoid_approx") {
+    std::uint64_t repeat_count;
+    if (ReadNnueBenchRepeatCount(stream, repeat_count))
+      TestSigmoidApproximationBenchmark(repeat_count);
+  } else if (sub_command == "validate_sigmoid_candidate") {
+    ValidateProductionSigmoidCandidate();
 #if defined(USE_AVX2)
   } else if (sub_command == "bench_fm_abs_squared_compare") {
     std::uint64_t repeat_count;
@@ -5187,6 +6013,9 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << " test nnue bench_network_stages [repeats]" << std::endl;
     std::cout << " test nnue bench_main_gate_compare [repeats]"
               << std::endl;
+    std::cout << " test nnue bench_sigmoid_approx [repeats]"
+              << std::endl;
+    std::cout << " test nnue validate_sigmoid_candidate" << std::endl;
 #if defined(USE_AVX2)
     std::cout << " test nnue bench_fm_abs_squared_compare [repeats]"
               << std::endl;
