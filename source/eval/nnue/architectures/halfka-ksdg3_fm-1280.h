@@ -115,6 +115,35 @@ struct Network {
 		return static_cast<int32_t>(value * sig);
 	}
 
+	static inline void ComputeMainGateSigmoid(
+		const std::int32_t* diff_fc_output, std::int32_t* gate_q64) {
+		for (int j = 0; j < 32; ++j)
+			gate_q64[j] = sigmoid_gate_slow(diff_fc_output[j] - 2438, 64);
+	}
+
+	static inline void ComputeMainGateApply(const std::int32_t* fc_input,
+		const std::int32_t* gate_q64, std::int32_t* fc_output) {
+		for (int j = 0; j < 32; ++j)
+			fc_output[j] = static_cast<int32_t>(
+				(fc_input[j] * (64 + gate_q64[j])) / 128);
+	}
+
+	static inline void ComputeMainGateClamp(const std::int32_t* fc_input,
+		std::int32_t* fc_output) {
+		for (int j = 0; j < 31; ++j)
+			fc_output[j] = std::clamp(fc_input[j], 0, 8128);
+		fc_output[31] = fc_input[31];
+	}
+
+	static inline void ComputeMainGate(const std::int32_t* fc_input,
+		const std::int32_t* diff_fc_output, std::int32_t* fc_output) {
+		std::int32_t gate_q64[32];
+		std::int32_t before_clamp[32];
+		ComputeMainGateSigmoid(diff_fc_output, gate_q64);
+		ComputeMainGateApply(fc_input, gate_q64, before_clamp);
+		ComputeMainGateClamp(before_clamp, fc_output);
+	}
+
 	static inline void ComputeAbsSquaredScalar(const std::uint8_t* input,
 		std::uint8_t* output) {
 		for (int j = 0; j < 32; ++j) {
@@ -308,15 +337,8 @@ struct Network {
 
 		// --- 3. Main Path: 基本骨格パスと FM による動的フィルタリング ---
 		fc_0.Propagate(transformedFeatures, buf.fc_0_out);
-		for (int j = 0; j < 32; ++j) {
-			// FM 側の信号（gate_d）で Main パスの情報の通りやすさを制御
-			int32_t sig_half = sigmoid_gate_slow(buf.diff_fc_out[j] - 2438, 64);
-			buf.fc_0_out[j] = static_cast<int32_t>((buf.fc_0_out[j] * (64 + sig_half)) / 128);
-
-	    	if (j < 31) {
-				buf.fc_0_out[j] = std::clamp(buf.fc_0_out[j], 0, 8128);
-			}
-		}
+		// FM 側の信号（gate_d）で Main パスの情報の通りやすさを制御
+		ComputeMainGate(buf.fc_0_out, buf.diff_fc_out, buf.fc_0_out);
 
 		ac_sqr_0.Propagate(buf.fc_0_out, buf.ac_sqr_0_out_temp); 
 		ac_0.Propagate(buf.fc_0_out, buf.ac_0_out);
@@ -597,14 +619,39 @@ struct Network {
 
 	void BenchmarkMainGate(const std::int32_t* fc_input,
 		const std::int32_t* diff_fc_output, std::int32_t* fc_output) const {
+		BenchmarkMainGateCombined(fc_input, diff_fc_output, fc_output);
+	}
+
+	void BenchmarkMainGateCombined(const std::int32_t* fc_input,
+		const std::int32_t* diff_fc_output, std::int32_t* fc_output) const {
 		for (int j = 0; j < 32; ++j) {
-			const int32_t sigmoid_half =
+			const int32_t gate_q64 =
 				sigmoid_gate_slow(diff_fc_output[j] - 2438, 64);
 			fc_output[j] = static_cast<int32_t>(
-				(fc_input[j] * (64 + sigmoid_half)) / 128);
+				(fc_input[j] * (64 + gate_q64)) / 128);
 			if (j < 31)
 				fc_output[j] = std::clamp(fc_output[j], 0, 8128);
 		}
+	}
+
+	void BenchmarkMainGateReconstructed(const std::int32_t* fc_input,
+		const std::int32_t* diff_fc_output, std::int32_t* fc_output) const {
+		ComputeMainGate(fc_input, diff_fc_output, fc_output);
+	}
+
+	void BenchmarkMainGateSigmoid(const std::int32_t* diff_fc_output,
+		std::int32_t* gate_q64) const {
+		ComputeMainGateSigmoid(diff_fc_output, gate_q64);
+	}
+
+	void BenchmarkMainGateApply(const std::int32_t* fc_input,
+		const std::int32_t* gate_q64, std::int32_t* fc_output) const {
+		ComputeMainGateApply(fc_input, gate_q64, fc_output);
+	}
+
+	void BenchmarkMainGateClamp(const std::int32_t* fc_input,
+		std::int32_t* fc_output) const {
+		ComputeMainGateClamp(fc_input, fc_output);
 	}
 
 	void BenchmarkMainSqrClippedRelu(const std::int32_t* fc_output,
