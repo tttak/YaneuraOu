@@ -431,6 +431,48 @@ struct Network {
 		float cross;
 	};
 
+	void BenchmarkPhaseInputAssembly(
+		const TransformedFeatureType* transformed_features,
+		const TransformedFeatureType* diff_features,
+		const TransformedFeatureType* abs_features, const int bucket_id,
+		std::uint8_t* phase_input) const {
+		for (int j = 0; j < 128; ++j) {
+			const int32_t abs_value = static_cast<int32_t>(abs_features[j]);
+			phase_input[j] = static_cast<std::uint8_t>(
+				std::clamp((abs_value - 64) * 2, 0, 127));
+			phase_input[j + 128] = diff_features[j];
+			phase_input[j + 256] = transformed_features[j];
+		}
+		phase_input[127] =
+			static_cast<std::uint8_t>((bucket_id * 127) / 11);
+	}
+
+	void BenchmarkPhaseProjection(const std::uint8_t* phase_input,
+		std::int32_t* phase_output) const {
+		phase_proj.PropagatePrefix<6>(phase_input, phase_output);
+	}
+
+	void BenchmarkPhaseSigmoid(const std::int32_t* phase_output,
+		float* phase_value) const {
+		for (int i = 0; i < 6; ++i) {
+			const float logit =
+				(static_cast<float>(phase_output[i]) / 8128.0f) * 3.0f + 1.0f;
+			const float sigmoid = 1.0f / (1.0f + std::exp(-logit));
+			phase_value[i] = 0.1f + 0.9f * sigmoid;
+		}
+	}
+
+	BenchmarkPhaseScales BenchmarkPhaseChannelScales(
+		const float* phase_value) const {
+		return {
+			(0.5f + 0.5f * phase_value[0]) * 1.3f,
+			(0.5f + 0.5f * phase_value[1]) * 1.5f,
+			(0.5f + 0.5f * phase_value[2]) * 1.0f,
+			(0.5f + 0.5f * phase_value[3]) * 0.7f,
+			(0.5f + 0.5f * phase_value[4]) * 0.88f,
+			(0.5f + 0.5f * phase_value[5]) * 1.5f};
+	}
+
 	BenchmarkPhaseScales BenchmarkPhaseScalesFromOutput(
 		const std::int32_t* phase_output) const {
 		float phase_value[6];
@@ -702,6 +744,74 @@ struct Network {
 			const float final_diff = current_diff * (1.0f - attention_score)
 				+ clamped_value * attention_score;
 			diff_output[j] = static_cast<std::uint8_t>(final_diff * 127.0f);
+		}
+	}
+
+	void BenchmarkLcaAssembleFmInput(const std::uint8_t* diff_input,
+		const std::uint8_t* abs_input, std::uint8_t* fm_input) const {
+		for (int j = 0; j < 32; ++j) {
+			fm_input[j] = diff_input[j];
+			fm_input[j + 32] = abs_input[j];
+		}
+	}
+
+	void BenchmarkLcaQuery(const std::uint8_t* main_raw,
+		std::int32_t* query_output) const {
+		lca_q.Propagate(main_raw, query_output);
+	}
+
+	void BenchmarkLcaKey(const std::uint8_t* fm_input,
+		std::int32_t* key_output) const {
+		lca_k.Propagate(fm_input, key_output);
+	}
+
+	void BenchmarkLcaValue(const std::uint8_t* fm_input,
+		std::int32_t* value_output) const {
+		lca_v.Propagate(fm_input, value_output);
+	}
+
+	void BenchmarkLcaDotAndLogit(const std::int32_t* query_output,
+		const std::int32_t* key_output, float* dot_product,
+		float* attention_logit) const {
+		*dot_product = 0.0f;
+		for (int j = 0; j < 32; ++j)
+			*dot_product +=
+				(static_cast<float>(query_output[j]) / 8128.0f)
+				* (static_cast<float>(key_output[j]) / 8128.0f);
+		*attention_logit = (*dot_product * 0.17677f) / lca_temp;
+	}
+
+	void BenchmarkLcaAttentionScore(const float attention_logit,
+		float* attention_score) const {
+		*attention_score =
+			1.0f / (1.0f + std::exp(-attention_logit));
+	}
+
+	void BenchmarkLcaValueClampAndCorrection(
+		const std::int32_t* value_output, const float attention_score,
+		float* value_clamped, float* value_correction) const {
+		for (int j = 0; j < 32; ++j) {
+			const float value =
+				static_cast<float>(value_output[j]) / 8128.0f;
+			value_clamped[j] =
+				std::max(0.0f, std::min(1.0f, value * 0.4f + 0.5f));
+			value_correction[j] = value_clamped[j] * attention_score;
+		}
+	}
+
+	void BenchmarkLcaFinalAddAndQuantize(
+		const std::uint8_t* diff_input, const float attention_score,
+		const float* value_correction, float* output_before_narrow,
+		std::uint8_t* diff_output) const {
+		for (int j = 0; j < 32; ++j) {
+			const float current_diff =
+				static_cast<float>(diff_input[j]) / 127.0f;
+			const float final_diff =
+				current_diff * (1.0f - attention_score)
+				+ value_correction[j];
+			output_before_narrow[j] = final_diff * 127.0f;
+			diff_output[j] =
+				static_cast<std::uint8_t>(output_before_narrow[j]);
 		}
 	}
 
