@@ -136,6 +136,8 @@ class FeatureTransformer {
 		std::uint64_t misses = 0;
 		std::uint64_t removed_features = 0;
 		std::uint64_t added_features = 0;
+		std::uint64_t max_removed_features = 0;
+		std::uint64_t max_added_features = 0;
 	};
 #endif
 
@@ -796,6 +798,7 @@ class FeatureTransformer {
 
 	struct alignas(kCacheLineSize) FinnyEntry {
 		BiasType accumulation[kHalfDimensions];
+		Accumulator::FactorPart factors;
 		Features::IndexList active_indices;
 		bool initialized = false;
 	};
@@ -889,6 +892,51 @@ class FeatureTransformer {
 		return *cache;
 	}
 
+#if defined(ENABLE_NNUE_BENCH)
+	struct alignas(kCacheLineSize) BenchmarkPhase1FinnyEntry {
+		BiasType accumulation[kHalfDimensions];
+		Features::IndexList active_indices;
+		bool initialized = false;
+	};
+
+	struct BenchmarkPhase1FinnyCache {
+		using TriggerEntries = std::array<
+			std::array<BenchmarkPhase1FinnyEntry, SQ_NB>, COLOR_NB>;
+
+		const FeatureTransformer* owner = nullptr;
+		std::uint64_t generation = 0;
+		std::array<TriggerEntries, kRefreshTriggers.size()> entries;
+
+		void reset(const FeatureTransformer* new_owner,
+		           const std::uint64_t new_generation) {
+			owner = new_owner;
+			generation = new_generation;
+			for (auto& trigger_entries : entries)
+				for (auto& perspective_entries : trigger_entries)
+					for (auto& entry : perspective_entries)
+						entry.initialized = false;
+		}
+	};
+
+	BenchmarkPhase1FinnyCache& benchmark_phase1_finny_cache() const {
+		static thread_local std::unique_ptr<BenchmarkPhase1FinnyCache> cache;
+		if (!cache)
+			cache = std::make_unique<BenchmarkPhase1FinnyCache>();
+		if (cache->owner != this || cache->generation != finny_generation_)
+			cache->reset(this, finny_generation_);
+		return *cache;
+	}
+
+	FinnyCache& benchmark_phase3_finny_cache() const {
+		static thread_local std::unique_ptr<FinnyCache> cache;
+		if (!cache)
+			cache = std::make_unique<FinnyCache>();
+		if (cache->owner != this || cache->generation != finny_generation_)
+			cache->reset(this, finny_generation_);
+		return *cache;
+	}
+#endif
+
 	template <typename ApplyChanges>
 	void update_main_accumulator_to_two(
 		const BiasType* source, BiasType* first_destination,
@@ -917,19 +965,24 @@ class FeatureTransformer {
 #endif
 	}
 
+	template <typename Entry>
 	void refresh_main_accumulator_using_finny_entry(
-		BiasType* current, FinnyEntry& entry,
+		BiasType* current, Entry& entry,
 		const Features::IndexList& active_indices,
-		const IndexType trigger_index
+		const Features::IndexList& removed_indices,
+		const Features::IndexList& added_indices,
+		const IndexType trigger_index, const bool cold
 #if defined(ENABLE_NNUE_BENCH)
 		, BenchmarkFinnyStatistics* const statistics = nullptr
 #endif
 		) const {
-		if (!entry.initialized) {
+		if (cold) {
 #if defined(ENABLE_NNUE_BENCH)
 			if (statistics) {
 				++statistics->misses;
 				statistics->added_features += active_indices.size();
+				statistics->max_added_features = std::max<std::uint64_t>(
+					statistics->max_added_features, active_indices.size());
 			}
 #endif
 			const BiasType* source = trigger_index == 0 ? biases_ : nullptr;
@@ -948,20 +1001,17 @@ class FeatureTransformer {
 							value[j] += weights_[kHalfDimensions * index + j];
 #endif
 				});
-			copy_index_list(entry.active_indices, active_indices);
-			entry.initialized = true;
 			return;
 		}
-
-		Features::IndexList removed_indices;
-		Features::IndexList added_indices;
-		make_index_diff(entry.active_indices, active_indices,
-		                removed_indices, added_indices);
 #if defined(ENABLE_NNUE_BENCH)
 		if (statistics) {
 			++statistics->hits;
 			statistics->removed_features += removed_indices.size();
 			statistics->added_features += added_indices.size();
+			statistics->max_removed_features = std::max<std::uint64_t>(
+				statistics->max_removed_features, removed_indices.size());
+			statistics->max_added_features = std::max<std::uint64_t>(
+				statistics->max_added_features, added_indices.size());
 		}
 #endif
 		update_main_accumulator_to_two(
@@ -987,11 +1037,64 @@ class FeatureTransformer {
 						value[j] += weights_[kHalfDimensions * index + j];
 #endif
 			});
-		copy_index_list(entry.active_indices, active_indices);
 	}
 
+	template <bool CacheFm, typename Entry>
+	void refresh_accumulator_using_finny_entry(
+		BiasType* current_main, Accumulator::FactorPart* current_factors,
+		Entry& entry, const Features::IndexList& active_indices,
+		const IndexType trigger_index
+#if defined(ENABLE_NNUE_BENCH)
+		, BenchmarkFinnyStatistics* const statistics = nullptr
+#endif
+		) const {
+		const bool cold = !entry.initialized;
+		Features::IndexList removed_indices;
+		Features::IndexList added_indices;
+		if (!cold)
+			make_index_diff(entry.active_indices, active_indices,
+			                removed_indices, added_indices);
+
+		refresh_main_accumulator_using_finny_entry(
+			current_main, entry, active_indices, removed_indices, added_indices,
+			trigger_index, cold
+#if defined(ENABLE_NNUE_BENCH)
+			, statistics
+#endif
+			);
+
+		if (trigger_index == 0) {
+			if constexpr (CacheFm) {
+				if (cold) {
+					refresh_fm_factors_from_scratch(entry.factors, active_indices);
+				} else {
+					for (const auto index : removed_indices) {
+						const IndexType v_offset = index * kFactorDimensions;
+						auto& group = index < SPLIT_IDX
+							? entry.factors.ksdg : entry.factors.halfka;
+						update_fm_factor_group<false>(group, &v_weights_[v_offset]);
+					}
+					for (const auto index : added_indices) {
+						const IndexType v_offset = index * kFactorDimensions;
+						auto& group = index < SPLIT_IDX
+							? entry.factors.ksdg : entry.factors.halfka;
+						update_fm_factor_group<true>(group, &v_weights_[v_offset]);
+					}
+				}
+				std::memcpy(current_factors, &entry.factors,
+				            sizeof(Accumulator::FactorPart));
+			} else {
+				refresh_fm_factors_from_scratch(*current_factors, active_indices);
+			}
+		}
+
+		copy_index_list(entry.active_indices, active_indices);
+		entry.initialized = true;
+	}
+
+	template <bool CacheFm, typename Cache>
 	void refresh_accumulator_with_finny_cache(
-		const Position& pos, FinnyCache& cache
+		const Position& pos, Cache& cache
 #if defined(ENABLE_NNUE_BENCH)
 		, BenchmarkFinnyStatistics* const statistics = nullptr
 #endif
@@ -1004,16 +1107,14 @@ class FeatureTransformer {
 			for (const Color perspective : {BLACK, WHITE}) {
 				const Square bucket = finny_bucket_square(pos, trigger, perspective);
 				auto& entry = cache.entries[i][perspective][bucket];
-				refresh_main_accumulator_using_finny_entry(
-					accumulator.accumulation[perspective][i], entry,
-					active_indices[perspective], i
+				refresh_accumulator_using_finny_entry<CacheFm>(
+					accumulator.accumulation[perspective][i],
+					i == 0 ? &accumulator.factors[perspective] : nullptr,
+					entry, active_indices[perspective], i
 #if defined(ENABLE_NNUE_BENCH)
 					, statistics
 #endif
 					);
-				if (i == 0)
-					refresh_fm_factors_from_scratch(
-						accumulator.factors[perspective], active_indices[perspective]);
 			}
 		}
 		accumulator.computed_accumulation = true;
@@ -1022,7 +1123,7 @@ class FeatureTransformer {
 
 	void refresh_accumulator_with_finny_cache(const Position& pos) const {
 		auto& cache = finny_cache();
-		refresh_accumulator_with_finny_cache(pos, cache
+		refresh_accumulator_with_finny_cache<true>(pos, cache
 #if defined(ENABLE_NNUE_BENCH)
 			, nullptr
 #endif
@@ -1031,8 +1132,8 @@ class FeatureTransformer {
 #endif
 
 	// Calculate cumulative value without using StateInfo difference calculation.
-	// With Finny enabled, Main uses the per-thread cache while FM is always
-	// rebuilt from the current active feature list.
+	// With Finny enabled, Main and FM use the same per-thread cache entry.
+	// update_accumulator() remains independent of Finny.
 	void refresh_accumulator(const Position& pos) const {
 #if defined(USE_FINNY_TABLES)
 		if constexpr (kUseFinnyTables) {
@@ -1213,11 +1314,31 @@ class FeatureTransformer {
 	void BenchmarkRefreshAccumulatorWithFinny(
 		const Position& pos, BenchmarkFinnyStatistics* const statistics) const {
 		auto& cache = finny_cache();
-		refresh_accumulator_with_finny_cache(pos, cache, statistics);
+		refresh_accumulator_with_finny_cache<true>(pos, cache, statistics);
 	}
 
 	void BenchmarkResetFinnyCache() const {
 		finny_cache().reset(this, finny_generation_);
+	}
+
+	void BenchmarkRefreshAccumulatorWithPhase1Finny(
+		const Position& pos, BenchmarkFinnyStatistics* const statistics) const {
+		auto& cache = benchmark_phase1_finny_cache();
+		refresh_accumulator_with_finny_cache<false>(pos, cache, statistics);
+	}
+
+	void BenchmarkRefreshAccumulatorWithPhase3Finny(
+		const Position& pos, BenchmarkFinnyStatistics* const statistics) const {
+		auto& cache = benchmark_phase3_finny_cache();
+		refresh_accumulator_with_finny_cache<true>(pos, cache, statistics);
+	}
+
+	void BenchmarkResetPhase1FinnyCache() const {
+		benchmark_phase1_finny_cache().reset(this, finny_generation_);
+	}
+
+	void BenchmarkResetPhase3FinnyCache() const {
+		benchmark_phase3_finny_cache().reset(this, finny_generation_);
 	}
 
 	static constexpr std::size_t BenchmarkFinnyEntrySize() {
@@ -1232,6 +1353,18 @@ class FeatureTransformer {
 		return kRefreshTriggers.size()
 			 * static_cast<std::size_t>(COLOR_NB)
 			 * static_cast<std::size_t>(SQ_NB);
+	}
+
+	static constexpr std::size_t BenchmarkFinnyFactorBytesPerEntry() {
+		return sizeof(Accumulator::FactorPart);
+	}
+
+	static constexpr std::size_t BenchmarkPhase1FinnyEntrySize() {
+		return sizeof(BenchmarkPhase1FinnyEntry);
+	}
+
+	static constexpr std::size_t BenchmarkPhase1FinnyCacheSize() {
+		return sizeof(BenchmarkPhase1FinnyCache);
 	}
 #endif
 

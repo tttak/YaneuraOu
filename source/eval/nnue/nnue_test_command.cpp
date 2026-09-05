@@ -1164,6 +1164,222 @@ void TestFinnyBenchmarkCompare(const std::uint64_t repeat_count) {
                     && timing_checksums[0] == timing_checksums[2]
                 ? "yes" : "NO") << std::endl;
 }
+
+enum class FinnyFmBenchOperation {
+  Phase1,
+  Phase3,
+};
+
+void ResetFinnyFmBenchmarkCache(const FinnyFmBenchOperation operation) {
+  if (operation == FinnyFmBenchOperation::Phase1)
+    feature_transformer->BenchmarkResetPhase1FinnyCache();
+  else
+    feature_transformer->BenchmarkResetPhase3FinnyCache();
+}
+
+void RefreshWithFinnyFmBenchmarkMode(
+    const Position& pos, const FinnyFmBenchOperation operation,
+    FeatureTransformer::BenchmarkFinnyStatistics* const statistics) {
+  if (operation == FinnyFmBenchOperation::Phase1)
+    feature_transformer->BenchmarkRefreshAccumulatorWithPhase1Finny(pos,
+                                                                     statistics);
+  else
+    feature_transformer->BenchmarkRefreshAccumulatorWithPhase3Finny(pos,
+                                                                     statistics);
+}
+
+NnueBenchTiming RunFinnyFmBenchmarkPass(
+    const FinnyFmBenchOperation operation, const std::uint64_t num_games,
+    FeatureTransformer::BenchmarkFinnyStatistics* const statistics,
+    std::uint64_t& checksum, const bool timed) {
+  Position pos;
+  StateInfo root_state;
+  std::vector<StateInfo> states(kNnueBenchMaxPly);
+  PRNG prng(kNnueBenchSeed);
+  NnueBenchTiming timing;
+
+  for (std::uint64_t game = 0; game < num_games; ++game) {
+    pos.set_hirate(&root_state);
+    for (int ply = 0; ply < kNnueBenchMaxPly; ++ply) {
+      MoveList<LEGAL_ALL> moves(pos);
+      if (moves.size() == 0)
+        break;
+      const Move move = moves.begin()[prng.rand(moves.size())];
+      pos.do_move(move, states[ply]);
+
+      if (timed) {
+        const auto begin = NnueBenchClock::now();
+        RefreshWithFinnyFmBenchmarkMode(pos, operation, statistics);
+        const auto end = NnueBenchClock::now();
+        timing.nanoseconds +=
+            std::chrono::duration<double, std::nano>(end - begin).count();
+      } else {
+        RefreshWithFinnyFmBenchmarkMode(pos, operation, statistics);
+      }
+      ++timing.calls;
+      ChecksumAccumulator(pos, checksum);
+    }
+  }
+  return timing;
+}
+
+std::uint64_t ValidateFinnyFmModeAgainstScratch(
+    const FinnyFmBenchOperation operation, std::uint64_t& finny_checksum,
+    std::uint64_t& scratch_checksum) {
+  Position pos;
+  StateInfo root_state;
+  std::vector<StateInfo> states(kNnueBenchMaxPly);
+  PRNG prng(kNnueBenchSeed);
+  std::uint64_t mismatches = 0;
+  ResetFinnyFmBenchmarkCache(operation);
+
+  for (std::uint64_t game = 0; game < kNnueBenchMeasuredGames; ++game) {
+    pos.set_hirate(&root_state);
+    for (int ply = 0; ply < kNnueBenchMaxPly; ++ply) {
+      MoveList<LEGAL_ALL> moves(pos);
+      if (moves.size() == 0)
+        break;
+      const Move move = moves.begin()[prng.rand(moves.size())];
+      pos.do_move(move, states[ply]);
+
+      RefreshWithFinnyFmBenchmarkMode(pos, operation, nullptr);
+      const Accumulator finny = pos.state()->accumulator;
+      ChecksumAccumulator(pos, finny_checksum);
+
+      feature_transformer->BenchmarkRefreshAccumulatorFromScratch(pos);
+      const Accumulator scratch = pos.state()->accumulator;
+      ChecksumAccumulator(pos, scratch_checksum);
+      mismatches += CountAccumulatorMismatches(finny, scratch);
+    }
+  }
+  return mismatches;
+}
+
+void PrintFinnyFmStatistics(
+    const char* const name,
+    const FeatureTransformer::BenchmarkFinnyStatistics& statistics) {
+  const double mean_removed = statistics.hits == 0
+      ? 0.0 : static_cast<double>(statistics.removed_features) / statistics.hits;
+  const double mean_added = statistics.hits == 0
+      ? 0.0 : static_cast<double>(statistics.added_features) / statistics.hits;
+  std::cout << name << std::endl
+            << "  cache hits       : " << statistics.hits << std::endl
+            << "  cache misses     : " << statistics.misses << std::endl
+            << "  mean removed/hit : " << std::fixed << std::setprecision(3)
+            << mean_removed << std::endl
+            << "  max removed      : " << statistics.max_removed_features << std::endl
+            << "  mean added/hit   : " << mean_added << std::endl
+            << "  max added        : " << statistics.max_added_features << std::endl;
+}
+
+void TestFinnyFmBenchmarkCompare(const std::uint64_t repeat_count) {
+  constexpr std::size_t kOperationCount = 2;
+  const FinnyFmBenchOperation operations[kOperationCount] = {
+      FinnyFmBenchOperation::Phase1, FinnyFmBenchOperation::Phase3};
+  const std::size_t entry_count =
+      FeatureTransformer::BenchmarkFinnyEntryCount();
+  const std::size_t phase3_entry_bytes =
+      FeatureTransformer::BenchmarkFinnyEntrySize();
+  const std::size_t phase3_cache_bytes =
+      FeatureTransformer::BenchmarkFinnyCacheSize();
+  const std::size_t fm_bytes =
+      FeatureTransformer::BenchmarkFinnyFactorBytesPerEntry();
+  const std::size_t phase1_entry_bytes =
+      FeatureTransformer::BenchmarkPhase1FinnyEntrySize();
+  const std::size_t phase1_cache_bytes =
+      FeatureTransformer::BenchmarkPhase1FinnyCacheSize();
+
+  std::cout << "[NNUE benchmark: Finny FM Phase 1 / Phase 3]" << std::endl
+            << "  seed              : " << kNnueBenchSeed << std::endl
+            << "  warm-up games     : " << kNnueBenchWarmupGames << std::endl
+            << "  measured games    : " << kNnueBenchMeasuredGames << std::endl
+            << "  max ply/game      : " << kNnueBenchMaxPly << std::endl
+            << "  repeats           : " << repeat_count << std::endl
+            << "  order             : even=Phase1,Phase3 odd=Phase3,Phase1"
+            << std::endl
+            << "  Finny entries     : " << entry_count << std::endl
+            << "  Phase 1 entry bytes: "
+            << phase1_entry_bytes << std::endl
+            << "  Phase 3 entry bytes: " << phase3_entry_bytes << std::endl
+            << "  entry increase     : " << fm_bytes << std::endl
+            << "  Phase 1 cache bytes/thread: "
+            << phase1_cache_bytes << std::endl
+            << "  Phase 3 cache bytes/thread: " << phase3_cache_bytes << std::endl
+            << "  cache increase/thread: " << phase3_cache_bytes - phase1_cache_bytes
+            << std::endl;
+
+  NnueBenchSamples samples[kOperationCount];
+  std::uint64_t timing_checksums[kOperationCount] = {
+      UINT64_C(14695981039346656037), UINT64_C(14695981039346656037)};
+  FeatureTransformer::BenchmarkFinnyStatistics statistics[kOperationCount];
+
+  for (std::uint64_t repeat = 0; repeat < repeat_count; ++repeat) {
+    for (std::size_t offset = 0; offset < kOperationCount; ++offset) {
+      const std::size_t operation_index = (repeat + offset) % kOperationCount;
+      const auto operation = operations[operation_index];
+      std::uint64_t warmup_checksum = UINT64_C(14695981039346656037);
+
+      ResetFinnyFmBenchmarkCache(operation);
+      RunFinnyFmBenchmarkPass(operation, kNnueBenchWarmupGames, nullptr,
+                              warmup_checksum, false);
+
+      // Populate the entire measured corpus once so the timed pass measures
+      // warm entries for both implementations using identical positions.
+      ResetFinnyFmBenchmarkCache(operation);
+      RunFinnyFmBenchmarkPass(operation, kNnueBenchMeasuredGames, nullptr,
+                              warmup_checksum, false);
+
+      auto* const sample_statistics = repeat == 0
+          ? &statistics[operation_index] : nullptr;
+      samples[operation_index].Add(RunFinnyFmBenchmarkPass(
+          operation, kNnueBenchMeasuredGames, sample_statistics,
+          timing_checksums[operation_index], true));
+    }
+  }
+
+  PrintNnueBenchSamples("A. Phase 1: Main Finny + FM scratch", samples[0]);
+  PrintNnueBenchSamples("B. Phase 3: Main + FM Finny", samples[1]);
+  const auto phase1_summary = SummarizeNnueBenchSamples(samples[0]);
+  const auto phase3_summary = SummarizeNnueBenchSamples(samples[1]);
+  const double difference = phase3_summary.median - phase1_summary.median;
+  const double improvement = phase1_summary.median == 0.0
+      ? 0.0 : -difference / phase1_summary.median * 100.0;
+  std::cout << "  improvement ns/call : " << std::fixed << std::setprecision(1)
+            << -difference << std::endl
+            << "  improvement         : " << std::setprecision(2)
+            << improvement << "%" << std::endl;
+  PrintFinnyFmStatistics("[Phase 1 warm statistics]", statistics[0]);
+  PrintFinnyFmStatistics("[Phase 3 warm statistics]", statistics[1]);
+
+  std::uint64_t phase1_checksum = UINT64_C(14695981039346656037);
+  std::uint64_t phase1_scratch_checksum = UINT64_C(14695981039346656037);
+  const std::uint64_t phase1_mismatches = ValidateFinnyFmModeAgainstScratch(
+      FinnyFmBenchOperation::Phase1, phase1_checksum,
+      phase1_scratch_checksum);
+  std::uint64_t phase3_checksum = UINT64_C(14695981039346656037);
+  std::uint64_t phase3_scratch_checksum = UINT64_C(14695981039346656037);
+  const std::uint64_t phase3_mismatches = ValidateFinnyFmModeAgainstScratch(
+      FinnyFmBenchOperation::Phase3, phase3_checksum,
+      phase3_scratch_checksum);
+
+  std::cout << "[correctness against true scratch]" << std::endl
+            << "  Phase 1 checksum : 0x" << std::hex << phase1_checksum
+            << std::endl
+            << "  scratch checksum : 0x" << phase1_scratch_checksum
+            << std::dec << std::endl
+            << "  Phase 1 mismatch count: " << phase1_mismatches << std::endl
+            << "  Phase 3 checksum : 0x" << std::hex << phase3_checksum
+            << std::endl
+            << "  scratch checksum : 0x" << phase3_scratch_checksum
+            << std::dec << std::endl
+            << "  Phase 3 mismatch count: " << phase3_mismatches << std::endl
+            << "[timing checksums]" << std::endl
+            << "  Phase 1: 0x" << std::hex << timing_checksums[0] << std::endl
+            << "  Phase 3: 0x" << timing_checksums[1] << std::dec << std::endl
+            << "  timing checksum match: "
+            << (timing_checksums[0] == timing_checksums[1] ? "yes" : "NO")
+            << std::endl;
+}
 #endif
 
 enum class FtTransformStageOperation {
@@ -6753,6 +6969,10 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::uint64_t repeat_count;
     if (ReadNnueBenchRepeatCount(stream, repeat_count))
       TestFinnyBenchmarkCompare(repeat_count);
+  } else if (sub_command == "bench_finny_fm_compare") {
+    std::uint64_t repeat_count;
+    if (ReadNnueBenchRepeatCount(stream, repeat_count))
+      TestFinnyFmBenchmarkCompare(repeat_count);
 #endif
   } else if (sub_command == "bench_ft_transform_stages") {
     std::uint64_t repeat_count;
@@ -6827,6 +7047,7 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << " test nnue bench_ft [repeats]" << std::endl;
 #if defined(USE_FINNY_TABLES)
     std::cout << " test nnue bench_finny_compare [repeats]" << std::endl;
+    std::cout << " test nnue bench_finny_fm_compare [repeats]" << std::endl;
 #endif
     std::cout << " test nnue bench_ft_transform_stages [repeats]"
               << std::endl;
