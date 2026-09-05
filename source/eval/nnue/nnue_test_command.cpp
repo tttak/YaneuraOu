@@ -15,6 +15,7 @@
 #include <fstream>
 #include <functional>
 #include <iomanip>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <streambuf>
@@ -5088,6 +5089,452 @@ std::int32_t ComputeNnueNetworkSigmoidBenchOutput(
                                          work.fc_2_out[0]);
 }
 
+#if defined(USE_NNUE_APPROX_SIGMOID_LUT)
+
+enum class MainGateIntegerBenchImplementation {
+  CurrentFloatLut,
+  ProductionCompact64,
+};
+
+enum class MainGateIntegerBenchOperation {
+  SigmoidOnly,
+  CompleteGate,
+  FullNetwork,
+};
+
+template<MainGateIntegerBenchImplementation Implementation>
+void ComputeMainGateIntegerBench(
+    const Network& selected_network, const std::int32_t* main_input,
+    const std::int32_t* diff_fc_output, std::int32_t* output) {
+  if constexpr (Implementation ==
+                MainGateIntegerBenchImplementation::CurrentFloatLut)
+    selected_network.BenchmarkMainGateFloatLut(
+        main_input, diff_fc_output, output);
+  else
+    selected_network.BenchmarkMainGateReconstructed(
+        main_input, diff_fc_output, output);
+}
+
+template<MainGateIntegerBenchImplementation Implementation>
+void ComputeMainGateIntegerBenchQ64(
+    const Network& selected_network, const std::int32_t* diff_fc_output,
+    std::int32_t* gate_q64) {
+  if constexpr (Implementation ==
+                MainGateIntegerBenchImplementation::CurrentFloatLut)
+    selected_network.BenchmarkMainGateFloatLutSigmoid(
+        diff_fc_output, gate_q64);
+  else
+    selected_network.BenchmarkMainGateSigmoid(diff_fc_output, gate_q64);
+}
+
+template<MainGateIntegerBenchImplementation Implementation>
+std::int32_t ComputeNnueNetworkMainGateIntegerBenchOutput(
+    const NetworkBenchCase& input, Network::Buffer& work) {
+  const Network& selected_network =
+      NnueBenchSelectedNetwork(input.selected_bucket);
+  const auto scales = selected_network.BenchmarkPhase(
+      input.transformed.data(), input.diff_transformed.data(),
+      input.abs_transformed.data(), input.material_bucket,
+      work.phase_input, work.phase_out);
+
+  selected_network.BenchmarkFmAffine(
+      input.diff_transformed.data(), input.abs_transformed.data(),
+      work.diff_fc_out, work.abs_fc_out);
+  selected_network.BenchmarkFmActivation(
+      work.diff_fc_out, work.abs_fc_out, work.diff_ac_out,
+      work.abs_ac_out, work.abs_sqr_out);
+
+  selected_network.BenchmarkMainFc0(
+      input.transformed.data(), work.fc_0_out);
+  ComputeMainGateIntegerBench<Implementation>(
+      selected_network, work.fc_0_out, work.diff_fc_out, work.fc_0_out);
+  selected_network.BenchmarkMainSqrClippedRelu(
+      work.fc_0_out, work.ac_sqr_0_out_temp);
+  selected_network.BenchmarkMainClippedRelu(work.fc_0_out, work.ac_0_out);
+
+  selected_network.BenchmarkLca(
+      work.ac_0_out, work.diff_ac_out, work.abs_ac_out, work.diff_ac_out,
+      work.fm_cat_uint8, work.lca_q_out, work.lca_k_out, work.lca_v_out);
+  selected_network.BenchmarkCross(
+      work.ac_sqr_0_out_temp, work.ac_0_out, work.diff_ac_out,
+      work.abs_ac_out, work.cross_cat, work.cross_fc_out, work.cross_feat);
+  selected_network.BenchmarkL2Assembly(
+      work.ac_sqr_0_out_temp, work.ac_0_out, work.diff_ac_out,
+      work.abs_ac_out, work.abs_sqr_out, work.cross_feat, scales,
+      work.l2_input);
+  selected_network.BenchmarkFc1(work.l2_input, work.fc_1_out);
+  selected_network.BenchmarkAc1(work.fc_1_out, work.ac_1_out);
+  selected_network.BenchmarkFc2(work.ac_1_out, work.fc_2_out);
+  return selected_network.BenchmarkBlend(work.fc_0_out[31],
+                                         work.fc_2_out[0]);
+}
+
+template<MainGateIntegerBenchImplementation Implementation,
+         MainGateIntegerBenchOperation Operation>
+NnueBenchTiming MeasureMainGateIntegerCorpus(
+    const std::vector<NetworkStageBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  alignas(kCacheLineSize) std::int32_t output[32];
+  alignas(kCacheLineSize) Network::Buffer work{};
+  NnueBenchTiming timing;
+
+  const auto begin = NnueBenchClock::now();
+  for (const auto& sample : corpus) {
+    const Network& selected_network =
+        NnueBenchSelectedNetwork(sample.input.selected_bucket);
+    if constexpr (Operation == MainGateIntegerBenchOperation::SigmoidOnly) {
+      ComputeMainGateIntegerBenchQ64<Implementation>(
+          selected_network, sample.intermediate.diff_fc_out, output);
+      const auto index = static_cast<std::size_t>(timing.calls) & 31;
+      MixNnueBenchChecksum(checksum, output[index]);
+    } else if constexpr (
+        Operation == MainGateIntegerBenchOperation::CompleteGate) {
+      ComputeMainGateIntegerBench<Implementation>(
+          selected_network, sample.main_before_gate.data(),
+          sample.intermediate.diff_fc_out, output);
+      const auto index = static_cast<std::size_t>(timing.calls) & 31;
+      MixNnueBenchChecksum(checksum, output[index]);
+      MixNnueBenchChecksum(checksum, output[(index + 17) & 31]);
+    } else {
+      const auto value =
+          ComputeNnueNetworkMainGateIntegerBenchOutput<Implementation>(
+              sample.input, work);
+      MixNnueBenchChecksum(checksum, value);
+    }
+    ++timing.calls;
+  }
+  const auto end = NnueBenchClock::now();
+  timing.nanoseconds =
+      std::chrono::duration<double, std::nano>(end - begin).count();
+  return timing;
+}
+
+template<MainGateIntegerBenchImplementation Implementation,
+         MainGateIntegerBenchOperation Operation>
+NnueBenchTiming MeasureMainGateIntegerCorpusAfterWarmup(
+    const std::vector<NetworkStageBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  std::uint64_t warmup_checksum = UINT64_C(14695981039346656037);
+  MeasureMainGateIntegerCorpus<Implementation, Operation>(
+      corpus, warmup_checksum);
+  MixNnueBenchChecksum(checksum, warmup_checksum);
+  return MeasureMainGateIntegerCorpus<Implementation, Operation>(
+      corpus, checksum);
+}
+
+struct MainGateIntegerValidation {
+  NnueBenchIntegerDiagnostic gate_q64;
+  NnueBenchIntegerDiagnostic gate_applied;
+  NnueBenchIntegerDiagnostic gate_output;
+  NnueBenchIntegerDiagnostic final_output;
+  std::uint64_t reference_gate_checksum =
+      UINT64_C(14695981039346656037);
+  std::uint64_t candidate_gate_checksum =
+      UINT64_C(14695981039346656037);
+  std::uint64_t reference_final_checksum =
+      UINT64_C(14695981039346656037);
+  std::uint64_t candidate_final_checksum =
+      UINT64_C(14695981039346656037);
+};
+
+template<MainGateIntegerBenchImplementation Candidate>
+MainGateIntegerValidation ValidateMainGateIntegerCandidate(
+    const std::vector<NetworkStageBenchCase>& corpus) {
+  MainGateIntegerValidation validation;
+  alignas(kCacheLineSize) std::int32_t reference_q64[32];
+  alignas(kCacheLineSize) std::int32_t candidate_q64[32];
+  alignas(kCacheLineSize) std::int32_t reference_applied[32];
+  alignas(kCacheLineSize) std::int32_t candidate_applied[32];
+  alignas(kCacheLineSize) std::int32_t reference_output[32];
+  alignas(kCacheLineSize) std::int32_t candidate_output[32];
+  alignas(kCacheLineSize) Network::Buffer reference_work{};
+  alignas(kCacheLineSize) Network::Buffer candidate_work{};
+
+  for (std::size_t sample_index = 0; sample_index < corpus.size();
+       ++sample_index) {
+    const auto& sample = corpus[sample_index];
+    const Network& selected_network =
+        NnueBenchSelectedNetwork(sample.input.selected_bucket);
+    ComputeMainGateIntegerBenchQ64<
+        MainGateIntegerBenchImplementation::CurrentFloatLut>(
+            selected_network, sample.intermediate.diff_fc_out,
+            reference_q64);
+    ComputeMainGateIntegerBenchQ64<
+        Candidate>(
+            selected_network, sample.intermediate.diff_fc_out,
+            candidate_q64);
+    selected_network.BenchmarkMainGateApply(
+        sample.main_before_gate.data(), reference_q64, reference_applied);
+    selected_network.BenchmarkMainGateApply(
+        sample.main_before_gate.data(), candidate_q64, candidate_applied);
+    selected_network.BenchmarkMainGateClamp(
+        reference_applied, reference_output);
+    selected_network.BenchmarkMainGateClamp(
+        candidate_applied, candidate_output);
+
+    MixNnueBenchRange(validation.reference_gate_checksum, reference_q64, 32);
+    MixNnueBenchRange(validation.candidate_gate_checksum, candidate_q64, 32);
+    AddNnueBenchIntegerDiagnostic(
+        validation.gate_q64, reference_q64, candidate_q64, 32,
+        sample_index);
+    AddNnueBenchIntegerDiagnostic(
+        validation.gate_applied, reference_applied, candidate_applied, 32,
+        sample_index);
+    AddNnueBenchIntegerDiagnostic(
+        validation.gate_output, reference_output, candidate_output, 32,
+        sample_index);
+
+    const auto reference_final =
+        ComputeNnueNetworkMainGateIntegerBenchOutput<
+            MainGateIntegerBenchImplementation::CurrentFloatLut>(
+                sample.input, reference_work);
+    const auto candidate_final =
+        ComputeNnueNetworkMainGateIntegerBenchOutput<
+            Candidate>(
+                sample.input, candidate_work);
+    MixNnueBenchChecksum(validation.reference_final_checksum,
+                         reference_final);
+    MixNnueBenchChecksum(validation.candidate_final_checksum,
+                         candidate_final);
+    AddNnueBenchIntegerDiagnostic(
+        validation.final_output, &reference_final, &candidate_final, 1,
+        sample_index);
+  }
+  return validation;
+}
+
+template<MainGateIntegerBenchOperation Operation>
+NnueBenchTiming DispatchMainGateIntegerMeasurement(
+    const MainGateIntegerBenchImplementation implementation,
+    const std::vector<NetworkStageBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  switch (implementation) {
+    case MainGateIntegerBenchImplementation::CurrentFloatLut:
+      return MeasureMainGateIntegerCorpusAfterWarmup<
+          MainGateIntegerBenchImplementation::CurrentFloatLut, Operation>(
+              corpus, checksum);
+    case MainGateIntegerBenchImplementation::ProductionCompact64:
+      return MeasureMainGateIntegerCorpusAfterWarmup<
+          MainGateIntegerBenchImplementation::ProductionCompact64, Operation>(
+              corpus, checksum);
+  }
+  return {};
+}
+
+NnueBenchTiming DispatchMainGateIntegerOperation(
+    const MainGateIntegerBenchImplementation implementation,
+    const MainGateIntegerBenchOperation operation,
+    const std::vector<NetworkStageBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  switch (operation) {
+    case MainGateIntegerBenchOperation::SigmoidOnly:
+      return DispatchMainGateIntegerMeasurement<
+          MainGateIntegerBenchOperation::SigmoidOnly>(
+              implementation, corpus, checksum);
+    case MainGateIntegerBenchOperation::CompleteGate:
+      return DispatchMainGateIntegerMeasurement<
+          MainGateIntegerBenchOperation::CompleteGate>(
+              implementation, corpus, checksum);
+    case MainGateIntegerBenchOperation::FullNetwork:
+      return DispatchMainGateIntegerMeasurement<
+          MainGateIntegerBenchOperation::FullNetwork>(
+              implementation, corpus, checksum);
+  }
+  return {};
+}
+
+template<MainGateIntegerBenchImplementation Implementation>
+std::int32_t MainGateIntegerValue(const std::int32_t raw) {
+  if constexpr (Implementation ==
+                MainGateIntegerBenchImplementation::CurrentFloatLut)
+    return Network::sigmoid_gate_slow(raw, 64);
+  else
+    return Network::MainGateCompactQ64Value(raw);
+}
+
+template<MainGateIntegerBenchImplementation Candidate>
+NnueBenchIntegerDiagnostic ValidateMainGateIntegerAllRawInputs() {
+  NnueBenchIntegerDiagnostic result;
+  std::size_t sample = 0;
+  for (std::int32_t raw = Network::kMainGateCompactRawMinimum;
+       raw <= Network::kMainGateCompactRawMaximum; ++raw, ++sample) {
+    const auto reference = MainGateIntegerValue<
+        MainGateIntegerBenchImplementation::CurrentFloatLut>(raw);
+    const auto candidate = MainGateIntegerValue<Candidate>(raw);
+    AddNnueBenchIntegerDiagnostic(
+        result, &reference, &candidate, 1, sample);
+  }
+  const std::array<std::int32_t, 4> saturation_inputs = {
+      Network::kMainGateCompactRawMinimum - 1,
+      std::numeric_limits<std::int32_t>::min(),
+      Network::kMainGateCompactRawMaximum + 1,
+      std::numeric_limits<std::int32_t>::max()};
+  for (const auto raw : saturation_inputs) {
+    const auto reference = MainGateIntegerValue<
+        MainGateIntegerBenchImplementation::CurrentFloatLut>(raw);
+    const auto candidate = MainGateIntegerValue<Candidate>(raw);
+    AddNnueBenchIntegerDiagnostic(
+        result, &reference, &candidate, 1, sample++);
+  }
+  return result;
+}
+
+void PrintMainGateCompactTableInfo() {
+  const auto& table = Network::MainGateCompactQ64Lut();
+  std::uint64_t transition_bins = 0;
+  for (const auto& entry : table)
+    transition_bins +=
+        entry.threshold <= Network::kMainGateCompactCoarseWidth;
+  std::cout << "B. production C64-v2 branchless compact LUT" << std::endl
+            << "  coarse width       : "
+            << Network::kMainGateCompactCoarseWidth << " raw values"
+            << std::endl
+            << "  coarse bins        : " << table.size() << std::endl
+            << "  entry layout       : uint8 threshold + uint8 base"
+            << std::endl
+            << "  table bytes        : " << sizeof(table) << std::endl
+            << "  lookup             : clamp -> one 2-byte entry -> base + compare"
+            << std::endl
+            << "  threshold compares : exactly 1 (branchless)" << std::endl
+            << "  transition/no-transition bins: " << transition_bins << " / "
+            << table.size() - transition_bins << std::endl
+            << "  no-transition sentinel: "
+            << Network::kMainGateCompactCoarseWidth + 1 << std::endl;
+}
+
+void PrintMainGateIntegerCandidateValidation(
+    const char* const name, const MainGateIntegerValidation& validation) {
+  std::cout << name << std::endl;
+  PrintNnueBenchIntegerDiagnostic("  gate_q64[32]", validation.gate_q64);
+  PrintNnueBenchIntegerDiagnostic(
+      "  Main gate applied before clamp[32]", validation.gate_applied);
+  PrintNnueBenchIntegerDiagnostic(
+      "  fc_0_out[32]", validation.gate_output);
+  PrintNnueBenchIntegerDiagnostic(
+      "  final Network output", validation.final_output);
+}
+
+void TestMainGateIntegerBenchmarkCompare(const std::uint64_t repeat_count) {
+  // Build the production table before corpus generation and timed regions.
+  Network::MainGateCompactQ64Lut();
+
+  std::cout << "[NNUE benchmark: Main gate exact compact Q64 LUTs]"
+            << std::endl
+            << "  baseline     : production float32 LUT [-10,8], step 1/32"
+            << std::endl
+            << "  candidate    : production C64-v2 branchless compact LUT"
+            << std::endl
+            << "  raw range    : ["
+            << Network::kMainGateCompactRawMinimum << ", "
+            << Network::kMainGateCompactRawMaximum << "]"
+            << std::endl
+            << "  seed         : " << kNnueBenchSeed << std::endl
+            << "  corpus games : " << kNnueBenchMeasuredGames << std::endl
+            << "  max ply/game : " << kNnueBenchMaxPly << std::endl
+            << "  repeats      : " << repeat_count << std::endl
+            << "  order        : implementation and stage order rotated per repeat"
+            << std::endl
+            << "[table layout]" << std::endl;
+  PrintMainGateCompactTableInfo();
+
+  const auto corpus = MakeNnueNetworkStageBenchCorpus();
+  if (corpus.empty()) {
+    std::cout << "error: Main gate integer benchmark corpus is empty"
+              << std::endl;
+    return;
+  }
+  std::cout << "  corpus calls : " << corpus.size() << std::endl
+            << "  compared gate values: " << corpus.size() * 32 << std::endl
+            << "  warm-up calls: " << corpus.size()
+            << " before every timed sample" << std::endl;
+
+  constexpr std::array<MainGateIntegerBenchImplementation, 2>
+      implementations = {
+          MainGateIntegerBenchImplementation::CurrentFloatLut,
+          MainGateIntegerBenchImplementation::ProductionCompact64};
+  constexpr std::array<const char*, 2> implementation_names = {
+      "A. previous production float LUT",
+      "B. production C64-v2 compact LUT"};
+  constexpr std::array<MainGateIntegerBenchOperation, 3> operations = {
+      MainGateIntegerBenchOperation::SigmoidOnly,
+      MainGateIntegerBenchOperation::CompleteGate,
+      MainGateIntegerBenchOperation::FullNetwork};
+  constexpr std::array<const char*, 3> operation_names = {
+      "Main sigmoid -> gate_q64[32]",
+      "Main gate sigmoid + apply + clamp",
+      "full staged Network (Main candidate only)"};
+  std::array<std::array<NnueBenchSamples, implementations.size()>,
+             operations.size()> samples;
+  std::array<std::array<std::uint64_t, implementations.size()>,
+             operations.size()> timing_checksums;
+  for (auto& checksums : timing_checksums)
+    checksums.fill(UINT64_C(14695981039346656037));
+
+  for (std::uint64_t repeat = 0; repeat < repeat_count; ++repeat)
+    for (std::size_t operation_offset = 0;
+         operation_offset < operations.size(); ++operation_offset) {
+      const auto operation_index =
+          (operation_offset + static_cast<std::size_t>(repeat))
+          % operations.size();
+      for (std::size_t implementation_offset = 0;
+           implementation_offset < implementations.size();
+           ++implementation_offset) {
+        const auto implementation_index =
+            (implementation_offset + static_cast<std::size_t>(repeat))
+            % implementations.size();
+        samples[operation_index][implementation_index].Add(
+            DispatchMainGateIntegerOperation(
+                implementations[implementation_index],
+                operations[operation_index], corpus,
+                timing_checksums[operation_index][implementation_index]));
+      }
+    }
+
+  for (std::size_t operation = 0; operation < operations.size();
+       ++operation) {
+    std::cout << operation_names[operation] << std::endl;
+    const auto reference =
+        SummarizeNnueBenchSamples(samples[operation][0]);
+    for (std::size_t implementation = 0;
+         implementation < implementations.size(); ++implementation) {
+      PrintNnueBenchSamples(implementation_names[implementation],
+                            samples[operation][implementation]);
+      const auto summary = SummarizeNnueBenchSamples(
+          samples[operation][implementation]);
+      const double improvement = reference.median == 0.0
+          ? 0.0
+          : (reference.median - summary.median) * 100.0
+                / reference.median;
+      std::cout << "  relative improvement vs A: " << std::fixed
+                << std::setprecision(2) << improvement << "%" << std::endl
+                << "  timing checksum: 0x" << std::hex
+                << timing_checksums[operation][implementation] << std::dec
+                << std::endl
+                << "  checksum match vs A: "
+                << (timing_checksums[operation][implementation]
+                            == timing_checksums[operation][0]
+                        ? "yes" : "NO")
+                << std::endl;
+    }
+  }
+
+  std::cout << "[exhaustive raw-input validation]" << std::endl
+            << "  in-range values : "
+            << Network::kMainGateCompactRawCount << std::endl
+            << "  saturation probes: 4" << std::endl;
+  const auto raw_production = ValidateMainGateIntegerAllRawInputs<
+      MainGateIntegerBenchImplementation::ProductionCompact64>();
+  PrintNnueBenchIntegerDiagnostic("B. production vs A", raw_production);
+
+  std::cout << "[corpus correctness]" << std::endl;
+  PrintMainGateIntegerCandidateValidation(
+      "B. production vs A",
+      ValidateMainGateIntegerCandidate<
+          MainGateIntegerBenchImplementation::ProductionCompact64>(corpus));
+}
+
+#endif  // defined(USE_NNUE_APPROX_SIGMOID_LUT)
+
 template<SigmoidBenchImplementation Implementation,
          SigmoidBenchOperation Operation>
 NnueBenchTiming MeasureSigmoidApproximationCorpus(
@@ -7000,6 +7447,12 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::uint64_t repeat_count;
     if (ReadNnueBenchRepeatCount(stream, repeat_count))
       TestMainGateBenchmarkCompare(repeat_count);
+#if defined(USE_NNUE_APPROX_SIGMOID_LUT)
+  } else if (sub_command == "bench_main_gate_integer_compare") {
+    std::uint64_t repeat_count;
+    if (ReadNnueBenchRepeatCount(stream, repeat_count))
+      TestMainGateIntegerBenchmarkCompare(repeat_count);
+#endif
   } else if (sub_command == "bench_sigmoid_approx") {
     std::uint64_t repeat_count;
     if (ReadNnueBenchRepeatCount(stream, repeat_count))
@@ -7060,6 +7513,10 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << " test nnue bench_network_stages [repeats]" << std::endl;
     std::cout << " test nnue bench_main_gate_compare [repeats]"
               << std::endl;
+#if defined(USE_NNUE_APPROX_SIGMOID_LUT)
+    std::cout << " test nnue bench_main_gate_integer_compare [repeats]"
+              << std::endl;
+#endif
     std::cout << " test nnue bench_sigmoid_approx [repeats]"
               << std::endl;
     std::cout << " test nnue validate_sigmoid_candidate" << std::endl;

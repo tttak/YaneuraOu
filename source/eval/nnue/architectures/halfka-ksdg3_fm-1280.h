@@ -5,6 +5,7 @@
 #include "../features/half_ka.h"
 #include "../features/king_safety3_distinguishgolds.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -105,6 +106,12 @@ struct Network {
 		fc_2.ReadParameters(stream).is_ok();
 		stream.read(reinterpret_cast<char*>(&bucket_blend_alpha), sizeof(int32_t));
 		std::cout << "Read Alpha: " << bucket_blend_alpha << " / 16384" << std::endl;
+#if defined(USE_NNUE_APPROX_SIGMOID_LUT)
+		// tournament builds use -fno-threadsafe-statics, so construct both the
+		// source float LUT and compact Main-gate LUT on the single-threaded
+		// network-loading path before search workers can evaluate positions.
+		MainGateCompactQ64Lut();
+#endif
 		return Tools::ResultCode::Ok;
 	}
 
@@ -113,8 +120,10 @@ struct Network {
 	}
 
 #if defined(USE_NNUE_APPROX_SIGMOID_LUT)
-	// Accuracy-comparison candidate for the Main and FM Abs gates.
-	// The Phase gate intentionally keeps its existing std::exp calculation.
+	// Production approximation for the Main and FM Abs gates. The Main gate
+	// consumes its exactly quantized compact Q64 representation below; FM Abs
+	// continues to consume this float interpolation directly. The Phase gate
+	// intentionally keeps its existing std::exp calculation.
 	static constexpr int kApproxSigmoidLutMinimum = -10;
 	static constexpr int kApproxSigmoidLutMaximum = 8;
 	static constexpr int kApproxSigmoidLutStepsPerUnit = 32;
@@ -172,10 +181,91 @@ struct Network {
 		return static_cast<int32_t>(value * sig);
 	}
 
+#if defined(USE_NNUE_APPROX_SIGMOID_LUT)
+	// Exact compact representation of the quantized Main-gate result produced
+	// by the float LUT above.  Exhaustive validation over all 146305 integral
+	// raw inputs established that every 64-value bin has at most one Q64
+	// transition.  A threshold of 65 is therefore a no-transition sentinel.
+	static constexpr int kMainGateCompactRawMinimum =
+		kApproxSigmoidLutRawMinimum;
+	static constexpr int kMainGateCompactRawMaximum =
+		kApproxSigmoidLutRawMaximum;
+	static constexpr int kMainGateCompactCoarseWidth = 64;
+	static constexpr std::size_t kMainGateCompactRawCount =
+		static_cast<std::size_t>(kMainGateCompactRawMaximum
+			- kMainGateCompactRawMinimum + 1);
+	static constexpr std::size_t kMainGateCompactBinCount =
+		(kMainGateCompactRawCount + kMainGateCompactCoarseWidth - 1)
+			/ kMainGateCompactCoarseWidth;
+
+	struct MainGateCompactEntry {
+		std::uint8_t threshold;
+		std::uint8_t base;
+	};
+	static_assert(sizeof(MainGateCompactEntry) == 2);
+
+	static const std::array<MainGateCompactEntry,
+		kMainGateCompactBinCount>& MainGateCompactQ64Lut() {
+		static const auto table = []() {
+			std::array<MainGateCompactEntry,
+				kMainGateCompactBinCount> result{};
+			for (std::size_t bin = 0; bin < result.size(); ++bin) {
+				auto& entry = result[bin];
+				const std::size_t begin =
+					bin * kMainGateCompactCoarseWidth;
+				const std::size_t end = std::min(
+					begin + kMainGateCompactCoarseWidth,
+					kMainGateCompactRawCount);
+				entry.base = static_cast<std::uint8_t>(sigmoid_gate_slow(
+					static_cast<std::int32_t>(begin)
+						+ kMainGateCompactRawMinimum,
+					64));
+				entry.threshold = kMainGateCompactCoarseWidth + 1;
+				for (std::size_t index = begin + 1; index < end; ++index) {
+					const auto value = static_cast<std::uint8_t>(
+						sigmoid_gate_slow(static_cast<std::int32_t>(index)
+							+ kMainGateCompactRawMinimum,
+							64));
+					if (value != entry.base) {
+						entry.threshold = static_cast<std::uint8_t>(
+							index - begin);
+						break;
+					}
+				}
+			}
+			return result;
+		}();
+		return table;
+	}
+
+	static inline std::int32_t MainGateCompactQ64Value(
+		const std::int32_t raw_x) {
+		const auto& table = MainGateCompactQ64Lut();
+		const std::int32_t clamped = std::clamp(raw_x,
+			kMainGateCompactRawMinimum, kMainGateCompactRawMaximum);
+		const auto offset = static_cast<std::uint32_t>(
+			clamped - kMainGateCompactRawMinimum);
+		const auto bin = static_cast<std::size_t>(
+			offset / kMainGateCompactCoarseWidth);
+		const auto within_bin = static_cast<std::uint8_t>(
+			offset - static_cast<std::uint32_t>(
+				bin * kMainGateCompactCoarseWidth));
+		const auto& entry = table[bin];
+		return static_cast<std::int32_t>(entry.base)
+			+ static_cast<std::int32_t>(within_bin >= entry.threshold);
+	}
+#endif
+
 	static inline void ComputeMainGateSigmoid(
 		const std::int32_t* diff_fc_output, std::int32_t* gate_q64) {
-		for (int j = 0; j < 32; ++j)
+		for (int j = 0; j < 32; ++j) {
+#if defined(USE_NNUE_APPROX_SIGMOID_LUT)
+			gate_q64[j] = MainGateCompactQ64Value(
+				diff_fc_output[j] - 2438);
+#else
 			gate_q64[j] = sigmoid_gate_slow(diff_fc_output[j] - 2438, 64);
+#endif
+		}
 	}
 
 	static inline void ComputeMainGateApply(const std::int32_t* fc_input,
@@ -586,6 +676,7 @@ struct Network {
 		ComputeMainGateClamp(before_clamp, fc_output);
 	}
 
+
 	struct BenchmarkPhaseScales {
 		float main_sqr;
 		float main_raw;
@@ -849,6 +940,24 @@ struct Network {
 		std::int32_t* gate_q64) const {
 		ComputeMainGateSigmoid(diff_fc_output, gate_q64);
 	}
+
+#if defined(USE_NNUE_APPROX_SIGMOID_LUT)
+	void BenchmarkMainGateFloatLutSigmoid(
+		const std::int32_t* diff_fc_output, std::int32_t* gate_q64) const {
+		for (int j = 0; j < 32; ++j)
+			gate_q64[j] = sigmoid_gate_slow(
+				diff_fc_output[j] - 2438, 64);
+	}
+
+	void BenchmarkMainGateFloatLut(const std::int32_t* fc_input,
+		const std::int32_t* diff_fc_output, std::int32_t* fc_output) const {
+		std::int32_t gate_q64[32];
+		std::int32_t before_clamp[32];
+		BenchmarkMainGateFloatLutSigmoid(diff_fc_output, gate_q64);
+		ComputeMainGateApply(fc_input, gate_q64, before_clamp);
+		ComputeMainGateClamp(before_clamp, fc_output);
+	}
+#endif
 
 	void BenchmarkMainGateApply(const std::int32_t* fc_input,
 		const std::int32_t* gate_q64, std::int32_t* fc_output) const {
