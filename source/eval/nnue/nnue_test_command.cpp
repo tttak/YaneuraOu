@@ -402,8 +402,10 @@ void TestAccumulator(Position& pos) {
   auto print_value_failure = [&](const std::uint64_t game, const int ply,
                                  const Move move, const Color perspective,
                                  const char* target, const std::size_t index,
-                                 const std::int64_t incremental_value,
-                                 const std::int64_t full_value,
+                                 const char* left_name,
+                                 const std::int64_t left_value,
+                                 const char* right_name,
+                                 const std::int64_t right_value,
                                  const std::size_t trigger_index,
                                  const bool is_main) {
     std::cout << std::endl
@@ -423,13 +425,77 @@ void TestAccumulator(Position& pos) {
     } else {
       std::cout << "  index             : " << index << std::endl;
     }
-    std::cout << "  incremental value : " << incremental_value << std::endl
-              << "  full refresh value: " << full_value << std::endl
+    std::cout << "  comparison        : " << left_name << " vs " << right_name
+              << std::endl
+              << "  " << left_name << " value : " << left_value << std::endl
+              << "  " << right_name << " value : " << right_value << std::endl
               << "  difference        : "
-              << (incremental_value - full_value) << std::endl;
+              << (left_value - right_value) << std::endl;
+  };
+
+  auto compare_accumulators = [&](const Accumulator& left,
+                                  const Accumulator& right,
+                                  const char* left_name,
+                                  const char* right_name,
+                                  const std::uint64_t game, const int ply,
+                                  const Move move) {
+    for (const Color perspective : {BLACK, WHITE}) {
+      for (std::size_t trigger_index = 0;
+           trigger_index < kRefreshTriggers.size(); ++trigger_index) {
+        for (IndexType index = 0; index < kTransformedFeatureDimensions; ++index) {
+          const std::int64_t left_value =
+              left.accumulation[perspective][trigger_index][index];
+          const std::int64_t right_value =
+              right.accumulation[perspective][trigger_index][index];
+          if (left_value != right_value) {
+            print_value_failure(game, ply, move, perspective,
+                                "main accumulation", index, left_name,
+                                left_value, right_name, right_value,
+                                trigger_index, true);
+            return false;
+          }
+        }
+      }
+
+      const auto& left_factors = left.factors[perspective];
+      const auto& right_factors = right.factors[perspective];
+      struct FactorComparison {
+        const char* target;
+        const std::int64_t* left_values;
+        const std::int64_t* right_values;
+      };
+      const FactorComparison factor_comparisons[] = {
+          {"halfka.sum_v", left_factors.halfka.sum_v,
+           right_factors.halfka.sum_v},
+          {"halfka.sum_v2", left_factors.halfka.sum_v2,
+           right_factors.halfka.sum_v2},
+          {"ksdg.sum_v", left_factors.ksdg.sum_v,
+           right_factors.ksdg.sum_v},
+          {"ksdg.sum_v2", left_factors.ksdg.sum_v2,
+           right_factors.ksdg.sum_v2},
+      };
+
+      for (const auto& comparison : factor_comparisons) {
+        for (std::size_t index = 0; index < 32; ++index) {
+          const std::int64_t left_value = comparison.left_values[index];
+          const std::int64_t right_value = comparison.right_values[index];
+          if (left_value != right_value) {
+            print_value_failure(game, ply, move, perspective,
+                                comparison.target, index, left_name,
+                                left_value, right_name, right_value, 0, false);
+            return false;
+          }
+        }
+      }
+    }
+    return true;
   };
 
   std::cout << "start testing accumulator with random games";
+
+#if defined(USE_FINNY_TABLES)
+  feature_transformer->TestResetFinnyCache();
+#endif
 
   for (std::uint64_t game = 0; game < num_games; ++game) {
     if (!pos.state()->accumulator.computed_accumulation) {
@@ -476,65 +542,38 @@ void TestAccumulator(Position& pos) {
 
       const Accumulator incremental = current->accumulator;
 
-      // compute_eval()はComputeScore(pos, true)を呼び、同じ局面の
-      // Accumulatorをfull refreshで再計算する。
-      ::YaneuraOu::Eval::compute_eval(pos);
+#if defined(USE_FINNY_TABLES)
+      feature_transformer->TestRefreshAccumulatorWithFinny(pos);
       if (!current->accumulator.computed_accumulation) {
-        print_state_failure(game, ply, "full refresh did not compute accumulator", &move);
+        print_state_failure(game, ply, "Finny refresh did not compute accumulator", &move);
         std::cout << "failed." << std::endl;
         return;
       }
+      const Accumulator finny = current->accumulator;
+#endif
 
-      const auto& full = current->accumulator;
-      for (const Color perspective : {BLACK, WHITE}) {
-        for (std::size_t trigger_index = 0;
-             trigger_index < kRefreshTriggers.size(); ++trigger_index) {
-          for (IndexType index = 0; index < kTransformedFeatureDimensions; ++index) {
-            const std::int64_t incremental_value =
-                incremental.accumulation[perspective][trigger_index][index];
-            const std::int64_t full_value =
-                full.accumulation[perspective][trigger_index][index];
-            if (incremental_value != full_value) {
-              print_value_failure(game, ply, move, perspective, "main accumulation",
-                                  index, incremental_value, full_value,
-                                  trigger_index, true);
-              std::cout << "failed." << std::endl;
-              return;
-            }
-          }
-        }
-
-        const auto& incremental_factors = incremental.factors[perspective];
-        const auto& full_factors = full.factors[perspective];
-        struct FactorComparison {
-          const char* target;
-          const std::int64_t* incremental_values;
-          const std::int64_t* full_values;
-        };
-        const FactorComparison factor_comparisons[] = {
-            {"halfka.sum_v", incremental_factors.halfka.sum_v,
-             full_factors.halfka.sum_v},
-            {"halfka.sum_v2", incremental_factors.halfka.sum_v2,
-             full_factors.halfka.sum_v2},
-            {"ksdg.sum_v", incremental_factors.ksdg.sum_v,
-             full_factors.ksdg.sum_v},
-            {"ksdg.sum_v2", incremental_factors.ksdg.sum_v2,
-             full_factors.ksdg.sum_v2},
-        };
-
-        for (const auto& comparison : factor_comparisons) {
-          for (std::size_t index = 0; index < 32; ++index) {
-            const std::int64_t incremental_value = comparison.incremental_values[index];
-            const std::int64_t full_value = comparison.full_values[index];
-            if (incremental_value != full_value) {
-              print_value_failure(game, ply, move, perspective, comparison.target,
-                                  index, incremental_value, full_value, 0, false);
-              std::cout << "failed." << std::endl;
-              return;
-            }
-          }
-        }
+      // compute_eval(pos) follows the configured refresh policy and can use
+      // Finny. The test oracle must explicitly invoke the true scratch path.
+      feature_transformer->TestRefreshAccumulatorFromScratch(pos);
+      if (!current->accumulator.computed_accumulation) {
+        print_state_failure(game, ply, "scratch refresh did not compute accumulator", &move);
+        std::cout << "failed." << std::endl;
+        return;
       }
+      const Accumulator scratch = current->accumulator;
+
+      if (!compare_accumulators(incremental, scratch, "incremental", "scratch",
+                                game, ply, move)) {
+        std::cout << "failed." << std::endl;
+        return;
+      }
+#if defined(USE_FINNY_TABLES)
+      if (!compare_accumulators(finny, scratch, "Finny", "scratch",
+                                game, ply, move)) {
+        std::cout << "failed." << std::endl;
+        return;
+      }
+#endif
     }
 
     pos.set_hirate(&si);
@@ -917,6 +956,215 @@ void TestFeatureTransformerBenchmark(const std::uint64_t repeat_count) {
             << "  checksum                    : 0x" << std::hex << checksum
             << std::dec << std::endl;
 }
+
+#if defined(USE_FINNY_TABLES)
+enum class FinnyBenchOperation {
+  Cold,
+  Warm,
+  Scratch,
+};
+
+std::uint64_t CountAccumulatorMismatches(const Accumulator& left,
+                                         const Accumulator& right) {
+  std::uint64_t mismatches = 0;
+  for (const Color perspective : {BLACK, WHITE}) {
+    for (std::size_t trigger = 0; trigger < kRefreshTriggers.size(); ++trigger)
+      for (IndexType index = 0; index < kTransformedFeatureDimensions; ++index)
+        mismatches += left.accumulation[perspective][trigger][index]
+                    != right.accumulation[perspective][trigger][index];
+
+    const auto& left_factors = left.factors[perspective];
+    const auto& right_factors = right.factors[perspective];
+    for (IndexType index = 0; index < 32; ++index) {
+      mismatches += left_factors.halfka.sum_v[index]
+                  != right_factors.halfka.sum_v[index];
+      mismatches += left_factors.halfka.sum_v2[index]
+                  != right_factors.halfka.sum_v2[index];
+      mismatches += left_factors.ksdg.sum_v[index]
+                  != right_factors.ksdg.sum_v[index];
+      mismatches += left_factors.ksdg.sum_v2[index]
+                  != right_factors.ksdg.sum_v2[index];
+    }
+  }
+  return mismatches;
+}
+
+NnueBenchTiming RunFinnyBenchmarkPass(
+    const FinnyBenchOperation operation, const std::uint64_t num_games,
+    FeatureTransformer::BenchmarkFinnyStatistics* const statistics,
+    std::uint64_t& checksum) {
+  Position pos;
+  StateInfo root_state;
+  std::vector<StateInfo> states(kNnueBenchMaxPly);
+  PRNG prng(kNnueBenchSeed);
+  NnueBenchTiming timing;
+
+  for (std::uint64_t game = 0; game < num_games; ++game) {
+    pos.set_hirate(&root_state);
+    for (int ply = 0; ply < kNnueBenchMaxPly; ++ply) {
+      MoveList<LEGAL_ALL> moves(pos);
+      if (moves.size() == 0)
+        break;
+      const Move move = moves.begin()[prng.rand(moves.size())];
+      pos.do_move(move, states[ply]);
+
+      // Cache invalidation is deliberately outside the timed interval. Cold
+      // measures one uninitialized-entry refresh, not clearing all 162 entries.
+      if (operation == FinnyBenchOperation::Cold)
+        feature_transformer->BenchmarkResetFinnyCache();
+
+      const auto begin = NnueBenchClock::now();
+      if (operation == FinnyBenchOperation::Scratch)
+        feature_transformer->BenchmarkRefreshAccumulatorFromScratch(pos);
+      else
+        feature_transformer->BenchmarkRefreshAccumulatorWithFinny(pos, statistics);
+      const auto end = NnueBenchClock::now();
+
+      timing.nanoseconds +=
+          std::chrono::duration<double, std::nano>(end - begin).count();
+      ++timing.calls;
+      ChecksumAccumulator(pos, checksum);
+    }
+  }
+  return timing;
+}
+
+std::uint64_t ValidateFinnyAgainstScratch(const bool cold_each_position,
+                                          std::uint64_t& finny_checksum,
+                                          std::uint64_t& scratch_checksum) {
+  Position pos;
+  StateInfo root_state;
+  std::vector<StateInfo> states(kNnueBenchMaxPly);
+  PRNG prng(kNnueBenchSeed);
+  std::uint64_t mismatches = 0;
+  feature_transformer->BenchmarkResetFinnyCache();
+
+  for (std::uint64_t game = 0; game < kNnueBenchMeasuredGames; ++game) {
+    pos.set_hirate(&root_state);
+    for (int ply = 0; ply < kNnueBenchMaxPly; ++ply) {
+      MoveList<LEGAL_ALL> moves(pos);
+      if (moves.size() == 0)
+        break;
+      const Move move = moves.begin()[prng.rand(moves.size())];
+      pos.do_move(move, states[ply]);
+
+      if (cold_each_position)
+        feature_transformer->BenchmarkResetFinnyCache();
+      feature_transformer->BenchmarkRefreshAccumulatorWithFinny(pos, nullptr);
+      const Accumulator finny = pos.state()->accumulator;
+      ChecksumAccumulator(pos, finny_checksum);
+
+      feature_transformer->BenchmarkRefreshAccumulatorFromScratch(pos);
+      const Accumulator scratch = pos.state()->accumulator;
+      ChecksumAccumulator(pos, scratch_checksum);
+      mismatches += CountAccumulatorMismatches(finny, scratch);
+    }
+  }
+  return mismatches;
+}
+
+void PrintFinnyStatistics(
+    const char* const name,
+    const FeatureTransformer::BenchmarkFinnyStatistics& statistics) {
+  std::cout << name << std::endl
+            << "  cache hits       : " << statistics.hits << std::endl
+            << "  cache misses     : " << statistics.misses << std::endl
+            << "  removed features : " << statistics.removed_features << std::endl
+            << "  added features   : " << statistics.added_features << std::endl;
+}
+
+void TestFinnyBenchmarkCompare(const std::uint64_t repeat_count) {
+  std::cout << "[NNUE benchmark: Finny / scratch refresh comparison]" << std::endl
+            << "  seed              : " << kNnueBenchSeed << std::endl
+            << "  warm-up games     : " << kNnueBenchWarmupGames << std::endl
+            << "  measured games    : " << kNnueBenchMeasuredGames << std::endl
+            << "  max ply/game      : " << kNnueBenchMaxPly << std::endl
+            << "  repeats           : " << repeat_count << std::endl
+            << "  order             : cold/warm/scratch rotated per repeat" << std::endl
+            << "  Finny entries     : "
+            << FeatureTransformer::BenchmarkFinnyEntryCount() << std::endl
+            << "  FinnyEntry bytes  : "
+            << FeatureTransformer::BenchmarkFinnyEntrySize() << std::endl
+            << "  FinnyCache bytes/thread: "
+            << FeatureTransformer::BenchmarkFinnyCacheSize() << std::endl;
+
+  NnueBenchSamples samples[3];
+  std::uint64_t timing_checksums[3] = {
+      UINT64_C(14695981039346656037), UINT64_C(14695981039346656037),
+      UINT64_C(14695981039346656037)};
+  FeatureTransformer::BenchmarkFinnyStatistics cold_statistics;
+  FeatureTransformer::BenchmarkFinnyStatistics warm_statistics;
+  const FinnyBenchOperation operations[3] = {
+      FinnyBenchOperation::Cold, FinnyBenchOperation::Warm,
+      FinnyBenchOperation::Scratch};
+
+  for (std::uint64_t repeat = 0; repeat < repeat_count; ++repeat) {
+    for (std::size_t offset = 0; offset < 3; ++offset) {
+      const std::size_t operation_index = (repeat + offset) % 3;
+      const auto operation = operations[operation_index];
+      std::uint64_t warmup_checksum = UINT64_C(14695981039346656037);
+      feature_transformer->BenchmarkResetFinnyCache();
+      RunFinnyBenchmarkPass(operation, kNnueBenchWarmupGames, nullptr,
+                            warmup_checksum);
+
+      // A warm measurement starts after an untimed production-shaped pass.
+      if (operation == FinnyBenchOperation::Warm) {
+        feature_transformer->BenchmarkResetFinnyCache();
+        RunFinnyBenchmarkPass(operation, kNnueBenchMeasuredGames, nullptr,
+                              warmup_checksum);
+      }
+
+      auto* statistics = repeat == 0
+          ? (operation == FinnyBenchOperation::Cold
+                 ? &cold_statistics
+                 : operation == FinnyBenchOperation::Warm
+                       ? &warm_statistics
+                       : nullptr)
+          : nullptr;
+      samples[operation_index].Add(RunFinnyBenchmarkPass(
+          operation, kNnueBenchMeasuredGames, statistics,
+          timing_checksums[operation_index]));
+    }
+  }
+
+  PrintNnueBenchSamples("cold Finny", samples[0]);
+  PrintNnueBenchSamples("warm Finny", samples[1]);
+  PrintNnueBenchSamples("true scratch refresh", samples[2]);
+  PrintFinnyStatistics("[cold Finny statistics]", cold_statistics);
+  PrintFinnyStatistics("[warm Finny statistics]", warm_statistics);
+
+  std::uint64_t cold_checksum = UINT64_C(14695981039346656037);
+  std::uint64_t cold_scratch_checksum = UINT64_C(14695981039346656037);
+  const std::uint64_t cold_mismatches = ValidateFinnyAgainstScratch(
+      true, cold_checksum, cold_scratch_checksum);
+  std::uint64_t warm_checksum = UINT64_C(14695981039346656037);
+  std::uint64_t warm_scratch_checksum = UINT64_C(14695981039346656037);
+  const std::uint64_t warm_mismatches = ValidateFinnyAgainstScratch(
+      false, warm_checksum, warm_scratch_checksum);
+
+  std::cout << "[correctness]" << std::endl
+            << "  cold Finny checksum   : 0x" << std::hex << cold_checksum
+            << std::endl
+            << "  cold scratch checksum : 0x" << cold_scratch_checksum
+            << std::endl
+            << "  cold mismatch count   : " << std::dec << cold_mismatches
+            << std::endl
+            << "  warm Finny checksum   : 0x" << std::hex << warm_checksum
+            << std::endl
+            << "  warm scratch checksum : 0x" << warm_scratch_checksum
+            << std::endl
+            << "  warm mismatch count   : " << std::dec << warm_mismatches
+            << std::endl
+            << "[timing checksums]" << std::endl
+            << "  cold   : 0x" << std::hex << timing_checksums[0] << std::endl
+            << "  warm   : 0x" << timing_checksums[1] << std::endl
+            << "  scratch: 0x" << timing_checksums[2] << std::dec << std::endl
+            << "  timing checksum match: "
+            << (timing_checksums[0] == timing_checksums[1]
+                    && timing_checksums[0] == timing_checksums[2]
+                ? "yes" : "NO") << std::endl;
+}
+#endif
 
 enum class FtTransformStageOperation {
   MainPairAndPacking,
@@ -6500,6 +6748,12 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::uint64_t repeat_count;
     if (ReadNnueBenchRepeatCount(stream, repeat_count))
       TestFeatureTransformerBenchmark(repeat_count);
+#if defined(USE_FINNY_TABLES)
+  } else if (sub_command == "bench_finny_compare") {
+    std::uint64_t repeat_count;
+    if (ReadNnueBenchRepeatCount(stream, repeat_count))
+      TestFinnyBenchmarkCompare(repeat_count);
+#endif
   } else if (sub_command == "bench_ft_transform_stages") {
     std::uint64_t repeat_count;
     if (ReadNnueBenchRepeatCount(stream, repeat_count))
@@ -6571,6 +6825,9 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << " test nnue info [path/to/" << kFileName << "...]" << std::endl;
 #if defined(ENABLE_NNUE_BENCH)
     std::cout << " test nnue bench_ft [repeats]" << std::endl;
+#if defined(USE_FINNY_TABLES)
+    std::cout << " test nnue bench_finny_compare [repeats]" << std::endl;
+#endif
     std::cout << " test nnue bench_ft_transform_stages [repeats]"
               << std::endl;
 #if defined(USE_AVX2)
