@@ -376,6 +376,9 @@
 // #define ENABLE_NNUE_TRACE       // trace_fullなどのNNUE詳細trace
 // #define ENABLE_NNUE_BENCH       // test nnue bench_* の専用benchmark
 // #define ENABLE_NNUE_SIGNAL_LOG  // 探索中のNNUE内部signal収集・report
+// #define ENABLE_NNUE_RFP_SHADOW  // 成立したreverse futilityの一部をshadow探索
+// #define USE_NNUE_PHASE_FM_LMR   // Router非対象の高評価・低FM relianceを明示的に+1 ply
+// #define DISABLE_NNUE_LCA_LMR    // 295/epoch20用LCA top-1% LMRを比較時に無効化
 //
 // ENABLE_NNUE_ROUTER_LMR_EXPERIMENTはENABLE_NNUE_SIGNAL_LOGを必要とするため、
 // 下の既定設定でsignal log有効時に自動定義する。ここでは直接定義しない。
@@ -412,6 +415,26 @@
 		#define ENABLE_NNUE_ROUTER_LMR_EXPERIMENT
 	#else
 		#define USE_NNUE_ROUTER_LMR
+	#endif
+#endif
+
+// SFNNwoP1536の通常buildでは、295/epoch20で校正したLCA top-1% signalも
+// Router-LMRと重複しないmoveへ使用する。診断logger側は専用experiment実装を
+// 使用するため、loggerなしのproduction相当buildだけを既定ONにする。
+// 別networkではtop-1%境界が異なるので、比較・再校正時は
+// DISABLE_NNUE_LCA_LMRを定義して無効化する。
+#if defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536) \
+	&& !defined(ENABLE_NNUE_SIGNAL_LOG) \
+	&& !defined(DISABLE_NNUE_LCA_LMR)
+	#define USE_NNUE_LCA_LMR
+#endif
+
+#if defined(USE_NNUE_LCA_LMR)
+	#if !defined(USE_NNUE_ROUTER_LMR)
+		#error "USE_NNUE_LCA_LMR requires USE_NNUE_ROUTER_LMR"
+	#endif
+	#ifndef NNUE_LCA_LMR_SUM_THRESHOLD
+		#define NNUE_LCA_LMR_SUM_THRESHOLD 1897
 	#endif
 #endif
 

@@ -18,6 +18,14 @@ namespace YaneuraOu::Eval::NNUE {
 // phase/deep/bypass fields, counters, and report machinery in match binaries.
 struct NnueRouterLmrSignal {
     std::int32_t router_margin = 0;
+#if defined(USE_NNUE_LCA_LMR)
+    // Exact sum of the absolute byte-domain LCA correction over 32 channels.
+    // The 295/epoch20 top-1% experiment compares this integer directly.
+    std::int32_t lca_abs_delta_sum = 0;
+#endif
+#if defined(USE_NNUE_PHASE_FM_LMR)
+    float fm_reliance = 0.0f;
+#endif
     bool valid = false;
 };
 
@@ -48,6 +56,9 @@ struct NnueSignalSnapshot {
     float main_reliance = 0.0f;
     float fm_reliance = 0.0f;
     float cross_reliance = 0.0f;
+    float lca_mean_abs_delta = 0.0f;
+    std::int32_t lca_max_abs_delta = 0;
+    std::int32_t lca_abs_delta_sum = 0;
     bool valid = false;
 };
 

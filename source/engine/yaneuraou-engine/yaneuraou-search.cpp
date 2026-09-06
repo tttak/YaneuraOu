@@ -55,6 +55,15 @@
 #if !defined(ENABLE_NNUE_SIGNAL_LOG)
 #error "ENABLE_NNUE_ROUTER_LMR_EXPERIMENT requires ENABLE_NNUE_SIGNAL_LOG"
 #endif
+
+#if defined(USE_NNUE_PHASE_FM_LMR) && !defined(USE_NNUE_ROUTER_LMR) \
+    && !defined(ENABLE_NNUE_SIGNAL_LOG)
+#error "USE_NNUE_PHASE_FM_LMR requires USE_NNUE_ROUTER_LMR or ENABLE_NNUE_SIGNAL_LOG"
+#endif
+#endif
+
+#if defined(ENABLE_NNUE_RFP_SHADOW) && !defined(ENABLE_NNUE_SIGNAL_LOG)
+#error "ENABLE_NNUE_RFP_SHADOW requires ENABLE_NNUE_SIGNAL_LOG"
 #endif
 
 namespace YaneuraOu {
@@ -2963,7 +2972,16 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
             nnueSignalObservation.MarkFutilityPruned();
 #endif
+#if defined(ENABLE_NNUE_RFP_SHADOW)
+            // Diagnostic-only verification: most candidates retain the normal
+            // immediate RFP return. A deterministic low-rate sample continues
+            // through the unmodified remainder of search(), and NodeObservation
+            // compares that node's eventual return with the original beta.
+            if (!nnueSignalObservation.SelectReverseFutilityShadowSample())
+                return NNUE_SIGNAL_RETURN((2 * beta + eval) / 3);
+#else
             return NNUE_SIGNAL_RETURN((2 * beta + eval) / 3);
+#endif
         }
     }
 
@@ -3707,9 +3725,24 @@ moves_loop:  // When in check, search starts here
 #if defined(USE_NNUE_ROUTER_LMR) && !defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)
         bool nnueRouterLmrWouldAdjust = false;
 #endif
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+        bool nnuePhaseFmLmrOutcomePending = false;
+        bool nnuePhaseFmLmrRouterAdjusted = false;
+        bool nnuePhaseFmLmrCandidate = false;
+        bool nnuePhaseFmLmrAdjusted = false;
+        bool nnuePhaseFmLmrReducedFailHigh = false;
+        bool nnuePhaseFmLmrWasResearched = false;
+        Value nnuePhaseFmLmrReducedValue = VALUE_ZERO;
+        bool nnueLcaLmrCandidate = false;
+        bool nnueLcaLmrAdjusted = false;
+#endif
 
         if (depth >= 2 && moveCount > 1)
         {
+#if defined(ENABLE_NNUE_SIGNAL_LOG) || defined(USE_NNUE_PHASE_FM_LMR) \
+ || defined(USE_NNUE_LCA_LMR)
+            bool nnueRouterLmrActuallyAdjusted = false;
+#endif
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
             nnueSignalObservation.MarkLmr();
             bool nnueSignalLmrResearched = false;
@@ -3795,19 +3828,89 @@ moves_loop:  // When in check, search starts here
                 // this experimental move receives the extra ply.
                 ++d;
                 nnueRouterLmrAdjusted = true;
+#if defined(ENABLE_NNUE_SIGNAL_LOG) || defined(USE_NNUE_PHASE_FM_LMR) \
+ || defined(USE_NNUE_LCA_LMR)
+                nnueRouterLmrActuallyAdjusted = true;
+#endif
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+                nnuePhaseFmLmrRouterAdjusted = true;
+#endif
                 nnueRouterLmrCandidateDepthIncrease =
                   static_cast<int>(d - nnueRouterLmrOriginalDepth);
             }
 #elif defined(USE_NNUE_ROUTER_LMR)
-            if (nnueRouterLmrWouldAdjust && d < newDepth)
+            if (nnueRouterLmrWouldAdjust && d < newDepth) {
                 // Only weaken an existing positive reduction.  A zero reduction
                 // can never become an extension.
                 ++d;
+#if defined(ENABLE_NNUE_SIGNAL_LOG) || defined(USE_NNUE_PHASE_FM_LMR) \
+ || defined(USE_NNUE_LCA_LMR)
+                nnueRouterLmrActuallyAdjusted = true;
+#endif
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+                nnuePhaseFmLmrRouterAdjusted = true;
+#endif
+            }
+#endif
+
+#if defined(USE_NNUE_LCA_LMR) && !defined(ENABLE_NNUE_SIGNAL_LOG)
+            // 295/epoch20 calibration: top-1% mean delta 59.28125 is the
+            // exact byte-domain sum 1897 over 32 Diff channels.  Router moves
+            // already deepened by one ply are excluded.  Requiring d < newDepth
+            // ensures that a zero reduction can never become an extension.
+            if (!nnueRouterLmrActuallyAdjusted && nnueRouterLmrSignal.valid
+                && nnueRouterLmrSignal.lca_abs_delta_sum >= NNUE_LCA_LMR_SUM_THRESHOLD
+                && d < newDepth)
+                ++d;
+#endif
+
+#if defined(ENABLE_NNUE_SIGNAL_LOG) && defined(ENABLE_NNUE_LCA_LMR_EXPERIMENT)
+            if (const auto* signal = nnueSignalObservation.Signal()) {
+                // 295/epoch20 calibration: top-1% mean delta 59.28125 is the
+                // exact byte-domain sum 1897 over 32 Diff channels.  Exclude
+                // moves already deepened by Router-LMR, and require d < newDepth
+                // so a zero reduction can never be turned into an extension.
+                nnueLcaLmrCandidate = !nnueRouterLmrActuallyAdjusted
+                  && signal->lca_abs_delta_sum >= NNUE_LCA_LMR_SUM_THRESHOLD
+                  && d < newDepth;
+                if (NNUE_LCA_LMR_VARIANT == 1 && nnueLcaLmrCandidate) {
+                    ++d;
+                    nnueLcaLmrAdjusted = true;
+                }
+            }
+#endif
+
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+            if (const auto* signal = nnueSignalObservation.Signal())
+                nnuePhaseFmLmrCandidate = !nnueRouterLmrActuallyAdjusted
+                  && !nnueLcaLmrAdjusted
+                  && ss->staticEval >= 1200 && signal->fm_reliance < 1.625f;
+#endif
+#if defined(USE_NNUE_PHASE_FM_LMR)
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+            const bool nnuePhaseFmHighRisk = nnuePhaseFmLmrCandidate;
+#else
+            const bool nnuePhaseFmHighRisk = !nnueRouterLmrActuallyAdjusted
+              && nnueRouterLmrSignal.valid && ss->staticEval >= 1200
+              && nnueRouterLmrSignal.fm_reliance < 1.625f;
+#endif
+            if (nnuePhaseFmHighRisk && d < newDepth) {
+                // Weaken only an existing positive reduction.  Never turn a
+                // zero reduction into an extension.
+                ++d;
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+                nnuePhaseFmLmrAdjusted = true;
+#endif
+            }
 #endif
 
             ss->reduction = newDepth - d;
             value         = -search<NonPV>(pos, ss + 1, -(alpha + 1), -alpha, d, true);
             ss->reduction = 0;
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+            nnuePhaseFmLmrReducedFailHigh = value > alpha;
+            nnuePhaseFmLmrReducedValue = value;
+#endif
 #if defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)
             nnueRouterLmrOutcomePending = nnueRouterLmrWouldAdjust;
             nnueRouterLmrReducedFailHigh = value > alpha;
@@ -3836,6 +3939,7 @@ moves_loop:  // When in check, search starts here
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
                     nnueSignalObservation.MarkLmrResearch();
                     nnueSignalLmrResearched = true;
+                    nnuePhaseFmLmrWasResearched = true;
 #if defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)
                     nnueRouterLmrWasResearched = true;
 #endif
@@ -3852,6 +3956,7 @@ moves_loop:  // When in check, search starts here
                 newDepth--;
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
             nnueSignalObservation.RecordLmrEvent(moveCount, nnueSignalLmrResearched);
+            nnuePhaseFmLmrOutcomePending = true;
 #endif
 #if defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)
             nnueSignalObservation.RecordRouterLmrExperiment(
@@ -4047,6 +4152,20 @@ moves_loop:  // When in check, search starts here
 
         int inc = (value == bestValue && ss->ply + 2 >= rootDepth && (int(nodes) & 14) == 0
                    && !is_win(std::abs(value) + 1));
+
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+        if (nnuePhaseFmLmrOutcomePending) {
+            const bool finalCutoff = value + inc > bestValue && value + inc > alpha
+                                  && value >= beta;
+            nnueSignalObservation.RecordPhaseFmLmrOutcome(
+              depth, moveCount, nnuePhaseFmLmrRouterAdjusted,
+              nnuePhaseFmLmrReducedFailHigh, nnuePhaseFmLmrWasResearched,
+              static_cast<int>(nnuePhaseFmLmrReducedValue), static_cast<int>(value),
+              value >= beta, finalCutoff, nnuePhaseFmLmrCandidate,
+              nnuePhaseFmLmrAdjusted, nnueLcaLmrCandidate,
+              nnueLcaLmrAdjusted);
+        }
+#endif
 
 #if defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)
         if (nnueRouterLmrOutcomePending) {

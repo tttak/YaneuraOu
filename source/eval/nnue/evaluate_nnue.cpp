@@ -556,6 +556,10 @@ namespace {
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
           , &signal
 #endif
+#if (defined(USE_NNUE_PHASE_FM_LMR) || defined(USE_NNUE_LCA_LMR)) \
+          && !defined(ENABLE_NNUE_SIGNAL_LOG)
+          , &router_lmr_signal
+#endif
         );
 
 

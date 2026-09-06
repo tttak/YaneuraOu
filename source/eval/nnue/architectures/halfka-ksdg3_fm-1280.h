@@ -412,6 +412,10 @@ struct Network {
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
 		, NnueSignalSnapshot* signal = nullptr
 #endif
+#if (defined(USE_NNUE_PHASE_FM_LMR) || defined(USE_NNUE_LCA_LMR)) \
+	&& !defined(ENABLE_NNUE_SIGNAL_LOG)
+		, NnueRouterLmrSignal* lmr_signal = nullptr
+#endif
 	) const {
 		auto& buf = *reinterpret_cast<Buffer*>(buffer);
 
@@ -462,6 +466,10 @@ struct Network {
 			signal->fm_reliance = diff_scale + abs_raw_scale + abs_sqr_scale;
 			signal->cross_reliance = cross_scale;
 		}
+#endif
+#if defined(USE_NNUE_PHASE_FM_LMR) && !defined(ENABLE_NNUE_SIGNAL_LOG)
+		if (lmr_signal)
+			lmr_signal->fm_reliance = diff_scale + abs_raw_scale + abs_sqr_scale;
 #endif
 
 
@@ -534,13 +542,41 @@ struct Network {
 		float att_score = 1.0f / (1.0f + std::exp(-att_logit));
 
 		// アテンションスコアに基づき、FM Diff Path の情報を動的に書き換え (Attention Blend)
+#if defined(ENABLE_NNUE_SIGNAL_LOG) || defined(USE_NNUE_LCA_LMR)
+		int lca_abs_delta_sum = 0;
+#endif
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+		int lca_abs_delta_max = 0;
+#endif
 		for (int j = 0; j < 32; ++j) {
+#if defined(ENABLE_NNUE_SIGNAL_LOG) || defined(USE_NNUE_LCA_LMR)
+			const int diff_before_lca = buf.diff_ac_out[j];
+#endif
 			float current_diff = static_cast<float>(buf.diff_ac_out[j]) / 127.0f;
 			float v_val = static_cast<float>(buf.lca_v_out[j]) / 8128.0f;
 			float v_clamped = std::max(0.0f, std::min(1.0f, v_val * 0.4f + 0.5f));
 			float final_diff_f = current_diff * (1.0f - att_score) + v_clamped * att_score;
 			buf.diff_ac_out[j] = static_cast<uint8_t>(final_diff_f * 127.0f);
+#if defined(ENABLE_NNUE_SIGNAL_LOG) || defined(USE_NNUE_LCA_LMR)
+			const int lca_abs_delta = std::abs(static_cast<int>(buf.diff_ac_out[j])
+			                                   - diff_before_lca);
+			lca_abs_delta_sum += lca_abs_delta;
+#endif
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+			lca_abs_delta_max = std::max(lca_abs_delta_max, lca_abs_delta);
+#endif
 		}
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+		if (signal) {
+			signal->lca_mean_abs_delta = static_cast<float>(lca_abs_delta_sum) / 32.0f;
+			signal->lca_max_abs_delta = lca_abs_delta_max;
+			signal->lca_abs_delta_sum = lca_abs_delta_sum;
+		}
+#endif
+#if defined(USE_NNUE_LCA_LMR) && !defined(ENABLE_NNUE_SIGNAL_LOG)
+		if (lmr_signal)
+			lmr_signal->lca_abs_delta_sum = lca_abs_delta_sum;
+#endif
 
 
 		// --- 5. Cross Feature: 異種パス間の積による相関特徴の生成 ---

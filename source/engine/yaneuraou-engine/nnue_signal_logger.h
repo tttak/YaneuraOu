@@ -10,16 +10,42 @@
 
 #if defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)
 #ifndef NNUE_ROUTER_LMR_VARIANT
-#define NNUE_ROUTER_LMR_VARIANT 2
+#define NNUE_ROUTER_LMR_VARIANT 3
 #endif
 #ifndef NNUE_ROUTER_LMR_MARGIN_THRESHOLD
-#define NNUE_ROUTER_LMR_MARGIN_THRESHOLD 1024
+#define NNUE_ROUTER_LMR_MARGIN_THRESHOLD 256
 #endif
 #ifndef NNUE_ROUTER_LMR_REDUCTION_DELTA
 #define NNUE_ROUTER_LMR_REDUCTION_DELTA 256
 #endif
 #if NNUE_ROUTER_LMR_VARIANT < 0 || NNUE_ROUTER_LMR_VARIANT > 3
 #error "NNUE_ROUTER_LMR_VARIANT must be 0 (current), 1/2 (fixed-point delta), or 3 (explicit +1 ply)"
+#endif
+#endif
+
+#if defined(ENABLE_NNUE_LCA_LMR_EXPERIMENT)
+#ifndef NNUE_LCA_LMR_VARIANT
+#define NNUE_LCA_LMR_VARIANT 0
+#endif
+#ifndef NNUE_LCA_LMR_SUM_THRESHOLD
+// 295/epoch20 top-1% cutoff: mean 59.28125 == exact delta sum 1897 / 32.
+#define NNUE_LCA_LMR_SUM_THRESHOLD 1897
+#endif
+#if NNUE_LCA_LMR_VARIANT < 0 || NNUE_LCA_LMR_VARIANT > 1
+#error "NNUE_LCA_LMR_VARIANT must be 0 (shadow current) or 1 (explicit +1 ply)"
+#endif
+#if NNUE_LCA_LMR_SUM_THRESHOLD < 0 || NNUE_LCA_LMR_SUM_THRESHOLD > 4064
+#error "NNUE_LCA_LMR_SUM_THRESHOLD must be in [0, 4064]"
+#endif
+#endif
+
+#if defined(ENABLE_NNUE_RFP_SHADOW)
+#ifndef NNUE_RFP_SHADOW_SAMPLE_SHIFT
+// Shadow one out of every 256 signal-valid reverse-futility cut candidates.
+#define NNUE_RFP_SHADOW_SAMPLE_SHIFT 8
+#endif
+#if NNUE_RFP_SHADOW_SAMPLE_SHIFT < 0 || NNUE_RFP_SHADOW_SAMPLE_SHIFT > 20
+#error "NNUE_RFP_SHADOW_SAMPLE_SHIFT must be in [0, 20]"
 #endif
 #endif
 
@@ -47,6 +73,21 @@ constexpr std::size_t kSignalBins = 24;
 constexpr std::size_t kErrorBins = 73;  // exact 0..63, followed by powers of two
 constexpr std::size_t kConditionBins = 5;
 constexpr std::size_t kBucketCount = 12;
+constexpr std::size_t kFmRelianceGroups = 3;
+constexpr std::size_t kFmRelianceFineGroups = 5;
+constexpr std::size_t kRouterMarginGroups = 2;
+constexpr std::size_t kLcaMeanDeltaBins = 10;
+constexpr std::size_t kLcaMaxDeltaBins = 9;
+constexpr std::size_t kLcaMagnitudeGroups = 4;
+constexpr std::size_t kLcaThresholdCount = 5;
+constexpr std::array<float, kLcaThresholdCount> kLcaThresholds = {
+  16.0f, 24.0f, 32.0f, 48.0f, 64.0f};
+constexpr std::size_t kLcaDeltaSumMax = 32 * 127;
+constexpr std::size_t kLcaPercentileCount = 5;
+constexpr std::array<std::uint32_t, kLcaPercentileCount> kLcaTopBasisPoints = {
+  100, 250, 500, 1000, 2000};
+constexpr std::size_t kFmJointBaseStrata =
+  kConditionBins * kConditionBins * kBucketCount * kConditionBins * kRouterMarginGroups;
 
 struct CoverageCell {
     std::uint64_t nodes = 0;
@@ -107,9 +148,73 @@ struct FutilityConditionalBucket {
     std::uint64_t fail_low = 0;
 };
 
+#if defined(ENABLE_NNUE_RFP_SHADOW)
+struct ReverseFutilityShadowBucket {
+    std::uint64_t rfp_conditions = 0;
+    std::uint64_t shadow_samples = 0;
+    std::uint64_t completed_samples = 0;
+    std::uint64_t correct_cuts = 0;
+    std::uint64_t wrong_cuts = 0;
+    std::int64_t result_minus_beta_sum = 0;
+    std::int64_t result_minus_static_sum = 0;
+    std::int64_t result_minus_beta_min = std::numeric_limits<std::int64_t>::max();
+    std::int64_t result_minus_beta_max = std::numeric_limits<std::int64_t>::lowest();
+    std::int64_t result_minus_static_min = std::numeric_limits<std::int64_t>::max();
+    std::int64_t result_minus_static_max = std::numeric_limits<std::int64_t>::lowest();
+};
+#endif
+
 struct LmrConditionalBucket {
     std::uint64_t events = 0;
     std::uint64_t researches = 0;
+};
+
+// Per-move LMR outcomes used only by signal diagnostics.  Unlike the older
+// node-level LMR table, these counters follow one reduced move through an
+// optional re-search and the final beta/cutoff decision.
+struct PhaseFmLmrBucket {
+    std::uint64_t moves = 0;
+    std::uint64_t reduced_fail_highs = 0;
+    std::uint64_t researches = 0;
+    std::uint64_t beta_exceeded = 0;
+    std::uint64_t final_cutoffs = 0;
+    std::uint64_t research_score_samples = 0;
+    std::uint64_t research_score_abs_delta_sum = 0;
+    std::uint64_t research_score_abs_delta_max = 0;
+};
+
+// Counterfactual LCA cohorts. These are diagnostic-only observations of moves
+// which production Router-LMR did not actually deepen; they never affect d/r.
+struct LcaThresholdCohortStats {
+    PhaseFmLmrBucket total{};
+    std::array<PhaseFmLmrBucket, kConditionBins> by_depth{};
+    std::array<PhaseFmLmrBucket, kConditionBins> by_move_count{};
+    std::array<PhaseFmLmrBucket, kBucketCount> by_bucket{};
+    std::array<PhaseFmLmrBucket, kConditionBins> by_static_eval{};
+    std::array<PhaseFmLmrBucket, kRouterMarginGroups> by_router_margin{};
+};
+
+struct PhaseFmLmrExperimentStats {
+    std::uint64_t candidate_moves = 0;
+    std::uint64_t adjusted_moves = 0;
+    PhaseFmLmrBucket candidate_outcomes{};
+    PhaseFmLmrBucket adjusted_outcomes{};
+    std::array<std::uint64_t, kBucketCount> adjusted_by_bucket{};
+    std::array<std::uint64_t, kConditionBins> adjusted_by_depth{};
+    std::array<std::uint64_t, kConditionBins> adjusted_by_move_count{};
+};
+
+struct LcaLmrExperimentStats {
+    PhaseFmLmrBucket candidate_outcomes{};
+    PhaseFmLmrBucket adjusted_outcomes{};
+    std::array<PhaseFmLmrBucket, kBucketCount> candidate_by_bucket{};
+    std::array<PhaseFmLmrBucket, kConditionBins> candidate_by_depth{};
+    std::array<PhaseFmLmrBucket, kConditionBins> candidate_by_move_count{};
+    std::array<PhaseFmLmrBucket, kConditionBins> candidate_by_static_eval{};
+    std::array<PhaseFmLmrBucket, kBucketCount> adjusted_by_bucket{};
+    std::array<PhaseFmLmrBucket, kConditionBins> adjusted_by_depth{};
+    std::array<PhaseFmLmrBucket, kConditionBins> adjusted_by_move_count{};
+    std::array<PhaseFmLmrBucket, kConditionBins> adjusted_by_static_eval{};
 };
 
 #if defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)
@@ -175,7 +280,7 @@ struct ThreadStats {
     std::array<std::uint64_t, kSourceCount> source{};
     std::array<std::array<PredictionBucket, kSignalBins>, kSignalKinds> prediction{};
     std::array<CorrelationSums, kSignalKinds> correlation{};
-    std::array<BasicSummary, 17> raw_signal{};
+    std::array<BasicSummary, 19> raw_signal{};
     std::array<std::uint64_t, kBucketCount> selected_bucket{};
     std::array<SignedDirectionStats, 3> signed_direction{};  // negative, zero, positive
     CorrelationSums signed_deep_vs_signed_error{};
@@ -186,12 +291,79 @@ struct ThreadStats {
     std::array<std::array<PredictionBucket, kSignalBins>, kBucketCount>
       disagreement_by_bucket{};
     std::array<FutilityConditionalBucket, kSignalBins> futility_eligible{};
+#if defined(ENABLE_NNUE_RFP_SHADOW)
+    std::uint64_t rfp_conditions = 0;
+    std::uint64_t rfp_signal_valid_conditions = 0;
+    std::uint64_t rfp_shadow_sequence = 0;
+    std::array<ReverseFutilityShadowBucket, kSignalBins> rfp_shadow_by_disagreement{};
+    std::array<std::array<ReverseFutilityShadowBucket, kSignalBins>, kConditionBins>
+      rfp_shadow_by_static_eval{};
+#endif
     std::array<std::array<LmrConditionalBucket, kSignalBins>, kConditionBins>
       router_lmr_by_depth{};
     std::array<std::array<LmrConditionalBucket, kSignalBins>, kConditionBins>
       router_lmr_by_move_count{};
     std::array<std::array<LmrConditionalBucket, kSignalBins>, kBucketCount>
       router_lmr_by_bucket{};
+    std::uint64_t phase_fm_lmr_moves = 0;
+    std::uint64_t phase_fm_lmr_signal_valid_moves = 0;
+    std::array<PhaseFmLmrBucket, kSignalBins> phase_fm_lmr{};
+    std::array<std::array<PhaseFmLmrBucket, kSignalBins>, kConditionBins>
+      phase_fm_lmr_by_depth{};
+    std::array<std::array<PhaseFmLmrBucket, kSignalBins>, kConditionBins>
+      phase_fm_lmr_by_move_count{};
+    std::array<std::array<PhaseFmLmrBucket, kSignalBins>, kBucketCount>
+      phase_fm_lmr_by_bucket{};
+    std::array<std::array<PhaseFmLmrBucket, kSignalBins>, kConditionBins>
+      phase_fm_lmr_by_static_eval{};
+    std::array<std::array<PhaseFmLmrBucket, kFmRelianceGroups>, kRouterMarginGroups>
+      phase_fm_lmr_by_router_and_fm{};
+    // Flat index: (depth, moveCount, bucket, |staticEval|, router group, FM group).
+    std::array<PhaseFmLmrBucket, kFmJointBaseStrata * kFmRelianceGroups>
+      phase_fm_lmr_joint{};
+    // [actual Router +1 ply][fine FM reliance group].
+    std::array<std::array<PhaseFmLmrBucket, kFmRelianceFineGroups>, 2>
+      phase_fm_lmr_by_router_adjustment{};
+    // [actual Router +1 ply][|staticEval|][fine FM reliance group].
+    std::array<std::array<std::array<PhaseFmLmrBucket, kFmRelianceFineGroups>,
+                          kConditionBins>, 2>
+      phase_fm_lmr_by_router_adjustment_and_static{};
+    // [staticEval sign: >=+1200, <=-1200][fine FM reliance group].
+    // Only moves not actually deepened by production Router-LMR are recorded.
+    std::array<std::array<PhaseFmLmrBucket, kFmRelianceFineGroups>, 2>
+      phase_fm_lmr_extreme_by_sign{};
+    // [staticEval sign][fine FM reliance group][selected bucket].
+    std::array<std::array<std::array<PhaseFmLmrBucket, kBucketCount>,
+                          kFmRelianceFineGroups>, 2>
+      phase_fm_lmr_extreme_by_sign_and_bucket{};
+    PhaseFmLmrExperimentStats phase_fm_lmr_experiment{};
+    LcaLmrExperimentStats lca_lmr_experiment{};
+    std::uint64_t lca_lmr_moves = 0;
+    std::uint64_t lca_lmr_signal_valid_moves = 0;
+    PhaseFmLmrBucket lca_lmr_all_outcomes{};
+    std::array<PhaseFmLmrBucket, kLcaMeanDeltaBins> lca_lmr_by_mean_delta{};
+    std::array<PhaseFmLmrBucket, kLcaMaxDeltaBins> lca_lmr_by_max_delta{};
+    std::array<std::array<PhaseFmLmrBucket, kLcaMeanDeltaBins>, kConditionBins>
+      lca_lmr_by_depth{};
+    std::array<std::array<PhaseFmLmrBucket, kLcaMeanDeltaBins>, kConditionBins>
+      lca_lmr_by_move_count{};
+    std::array<std::array<PhaseFmLmrBucket, kLcaMeanDeltaBins>, kBucketCount>
+      lca_lmr_by_bucket{};
+    std::array<std::array<PhaseFmLmrBucket, kLcaMeanDeltaBins>, kConditionBins>
+      lca_lmr_by_static_eval{};
+    std::array<std::array<PhaseFmLmrBucket, kLcaMagnitudeGroups>, kRouterMarginGroups>
+      lca_lmr_by_router_and_magnitude{};
+    // Flat index: (depth, moveCount, bucket, |staticEval|, router group, LCA group).
+    std::array<PhaseFmLmrBucket, kFmJointBaseStrata * kLcaMagnitudeGroups>
+      lca_lmr_joint{};
+    std::array<LcaThresholdCohortStats, kLcaThresholdCount>
+      lca_non_router_thresholds{};
+    PhaseFmLmrBucket lca_non_router_all{};
+    // Exact byte-domain delta-sum histogram (mean = sum / 32).  This permits
+    // per-network percentile thresholds without feeding a calibrated value
+    // back into production search.
+    std::array<PhaseFmLmrBucket, kLcaDeltaSumMax + 1>
+      lca_non_router_by_delta_sum{};
     std::array<CorrelationSums, 4> control_correlation{};  // depth, |eval|, |material|, ply
     std::array<std::array<std::array<std::array<PhaseStratum, kConditionBins>,
                                      kConditionBins>,
@@ -291,6 +463,66 @@ inline std::size_t PhaseSignalBin(const float value) {
                                  kSignalBins - 1);
 }
 
+inline std::size_t LcaMeanDeltaBin(const float value) {
+    if (value <= 0.0f) return 0;
+    if (value < 0.25f) return 1;
+    if (value < 0.50f) return 2;
+    if (value < 1.00f) return 3;
+    if (value < 2.00f) return 4;
+    if (value < 4.00f) return 5;
+    if (value < 8.00f) return 6;
+    if (value < 16.0f) return 7;
+    if (value < 32.0f) return 8;
+    return 9;
+}
+
+inline std::size_t LcaMaxDeltaBin(const std::int32_t value) {
+    if (value <= 0) return 0;
+    if (value == 1) return 1;
+    if (value == 2) return 2;
+    if (value <= 4) return 3;
+    if (value <= 8) return 4;
+    if (value <= 16) return 5;
+    if (value <= 32) return 6;
+    if (value <= 64) return 7;
+    return 8;
+}
+
+inline std::size_t LcaMagnitudeGroup(const float value) {
+    if (value < 2.00f) return 0;
+    if (value < 8.00f) return 1;
+    if (value < 32.0f) return 2;
+    return 3;
+}
+
+inline std::size_t FmRelianceGroup(const float value) {
+    // Fixed, interpretable groups spanning the observed FM-reliance range.
+    // They are diagnostic only and never affect search decisions.
+    return value < 1.75f ? 0 : value < 2.0f ? 1 : 2;
+}
+
+inline std::size_t FmRelianceFineGroup(const float value) {
+    if (value < 1.50f) return 0;
+    if (value < 1.625f) return 1;
+    if (value < 1.75f) return 2;
+    if (value < 2.00f) return 3;
+    return 4;
+}
+
+inline std::size_t RouterMarginGroup(const std::int32_t margin) {
+    // Match the current conservative Router-LMR high-risk threshold.
+    return margin <= 256 ? 0 : 1;
+}
+
+inline std::size_t FmJointBaseIndex(const std::size_t depth_bin,
+                                    const std::size_t move_count_bin,
+                                    const std::size_t bucket,
+                                    const std::size_t static_eval_bin,
+                                    const std::size_t router_group) {
+    return (((depth_bin * kConditionBins + move_count_bin) * kBucketCount + bucket)
+             * kConditionBins + static_eval_bin) * kRouterMarginGroups + router_group;
+}
+
 inline double SignalNumericValue(const Eval::NNUE::NnueSignalSnapshot& signal,
                                  const std::size_t kind) {
     switch (kind) {
@@ -363,9 +595,35 @@ class NodeObservation {
 #if defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)
         stats.router_lmr_experiment.adjusted_nodes += router_lmr_node_adjusted_;
 #endif
+#if defined(ENABLE_NNUE_RFP_SHADOW)
+        if (reverse_futility_shadow_sampled_ && has_result_) {
+            const auto update_shadow_outcome = [&](ReverseFutilityShadowBucket& bucket) {
+                const auto beta_delta = static_cast<std::int64_t>(result_) - beta_;
+                const auto static_delta = static_cast<std::int64_t>(result_) - static_eval_;
+                ++bucket.completed_samples;
+                bucket.correct_cuts += result_ >= beta_;
+                bucket.wrong_cuts += result_ < beta_;
+                bucket.result_minus_beta_sum += beta_delta;
+                bucket.result_minus_static_sum += static_delta;
+                bucket.result_minus_beta_min =
+                  std::min(bucket.result_minus_beta_min, beta_delta);
+                bucket.result_minus_beta_max =
+                  std::max(bucket.result_minus_beta_max, beta_delta);
+                bucket.result_minus_static_min =
+                  std::min(bucket.result_minus_static_min, static_delta);
+                bucket.result_minus_static_max =
+                  std::max(bucket.result_minus_static_max, static_delta);
+            };
+            update_shadow_outcome(
+              stats.rfp_shadow_by_disagreement[reverse_futility_shadow_disagreement_bin_]);
+            update_shadow_outcome(stats.rfp_shadow_by_static_eval
+              [reverse_futility_shadow_static_eval_bin_]
+              [reverse_futility_shadow_disagreement_bin_]);
+        }
+#endif
 
         if (access_.source == Eval::NNUE::NnueSignalEvalSource::FreshNetwork && valid) {
-            const double values[17] = {
+            const double values[19] = {
               double(access_.signal.deep_output), double(access_.signal.bypass_output),
               double(access_.signal.signed_deep_bypass),
               double(access_.signal.deep_bypass_disagreement),
@@ -375,8 +633,9 @@ class NodeObservation {
               access_.signal.phase_scale[2], access_.signal.phase_scale[3],
               access_.signal.phase_scale[4], access_.signal.phase_scale[5],
               access_.signal.main_reliance, access_.signal.fm_reliance,
-              access_.signal.cross_reliance};
-            for (std::size_t i = 0; i < 17; ++i) {
+              access_.signal.cross_reliance, access_.signal.lca_mean_abs_delta,
+              double(access_.signal.lca_max_abs_delta)};
+            for (std::size_t i = 0; i < 19; ++i) {
                 auto& summary = stats.raw_signal[i];
                 ++summary.count;
                 summary.sum += values[i];
@@ -508,10 +767,168 @@ class NodeObservation {
         reverse_futility_distance_ = distance;
         reverse_futility_taken_ = taken;
     }
+#if defined(ENABLE_NNUE_RFP_SHADOW)
+    bool SelectReverseFutilityShadowSample() {
+        auto& stats = LocalStats();
+        ++stats.rfp_conditions;
+
+        // disagreement is meaningful only when the evaluation path supplied a
+        // complete NNUE snapshot. Non-valid RFP cuts retain normal behavior.
+        if (!access_.signal.valid || !has_static_eval_)
+            return false;
+
+        ++stats.rfp_signal_valid_conditions;
+        const auto disagreement_bin = SignalBin(access_.signal, 0);
+        const auto static_eval_bin = MagnitudeBin(static_eval_);
+        auto& disagreement_bucket = stats.rfp_shadow_by_disagreement[disagreement_bin];
+        auto& conditioned_bucket =
+          stats.rfp_shadow_by_static_eval[static_eval_bin][disagreement_bin];
+        ++disagreement_bucket.rfp_conditions;
+        ++conditioned_bucket.rfp_conditions;
+
+        constexpr std::uint64_t sample_mask =
+          (std::uint64_t(1) << NNUE_RFP_SHADOW_SAMPLE_SHIFT) - 1;
+        const bool selected = (stats.rfp_shadow_sequence++ & sample_mask) == 0;
+        if (!selected)
+            return false;
+
+        ++disagreement_bucket.shadow_samples;
+        ++conditioned_bucket.shadow_samples;
+        reverse_futility_shadow_sampled_ = true;
+        reverse_futility_shadow_disagreement_bin_ = disagreement_bin;
+        reverse_futility_shadow_static_eval_bin_ = static_eval_bin;
+        return true;
+    }
+#endif
     void RecordLmrEvent(const int move_count, const bool researched) {
         const auto bin = MoveCountBin(move_count);
         ++lmr_events_[bin];
         lmr_researches_[bin] += researched;
+    }
+    void RecordPhaseFmLmrOutcome(const int depth, const int move_count,
+                                 const bool router_adjusted, const bool reduced_fail_high,
+                                 const bool researched, const int reduced_value,
+                                 const int final_value, const bool beta_exceeded,
+                                 const bool final_cutoff, const bool phase_fm_candidate,
+                                 const bool phase_fm_adjusted,
+                                 const bool lca_candidate, const bool lca_adjusted) {
+        auto& stats = LocalStats();
+        const auto add = [&](PhaseFmLmrBucket& value) {
+            ++value.moves;
+            value.reduced_fail_highs += reduced_fail_high;
+            value.researches += researched;
+            value.beta_exceeded += beta_exceeded;
+            value.final_cutoffs += final_cutoff;
+            if (researched) {
+                const auto delta = static_cast<std::int64_t>(final_value)
+                                 - static_cast<std::int64_t>(reduced_value);
+                const auto abs_delta = static_cast<std::uint64_t>(delta < 0 ? -delta : delta);
+                ++value.research_score_samples;
+                value.research_score_abs_delta_sum += abs_delta;
+                value.research_score_abs_delta_max =
+                  std::max(value.research_score_abs_delta_max, abs_delta);
+            }
+        };
+        ++stats.phase_fm_lmr_moves;
+        ++stats.lca_lmr_moves;
+        add(stats.lca_lmr_all_outcomes);
+        if (!access_.signal.valid || !has_static_eval_)
+            return;
+
+        ++stats.phase_fm_lmr_signal_valid_moves;
+        ++stats.lca_lmr_signal_valid_moves;
+        const auto fm_bin = PhaseSignalBin(access_.signal.fm_reliance);
+        const auto depth_bin = ConditionalDepthBin(depth);
+        const auto move_bin = MoveCountBin(move_count);
+        const auto bucket = static_cast<std::size_t>(std::clamp(
+          access_.signal.selected_bucket, 0, static_cast<int>(kBucketCount - 1)));
+        const auto static_bin = MagnitudeBin(static_eval_);
+        const auto router_group = RouterMarginGroup(access_.signal.router_margin);
+        const auto fm_group = FmRelianceGroup(access_.signal.fm_reliance);
+        const auto fm_fine_group = FmRelianceFineGroup(access_.signal.fm_reliance);
+
+        add(stats.phase_fm_lmr[fm_bin]);
+        add(stats.phase_fm_lmr_by_depth[depth_bin][fm_bin]);
+        add(stats.phase_fm_lmr_by_move_count[move_bin][fm_bin]);
+        add(stats.phase_fm_lmr_by_bucket[bucket][fm_bin]);
+        add(stats.phase_fm_lmr_by_static_eval[static_bin][fm_bin]);
+        add(stats.phase_fm_lmr_by_router_and_fm[router_group][fm_group]);
+        const auto joint = FmJointBaseIndex(depth_bin, move_bin, bucket, static_bin,
+                                            router_group) * kFmRelianceGroups + fm_group;
+        add(stats.phase_fm_lmr_joint[joint]);
+        const auto adjusted = router_adjusted ? 1U : 0U;
+        add(stats.phase_fm_lmr_by_router_adjustment[adjusted][fm_fine_group]);
+        add(stats.phase_fm_lmr_by_router_adjustment_and_static
+              [adjusted][static_bin][fm_fine_group]);
+        if (!router_adjusted && (static_eval_ >= 1200 || static_eval_ <= -1200)) {
+            const auto sign = static_eval_ >= 1200 ? 0U : 1U;
+            add(stats.phase_fm_lmr_extreme_by_sign[sign][fm_fine_group]);
+            add(stats.phase_fm_lmr_extreme_by_sign_and_bucket
+                  [sign][fm_fine_group][bucket]);
+        }
+        auto& experiment = stats.phase_fm_lmr_experiment;
+        if (phase_fm_candidate) {
+            ++experiment.candidate_moves;
+            add(experiment.candidate_outcomes);
+        }
+        if (phase_fm_adjusted) {
+            ++experiment.adjusted_moves;
+            add(experiment.adjusted_outcomes);
+            ++experiment.adjusted_by_bucket[bucket];
+            ++experiment.adjusted_by_depth[depth_bin];
+            ++experiment.adjusted_by_move_count[move_bin];
+        }
+
+        // The LCA signal is obtained in the existing final blend loop: no Q/K/V,
+        // sigmoid, or correction is recomputed for diagnostics.  Reuse this
+        // completed-move outcome and the same conditioning axes as the FM study.
+        const auto lca_mean_bin = LcaMeanDeltaBin(access_.signal.lca_mean_abs_delta);
+        const auto lca_max_bin = LcaMaxDeltaBin(access_.signal.lca_max_abs_delta);
+        const auto lca_group = LcaMagnitudeGroup(access_.signal.lca_mean_abs_delta);
+        add(stats.lca_lmr_by_mean_delta[lca_mean_bin]);
+        add(stats.lca_lmr_by_max_delta[lca_max_bin]);
+        add(stats.lca_lmr_by_depth[depth_bin][lca_mean_bin]);
+        add(stats.lca_lmr_by_move_count[move_bin][lca_mean_bin]);
+        add(stats.lca_lmr_by_bucket[bucket][lca_mean_bin]);
+        add(stats.lca_lmr_by_static_eval[static_bin][lca_mean_bin]);
+        add(stats.lca_lmr_by_router_and_magnitude[router_group][lca_group]);
+        const auto lca_joint = FmJointBaseIndex(depth_bin, move_bin, bucket, static_bin,
+                                                router_group) * kLcaMagnitudeGroups
+                             + lca_group;
+        add(stats.lca_lmr_joint[lca_joint]);
+        if (!router_adjusted) {
+            add(stats.lca_non_router_all);
+            const auto lca_sum = static_cast<std::size_t>(std::clamp(
+              access_.signal.lca_abs_delta_sum, 0,
+              static_cast<std::int32_t>(kLcaDeltaSumMax)));
+            add(stats.lca_non_router_by_delta_sum[lca_sum]);
+            for (std::size_t threshold = 0; threshold < kLcaThresholdCount; ++threshold) {
+                if (access_.signal.lca_mean_abs_delta < kLcaThresholds[threshold])
+                    continue;
+                auto& cohort = stats.lca_non_router_thresholds[threshold];
+                add(cohort.total);
+                add(cohort.by_depth[depth_bin]);
+                add(cohort.by_move_count[move_bin]);
+                add(cohort.by_bucket[bucket]);
+                add(cohort.by_static_eval[static_bin]);
+                add(cohort.by_router_margin[router_group]);
+            }
+        }
+        auto& lca_experiment = stats.lca_lmr_experiment;
+        if (lca_candidate) {
+            add(lca_experiment.candidate_outcomes);
+            add(lca_experiment.candidate_by_bucket[bucket]);
+            add(lca_experiment.candidate_by_depth[depth_bin]);
+            add(lca_experiment.candidate_by_move_count[move_bin]);
+            add(lca_experiment.candidate_by_static_eval[static_bin]);
+        }
+        if (lca_adjusted) {
+            add(lca_experiment.adjusted_outcomes);
+            add(lca_experiment.adjusted_by_bucket[bucket]);
+            add(lca_experiment.adjusted_by_depth[depth_bin]);
+            add(lca_experiment.adjusted_by_move_count[move_bin]);
+            add(lca_experiment.adjusted_by_static_eval[static_bin]);
+        }
     }
 #if defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)
     void RecordRouterLmrExperiment(const bool high_risk, const bool adjusted,
@@ -624,6 +1041,11 @@ class NodeObservation {
     bool reverse_futility_eligible_ = false;
     bool reverse_futility_taken_ = false;
     int reverse_futility_distance_ = 0;
+#if defined(ENABLE_NNUE_RFP_SHADOW)
+    bool reverse_futility_shadow_sampled_ = false;
+    std::size_t reverse_futility_shadow_disagreement_bin_ = 0;
+    std::size_t reverse_futility_shadow_static_eval_bin_ = 0;
+#endif
     std::array<std::uint32_t, kConditionBins> lmr_events_{};
     std::array<std::uint32_t, kConditionBins> lmr_researches_{};
 #if defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)
@@ -658,6 +1080,73 @@ inline void AddPrediction(PredictionBucket& dst, const PredictionBucket& src) {
     dst.depth_sum += src.depth_sum;
     dst.move_count_sum += src.move_count_sum;
 }
+
+inline void AddPhaseFmLmr(PhaseFmLmrBucket& dst, const PhaseFmLmrBucket& src) {
+    dst.moves += src.moves;
+    dst.reduced_fail_highs += src.reduced_fail_highs;
+    dst.researches += src.researches;
+    dst.beta_exceeded += src.beta_exceeded;
+    dst.final_cutoffs += src.final_cutoffs;
+    dst.research_score_samples += src.research_score_samples;
+    dst.research_score_abs_delta_sum += src.research_score_abs_delta_sum;
+    dst.research_score_abs_delta_max =
+      std::max(dst.research_score_abs_delta_max, src.research_score_abs_delta_max);
+}
+
+inline void AddPhaseFmLmrExperiment(PhaseFmLmrExperimentStats& dst,
+                                    const PhaseFmLmrExperimentStats& src) {
+    dst.candidate_moves += src.candidate_moves;
+    dst.adjusted_moves += src.adjusted_moves;
+    AddPhaseFmLmr(dst.candidate_outcomes, src.candidate_outcomes);
+    AddPhaseFmLmr(dst.adjusted_outcomes, src.adjusted_outcomes);
+    for (std::size_t i = 0; i < kBucketCount; ++i)
+        dst.adjusted_by_bucket[i] += src.adjusted_by_bucket[i];
+    for (std::size_t i = 0; i < kConditionBins; ++i) {
+        dst.adjusted_by_depth[i] += src.adjusted_by_depth[i];
+        dst.adjusted_by_move_count[i] += src.adjusted_by_move_count[i];
+    }
+}
+
+inline void AddLcaLmrExperiment(LcaLmrExperimentStats& dst,
+                                const LcaLmrExperimentStats& src) {
+    AddPhaseFmLmr(dst.candidate_outcomes, src.candidate_outcomes);
+    AddPhaseFmLmr(dst.adjusted_outcomes, src.adjusted_outcomes);
+    for (std::size_t i = 0; i < kBucketCount; ++i) {
+        AddPhaseFmLmr(dst.candidate_by_bucket[i], src.candidate_by_bucket[i]);
+        AddPhaseFmLmr(dst.adjusted_by_bucket[i], src.adjusted_by_bucket[i]);
+    }
+    for (std::size_t i = 0; i < kConditionBins; ++i) {
+        AddPhaseFmLmr(dst.candidate_by_depth[i], src.candidate_by_depth[i]);
+        AddPhaseFmLmr(dst.candidate_by_move_count[i], src.candidate_by_move_count[i]);
+        AddPhaseFmLmr(dst.candidate_by_static_eval[i], src.candidate_by_static_eval[i]);
+        AddPhaseFmLmr(dst.adjusted_by_depth[i], src.adjusted_by_depth[i]);
+        AddPhaseFmLmr(dst.adjusted_by_move_count[i], src.adjusted_by_move_count[i]);
+        AddPhaseFmLmr(dst.adjusted_by_static_eval[i], src.adjusted_by_static_eval[i]);
+    }
+}
+
+#if defined(ENABLE_NNUE_RFP_SHADOW)
+inline void AddReverseFutilityShadow(ReverseFutilityShadowBucket& dst,
+                                     const ReverseFutilityShadowBucket& src) {
+    dst.rfp_conditions += src.rfp_conditions;
+    dst.shadow_samples += src.shadow_samples;
+    dst.completed_samples += src.completed_samples;
+    dst.correct_cuts += src.correct_cuts;
+    dst.wrong_cuts += src.wrong_cuts;
+    dst.result_minus_beta_sum += src.result_minus_beta_sum;
+    dst.result_minus_static_sum += src.result_minus_static_sum;
+    if (src.completed_samples) {
+        dst.result_minus_beta_min =
+          std::min(dst.result_minus_beta_min, src.result_minus_beta_min);
+        dst.result_minus_beta_max =
+          std::max(dst.result_minus_beta_max, src.result_minus_beta_max);
+        dst.result_minus_static_min =
+          std::min(dst.result_minus_static_min, src.result_minus_static_min);
+        dst.result_minus_static_max =
+          std::max(dst.result_minus_static_max, src.result_minus_static_max);
+    }
+}
+#endif
 
 inline void AddCorrelation(CorrelationSums& dst, const CorrelationSums& src) {
     dst.count += src.count;
@@ -740,6 +1229,97 @@ inline ThreadStats Snapshot() {
                 result.router_lmr_by_bucket[bucket][bin].researches +=
                   stats->router_lmr_by_bucket[bucket][bin].researches;
             }
+        result.phase_fm_lmr_moves += stats->phase_fm_lmr_moves;
+        result.phase_fm_lmr_signal_valid_moves += stats->phase_fm_lmr_signal_valid_moves;
+        for (std::size_t bin = 0; bin < kSignalBins; ++bin) {
+            AddPhaseFmLmr(result.phase_fm_lmr[bin], stats->phase_fm_lmr[bin]);
+            for (std::size_t group = 0; group < kConditionBins; ++group) {
+                AddPhaseFmLmr(result.phase_fm_lmr_by_depth[group][bin],
+                              stats->phase_fm_lmr_by_depth[group][bin]);
+                AddPhaseFmLmr(result.phase_fm_lmr_by_move_count[group][bin],
+                              stats->phase_fm_lmr_by_move_count[group][bin]);
+                AddPhaseFmLmr(result.phase_fm_lmr_by_static_eval[group][bin],
+                              stats->phase_fm_lmr_by_static_eval[group][bin]);
+            }
+            for (std::size_t bucket = 0; bucket < kBucketCount; ++bucket)
+                AddPhaseFmLmr(result.phase_fm_lmr_by_bucket[bucket][bin],
+                              stats->phase_fm_lmr_by_bucket[bucket][bin]);
+        }
+        for (std::size_t router = 0; router < kRouterMarginGroups; ++router)
+            for (std::size_t fm = 0; fm < kFmRelianceGroups; ++fm)
+                AddPhaseFmLmr(result.phase_fm_lmr_by_router_and_fm[router][fm],
+                              stats->phase_fm_lmr_by_router_and_fm[router][fm]);
+        for (std::size_t i = 0; i < result.phase_fm_lmr_joint.size(); ++i)
+            AddPhaseFmLmr(result.phase_fm_lmr_joint[i], stats->phase_fm_lmr_joint[i]);
+        for (std::size_t adjusted = 0; adjusted < 2; ++adjusted)
+            for (std::size_t fm = 0; fm < kFmRelianceFineGroups; ++fm) {
+                AddPhaseFmLmr(result.phase_fm_lmr_by_router_adjustment[adjusted][fm],
+                              stats->phase_fm_lmr_by_router_adjustment[adjusted][fm]);
+                for (std::size_t static_bin = 0; static_bin < kConditionBins; ++static_bin)
+                    AddPhaseFmLmr(
+                      result.phase_fm_lmr_by_router_adjustment_and_static
+                        [adjusted][static_bin][fm],
+                      stats->phase_fm_lmr_by_router_adjustment_and_static
+                        [adjusted][static_bin][fm]);
+            }
+        for (std::size_t sign = 0; sign < 2; ++sign)
+            for (std::size_t fm = 0; fm < kFmRelianceFineGroups; ++fm) {
+                AddPhaseFmLmr(result.phase_fm_lmr_extreme_by_sign[sign][fm],
+                              stats->phase_fm_lmr_extreme_by_sign[sign][fm]);
+                for (std::size_t bucket = 0; bucket < kBucketCount; ++bucket)
+                    AddPhaseFmLmr(
+                      result.phase_fm_lmr_extreme_by_sign_and_bucket[sign][fm][bucket],
+                      stats->phase_fm_lmr_extreme_by_sign_and_bucket[sign][fm][bucket]);
+            }
+        AddPhaseFmLmrExperiment(result.phase_fm_lmr_experiment,
+                                stats->phase_fm_lmr_experiment);
+        AddLcaLmrExperiment(result.lca_lmr_experiment,
+                            stats->lca_lmr_experiment);
+        result.lca_lmr_moves += stats->lca_lmr_moves;
+        result.lca_lmr_signal_valid_moves += stats->lca_lmr_signal_valid_moves;
+        AddPhaseFmLmr(result.lca_lmr_all_outcomes, stats->lca_lmr_all_outcomes);
+        for (std::size_t bin = 0; bin < kLcaMeanDeltaBins; ++bin) {
+            AddPhaseFmLmr(result.lca_lmr_by_mean_delta[bin],
+                          stats->lca_lmr_by_mean_delta[bin]);
+            for (std::size_t group = 0; group < kConditionBins; ++group) {
+                AddPhaseFmLmr(result.lca_lmr_by_depth[group][bin],
+                              stats->lca_lmr_by_depth[group][bin]);
+                AddPhaseFmLmr(result.lca_lmr_by_move_count[group][bin],
+                              stats->lca_lmr_by_move_count[group][bin]);
+                AddPhaseFmLmr(result.lca_lmr_by_static_eval[group][bin],
+                              stats->lca_lmr_by_static_eval[group][bin]);
+            }
+            for (std::size_t bucket = 0; bucket < kBucketCount; ++bucket)
+                AddPhaseFmLmr(result.lca_lmr_by_bucket[bucket][bin],
+                              stats->lca_lmr_by_bucket[bucket][bin]);
+        }
+        for (std::size_t bin = 0; bin < kLcaMaxDeltaBins; ++bin)
+            AddPhaseFmLmr(result.lca_lmr_by_max_delta[bin],
+                          stats->lca_lmr_by_max_delta[bin]);
+        for (std::size_t router = 0; router < kRouterMarginGroups; ++router)
+            for (std::size_t lca = 0; lca < kLcaMagnitudeGroups; ++lca)
+                AddPhaseFmLmr(result.lca_lmr_by_router_and_magnitude[router][lca],
+                              stats->lca_lmr_by_router_and_magnitude[router][lca]);
+        for (std::size_t i = 0; i < result.lca_lmr_joint.size(); ++i)
+            AddPhaseFmLmr(result.lca_lmr_joint[i], stats->lca_lmr_joint[i]);
+        for (std::size_t threshold = 0; threshold < kLcaThresholdCount; ++threshold) {
+            auto& dst = result.lca_non_router_thresholds[threshold];
+            const auto& src = stats->lca_non_router_thresholds[threshold];
+            AddPhaseFmLmr(dst.total, src.total);
+            for (std::size_t group = 0; group < kConditionBins; ++group) {
+                AddPhaseFmLmr(dst.by_depth[group], src.by_depth[group]);
+                AddPhaseFmLmr(dst.by_move_count[group], src.by_move_count[group]);
+                AddPhaseFmLmr(dst.by_static_eval[group], src.by_static_eval[group]);
+            }
+            for (std::size_t bucket = 0; bucket < kBucketCount; ++bucket)
+                AddPhaseFmLmr(dst.by_bucket[bucket], src.by_bucket[bucket]);
+            for (std::size_t router = 0; router < kRouterMarginGroups; ++router)
+                AddPhaseFmLmr(dst.by_router_margin[router], src.by_router_margin[router]);
+        }
+        AddPhaseFmLmr(result.lca_non_router_all, stats->lca_non_router_all);
+        for (std::size_t sum = 0; sum <= kLcaDeltaSumMax; ++sum)
+            AddPhaseFmLmr(result.lca_non_router_by_delta_sum[sum],
+                          stats->lca_non_router_by_delta_sum[sum]);
         for (std::size_t bin = 0; bin < kSignalBins; ++bin) {
             auto& dst = result.futility_eligible[bin];
             const auto& src = stats->futility_eligible[bin];
@@ -752,6 +1332,18 @@ inline ThreadStats Snapshot() {
             dst.fail_high += src.fail_high;
             dst.fail_low += src.fail_low;
         }
+#if defined(ENABLE_NNUE_RFP_SHADOW)
+        result.rfp_conditions += stats->rfp_conditions;
+        result.rfp_signal_valid_conditions += stats->rfp_signal_valid_conditions;
+        for (std::size_t bin = 0; bin < kSignalBins; ++bin) {
+            AddReverseFutilityShadow(result.rfp_shadow_by_disagreement[bin],
+                                     stats->rfp_shadow_by_disagreement[bin]);
+            for (std::size_t static_bin = 0; static_bin < kConditionBins; ++static_bin)
+                AddReverseFutilityShadow(
+                  result.rfp_shadow_by_static_eval[static_bin][bin],
+                  stats->rfp_shadow_by_static_eval[static_bin][bin]);
+        }
+#endif
         for (std::size_t i = 0; i < 4; ++i)
             AddCorrelation(result.control_correlation[i], stats->control_correlation[i]);
         for (std::size_t phase = 0; phase < 3; ++phase)
@@ -958,6 +1550,68 @@ inline void PrintConditionalLmr(
     }
 }
 
+inline void PrintPhaseFmLmrValue(std::ostream& out, const PhaseFmLmrBucket& value) {
+    out << " moves=" << value.moves
+        << " reduced-FH=" << Percent(value.reduced_fail_highs, value.moves) << '%'
+        << " re-search=" << Percent(value.researches, value.moves) << '%'
+        << " beta=" << Percent(value.beta_exceeded, value.moves) << '%'
+        << " cutoff=" << Percent(value.final_cutoffs, value.moves) << '%'
+        << " research-mean-abs-delta="
+        << (value.research_score_samples
+              ? double(value.research_score_abs_delta_sum) / value.research_score_samples : 0.0)
+        << " research-samples=" << value.research_score_samples;
+}
+
+template<std::size_t Groups>
+inline void PrintConditionalPhaseFmLmr(
+  std::ostream& out, const char* title, const std::array<const char*, Groups>& labels,
+  const std::array<std::array<PhaseFmLmrBucket, kSignalBins>, Groups>& table) {
+    out << '[' << title << "]\n";
+    for (std::size_t group = 0; group < Groups; ++group) {
+        out << "  {" << labels[group] << "}\n";
+        for (std::size_t bin = 0; bin < kSignalBins; ++bin) {
+            const auto& value = table[group][bin];
+            if (!value.moves)
+                continue;
+            out << "    phase.fm_reliance=";
+            PrintSignalRange(out, 3, bin);
+            PrintPhaseFmLmrValue(out, value);
+            out << '\n';
+        }
+    }
+}
+
+inline const char* LcaMeanDeltaLabel(const std::size_t bin) {
+    static constexpr const char* labels[kLcaMeanDeltaBins] = {
+      "0", "(0,0.25)", "[0.25,0.50)", "[0.50,1.00)", "[1.00,2.00)",
+      "[2.00,4.00)", "[4.00,8.00)", "[8.00,16.00)", "[16.00,32.00)", "32+"};
+    return labels[bin];
+}
+
+inline const char* LcaMaxDeltaLabel(const std::size_t bin) {
+    static constexpr const char* labels[kLcaMaxDeltaBins] = {
+      "0", "1", "2", "3-4", "5-8", "9-16", "17-32", "33-64", "65+"};
+    return labels[bin];
+}
+
+template<std::size_t Groups>
+inline void PrintConditionalLcaLmr(
+  std::ostream& out, const char* title, const std::array<const char*, Groups>& labels,
+  const std::array<std::array<PhaseFmLmrBucket, kLcaMeanDeltaBins>, Groups>& table) {
+    out << '[' << title << "]\n";
+    for (std::size_t group = 0; group < Groups; ++group) {
+        out << "  {" << labels[group] << "}\n";
+        for (std::size_t bin = 0; bin < kLcaMeanDeltaBins; ++bin) {
+            const auto& value = table[group][bin];
+            if (!value.moves)
+                continue;
+            out << "    lca.mean_abs_delta=" << LcaMeanDeltaLabel(bin);
+            PrintPhaseFmLmrValue(out, value);
+            out << '\n';
+        }
+    }
+}
+
 inline void Report(std::ostream& out) {
     const auto stats = Snapshot();
     out << "[NNUE search signal diagnostics]\n"
@@ -1004,15 +1658,16 @@ inline void Report(std::ostream& out) {
         << "  decisive returns excluded    : " << stats.fresh_decisive_excluded << '\n'
         << "  note: error quantiles above 63 cp use power-of-two histogram bounds.\n";
 
-    static constexpr const char* raw_names[17] = {
+    static constexpr const char* raw_names[19] = {
       "deep_output", "bypass_output", "signed_deep_bypass",
       "deep_bypass_disagreement", "selected_bucket",
       "router_top1_logit", "router_top2_logit", "router_margin",
       "phase.main_sqr_scale", "phase.main_raw_scale", "phase.diff_scale",
       "phase.abs_raw_scale", "phase.abs_sqr_scale", "phase.cross_scale",
-      "phase.main_reliance", "phase.fm_reliance", "phase.cross_reliance"};
+      "phase.main_reliance", "phase.fm_reliance", "phase.cross_reliance",
+      "lca.mean_abs_delta", "lca.max_abs_delta"};
     out << "[fresh NNUE signal ranges]\n";
-    for (std::size_t i = 0; i < 17; ++i) {
+    for (std::size_t i = 0; i < 19; ++i) {
         const auto& summary = stats.raw_signal[i];
         out << "  " << std::left << std::setw(28) << raw_names[i] << std::right
             << " count=" << summary.count;
@@ -1113,12 +1768,427 @@ inline void Report(std::ostream& out) {
             << " FL=" << Percent(value.fail_low, value.count) << "%\n";
     }
 
+#if defined(ENABLE_NNUE_RFP_SHADOW)
+    ReverseFutilityShadowBucket rfp_shadow_total{};
+    for (const auto& value : stats.rfp_shadow_by_disagreement)
+        AddReverseFutilityShadow(rfp_shadow_total, value);
+    const auto print_rfp_shadow_bucket = [&](const ReverseFutilityShadowBucket& value,
+                                             const std::size_t bin,
+                                             const char* indent) {
+        if (!value.rfp_conditions)
+            return;
+        out << indent << "disagreement=";
+        PrintSignalRange(out, 0, bin);
+        out << " RFP=" << value.rfp_conditions
+            << " shadow=" << value.shadow_samples
+            << " completed=" << value.completed_samples
+            << " correct=" << value.correct_cuts
+            << " wrong=" << value.wrong_cuts
+            << " correct-rate=" << Percent(value.correct_cuts, value.completed_samples) << '%'
+            << " wrong-rate=" << Percent(value.wrong_cuts, value.completed_samples) << '%';
+        if (value.completed_samples)
+            out << " result-beta(mean/min/max)="
+                << double(value.result_minus_beta_sum) / value.completed_samples << '/'
+                << value.result_minus_beta_min << '/' << value.result_minus_beta_max
+                << " result-staticEval(mean/min/max)="
+                << double(value.result_minus_static_sum) / value.completed_samples << '/'
+                << value.result_minus_static_min << '/' << value.result_minus_static_max;
+        out << '\n';
+    };
+
+    out << "[reverse-futility shadow verification]\n"
+        << "  sampling: 1/" << (std::uint64_t(1) << NNUE_RFP_SHADOW_SAMPLE_SHIFT)
+        << " of signal-valid RFP conditions, deterministic per thread\n"
+        << "  correct cut: shadow result >= original beta; wrong cut: shadow result < original beta\n"
+        << "  all RFP conditions          : " << stats.rfp_conditions << '\n'
+        << "  signal-valid RFP conditions : " << stats.rfp_signal_valid_conditions
+        << " (" << Percent(stats.rfp_signal_valid_conditions, stats.rfp_conditions) << "%)\n"
+        << "  shadow samples/completed    : " << rfp_shadow_total.shadow_samples
+        << '/' << rfp_shadow_total.completed_samples << '\n'
+        << "  correct/wrong cuts          : " << rfp_shadow_total.correct_cuts
+        << '/' << rfp_shadow_total.wrong_cuts
+        << " (wrong " << Percent(rfp_shadow_total.wrong_cuts,
+                                  rfp_shadow_total.completed_samples) << "%)\n"
+        << "  by disagreement\n";
+    for (std::size_t bin = 0; bin < kSignalBins; ++bin)
+        print_rfp_shadow_bucket(stats.rfp_shadow_by_disagreement[bin], bin, "    ");
+
+    out << "  by |staticEval| and disagreement\n";
+    for (std::size_t static_bin = 0; static_bin < kConditionBins; ++static_bin) {
+        out << "    {" << magnitude_labels[static_bin] << "}\n";
+        for (std::size_t bin = 0; bin < kSignalBins; ++bin)
+            print_rfp_shadow_bucket(stats.rfp_shadow_by_static_eval[static_bin][bin],
+                                    bin, "      ");
+    }
+#endif
+
     PrintConditionalLmr(out, "router-margin LMR events conditioned by depth", depth_labels,
                         stats.router_lmr_by_depth);
     PrintConditionalLmr(out, "router-margin LMR events conditioned by move count", move_labels,
                         stats.router_lmr_by_move_count);
     PrintConditionalLmr(out, "router-margin LMR events conditioned by selected bucket",
                         bucket_labels, stats.router_lmr_by_bucket);
+
+    out << "[phase.fm_reliance LMR move outcomes]\n"
+        << "  population: actual LMR moves completed through final beta/cutoff decision\n"
+        << "  all LMR moves          : " << stats.phase_fm_lmr_moves << '\n'
+        << "  signal-valid LMR moves : " << stats.phase_fm_lmr_signal_valid_moves << " ("
+        << Percent(stats.phase_fm_lmr_signal_valid_moves, stats.phase_fm_lmr_moves) << "%)\n";
+    for (std::size_t bin = 0; bin < kSignalBins; ++bin) {
+        const auto& value = stats.phase_fm_lmr[bin];
+        if (!value.moves)
+            continue;
+        out << "  phase.fm_reliance=";
+        PrintSignalRange(out, 3, bin);
+        PrintPhaseFmLmrValue(out, value);
+        out << '\n';
+    }
+    PrintConditionalPhaseFmLmr(out, "phase.fm_reliance LMR conditioned by depth",
+                               depth_labels, stats.phase_fm_lmr_by_depth);
+    PrintConditionalPhaseFmLmr(out, "phase.fm_reliance LMR conditioned by move count",
+                               move_labels, stats.phase_fm_lmr_by_move_count);
+    PrintConditionalPhaseFmLmr(out, "phase.fm_reliance LMR conditioned by selected bucket",
+                               bucket_labels, stats.phase_fm_lmr_by_bucket);
+    PrintConditionalPhaseFmLmr(out, "phase.fm_reliance LMR conditioned by |staticEval|",
+                               magnitude_labels, stats.phase_fm_lmr_by_static_eval);
+
+    static constexpr std::array<const char*, kRouterMarginGroups> router_group_labels = {
+      "router margin <=256", "router margin >256"};
+    static constexpr std::array<const char*, kFmRelianceGroups> fm_group_labels = {
+      "FM <1.75", "FM 1.75-<2.00", "FM >=2.00"};
+    out << "[router margin x phase.fm_reliance LMR outcomes]\n";
+    for (std::size_t router = 0; router < kRouterMarginGroups; ++router) {
+        out << "  {" << router_group_labels[router] << "}\n";
+        for (std::size_t fm = 0; fm < kFmRelianceGroups; ++fm) {
+            out << "    " << fm_group_labels[fm];
+            PrintPhaseFmLmrValue(out, stats.phase_fm_lmr_by_router_and_fm[router][fm]);
+            out << '\n';
+        }
+    }
+
+    // Exact joint control: compare FM groups only inside cells having identical
+    // depth, move-count, bucket, |staticEval| and Router-margin groups.  Macro
+    // averaging prevents large buckets from recreating the original confounding.
+    std::size_t qualifying_strata = 0;
+    std::array<double, kFmRelianceGroups> joint_fh{};
+    std::array<double, kFmRelianceGroups> joint_research{};
+    std::array<double, kFmRelianceGroups> joint_beta{};
+    std::array<double, kFmRelianceGroups> joint_cutoff{};
+    std::array<std::uint64_t, kFmRelianceGroups> joint_samples{};
+    for (std::size_t base = 0; base < kFmJointBaseStrata; ++base) {
+        bool usable = true;
+        for (std::size_t fm = 0; fm < kFmRelianceGroups; ++fm)
+            usable &= stats.phase_fm_lmr_joint[base * kFmRelianceGroups + fm].moves >= 20;
+        if (!usable)
+            continue;
+        ++qualifying_strata;
+        for (std::size_t fm = 0; fm < kFmRelianceGroups; ++fm) {
+            const auto& value = stats.phase_fm_lmr_joint[base * kFmRelianceGroups + fm];
+            joint_samples[fm] += value.moves;
+            joint_fh[fm] += Percent(value.reduced_fail_highs, value.moves);
+            joint_research[fm] += Percent(value.researches, value.moves);
+            joint_beta[fm] += Percent(value.beta_exceeded, value.moves);
+            joint_cutoff[fm] += Percent(value.final_cutoffs, value.moves);
+        }
+    }
+    out << "[phase.fm_reliance jointly controlled LMR outcomes]\n"
+        << "  fixed strata: depth x moveCount x bucket x |staticEval| x router-margin group\n"
+        << "  inclusion: at least 20 moves in every FM group; rates are stratum-macro means\n"
+        << "  qualifying strata: " << qualifying_strata << '\n';
+    for (std::size_t fm = 0; fm < kFmRelianceGroups; ++fm) {
+        const double divisor = qualifying_strata ? double(qualifying_strata) : 1.0;
+        out << "  " << fm_group_labels[fm] << " samples=" << joint_samples[fm]
+            << " reduced-FH=" << joint_fh[fm] / divisor << '%'
+            << " re-search=" << joint_research[fm] / divisor << '%'
+            << " beta=" << joint_beta[fm] / divisor << '%'
+            << " cutoff=" << joint_cutoff[fm] / divisor << "%\n";
+    }
+
+    static constexpr std::array<const char*, kFmRelianceFineGroups> fm_fine_labels = {
+      "FM <1.50", "FM 1.50-<1.625", "FM 1.625-<1.75", "FM 1.75-<2.00", "FM >=2.00"};
+    out << "[phase.fm_reliance incremental coverage beyond production Router-LMR]\n"
+        << "  Router adjusted=yes means variant 3 actually increased d by one ply.\n"
+        << "  Router adjusted=no is the primary counterfactual population.\n";
+    for (std::size_t adjusted = 0; adjusted < 2; ++adjusted) {
+        out << "  {Router actual +1 ply: " << (adjusted ? "yes" : "no") << "}\n";
+        for (std::size_t fm = 0; fm < kFmRelianceFineGroups; ++fm) {
+            const auto& value = stats.phase_fm_lmr_by_router_adjustment[adjusted][fm];
+            out << "    " << fm_fine_labels[fm]
+                << " all-LMR=" << Percent(value.moves, stats.phase_fm_lmr_moves) << '%';
+            PrintPhaseFmLmrValue(out, value);
+            out << '\n';
+        }
+    }
+    out << "[phase.fm_reliance incremental coverage by |staticEval|]\n";
+    for (std::size_t static_bin = 0; static_bin < kConditionBins; ++static_bin) {
+        out << "  {Router actual +1 ply: no; " << magnitude_labels[static_bin] << "}\n";
+        for (std::size_t fm = 0; fm < kFmRelianceFineGroups; ++fm) {
+            const auto& value = stats.phase_fm_lmr_by_router_adjustment_and_static
+              [0][static_bin][fm];
+            out << "    " << fm_fine_labels[fm]
+                << " all-LMR=" << Percent(value.moves, stats.phase_fm_lmr_moves) << '%';
+            PrintPhaseFmLmrValue(out, value);
+            out << '\n';
+        }
+    }
+
+    PhaseFmLmrBucket non_router_static_ge_100_lt_1625{};
+    PhaseFmLmrBucket non_router_static_ge_100_lt_1750{};
+    for (std::size_t static_bin = 1; static_bin < kConditionBins; ++static_bin) {
+        for (std::size_t fm = 0; fm < 2; ++fm)
+            AddPhaseFmLmr(non_router_static_ge_100_lt_1625,
+              stats.phase_fm_lmr_by_router_adjustment_and_static[0][static_bin][fm]);
+        for (std::size_t fm = 0; fm < 3; ++fm)
+            AddPhaseFmLmr(non_router_static_ge_100_lt_1750,
+              stats.phase_fm_lmr_by_router_adjustment_and_static[0][static_bin][fm]);
+    }
+    out << "[phase.fm_reliance incremental threshold candidates]\n"
+        << "  population: Router actual +1 ply=no AND |staticEval|>=100\n"
+        << "  FM <1.625 all-LMR="
+        << Percent(non_router_static_ge_100_lt_1625.moves, stats.phase_fm_lmr_moves) << '%';
+    PrintPhaseFmLmrValue(out, non_router_static_ge_100_lt_1625);
+    out << "\n  FM <1.75 all-LMR="
+        << Percent(non_router_static_ge_100_lt_1750.moves, stats.phase_fm_lmr_moves) << '%';
+    PrintPhaseFmLmrValue(out, non_router_static_ge_100_lt_1750);
+    out << '\n';
+
+    static constexpr std::array<const char*, 2> extreme_sign_labels = {
+      "staticEval >= +1200", "staticEval <= -1200"};
+    static constexpr std::array<const char*, 3> extreme_threshold_labels = {
+      "FM <1.50", "FM <1.625", "FM <1.75"};
+    out << "[phase.fm_reliance signed extreme-eval counterfactual cohorts]\n"
+        << "  population: Router actual +1 ply=no; thresholds are cumulative\n";
+    for (std::size_t sign = 0; sign < 2; ++sign) {
+        out << "  {" << extreme_sign_labels[sign] << "}\n";
+        for (std::size_t threshold = 0; threshold < 3; ++threshold) {
+            PhaseFmLmrBucket total{};
+            std::array<PhaseFmLmrBucket, kBucketCount> by_bucket{};
+            for (std::size_t fm = 0; fm <= threshold; ++fm) {
+                AddPhaseFmLmr(total, stats.phase_fm_lmr_extreme_by_sign[sign][fm]);
+                for (std::size_t bucket = 0; bucket < kBucketCount; ++bucket)
+                    AddPhaseFmLmr(by_bucket[bucket],
+                      stats.phase_fm_lmr_extreme_by_sign_and_bucket[sign][fm][bucket]);
+            }
+            out << "    " << extreme_threshold_labels[threshold]
+                << " all-LMR=" << Percent(total.moves, stats.phase_fm_lmr_moves) << '%';
+            PrintPhaseFmLmrValue(out, total);
+            out << "\n      buckets";
+            for (std::size_t bucket = 0; bucket < kBucketCount; ++bucket)
+                out << " B" << std::setw(2) << std::setfill('0') << bucket
+                    << std::setfill(' ') << ':' << by_bucket[bucket].moves
+                    << '/' << Percent(by_bucket[bucket].researches,
+                                      by_bucket[bucket].moves) << '%';
+            out << '\n';
+        }
+    }
+
+    const auto& phase_experiment = stats.phase_fm_lmr_experiment;
+    out << "[Phase FM LMR explicit +1 experiment]\n"
+        << "  variant                 : ";
+#if defined(USE_NNUE_PHASE_FM_LMR)
+    out << "1 (Router-LMR + Phase FM explicit +1 ply)\n";
+#else
+    out << "0 (Router-LMR only; Phase FM counterfactual cohort)\n";
+#endif
+    out << "  predicate               : Router actual +1=no, staticEval>=1200, FM<1.625\n"
+        << "  candidate moves         : " << phase_experiment.candidate_moves << '\n'
+        << "  actual depth +1 moves   : " << phase_experiment.adjusted_moves << " ("
+        << Percent(phase_experiment.adjusted_moves, stats.phase_fm_lmr_moves)
+        << "% of all LMR)\n"
+        << "  candidate outcomes      :";
+    PrintPhaseFmLmrValue(out, phase_experiment.candidate_outcomes);
+    out << "\n  actual +1 outcomes       :";
+    PrintPhaseFmLmrValue(out, phase_experiment.adjusted_outcomes);
+    out << "\n  actual +1 by bucket      :";
+    for (std::size_t bucket = 0; bucket < kBucketCount; ++bucket)
+        out << " B" << std::setw(2) << std::setfill('0') << bucket << std::setfill(' ')
+            << '=' << phase_experiment.adjusted_by_bucket[bucket];
+    out << "\n  actual +1 by depth       :";
+    for (std::size_t group = 0; group < kConditionBins; ++group)
+        out << ' ' << depth_labels[group] << '=' << phase_experiment.adjusted_by_depth[group];
+    out << "\n  actual +1 by moveCount   :";
+    for (std::size_t group = 0; group < kConditionBins; ++group)
+        out << ' ' << move_labels[group] << '=' << phase_experiment.adjusted_by_move_count[group];
+    out << '\n';
+
+    out << "[LCA correction magnitude LMR move outcomes]\n"
+        << "  signal: byte-domain |Diff after LCA - Diff before LCA| over 32 channels\n"
+        << "  all LMR moves          : " << stats.lca_lmr_moves << '\n'
+        << "  signal-valid LMR moves : " << stats.lca_lmr_signal_valid_moves << " ("
+        << Percent(stats.lca_lmr_signal_valid_moves, stats.lca_lmr_moves) << "%)\n"
+        << "  by mean_abs_delta\n";
+    for (std::size_t bin = 0; bin < kLcaMeanDeltaBins; ++bin) {
+        const auto& value = stats.lca_lmr_by_mean_delta[bin];
+        if (!value.moves)
+            continue;
+        out << "    " << LcaMeanDeltaLabel(bin);
+        PrintPhaseFmLmrValue(out, value);
+        out << '\n';
+    }
+    out << "  by max_abs_delta\n";
+    for (std::size_t bin = 0; bin < kLcaMaxDeltaBins; ++bin) {
+        const auto& value = stats.lca_lmr_by_max_delta[bin];
+        if (!value.moves)
+            continue;
+        out << "    " << LcaMaxDeltaLabel(bin);
+        PrintPhaseFmLmrValue(out, value);
+        out << '\n';
+    }
+    PrintConditionalLcaLmr(out, "LCA correction LMR conditioned by depth",
+                           depth_labels, stats.lca_lmr_by_depth);
+    PrintConditionalLcaLmr(out, "LCA correction LMR conditioned by move count",
+                           move_labels, stats.lca_lmr_by_move_count);
+    PrintConditionalLcaLmr(out, "LCA correction LMR conditioned by selected bucket",
+                           bucket_labels, stats.lca_lmr_by_bucket);
+    PrintConditionalLcaLmr(out, "LCA correction LMR conditioned by |staticEval|",
+                           magnitude_labels, stats.lca_lmr_by_static_eval);
+
+    static constexpr std::array<const char*, kLcaMagnitudeGroups> lca_group_labels = {
+      "mean <2.00", "mean 2.00-<8.00", "mean 8.00-<32.00", "mean >=32.00"};
+    out << "[router margin x LCA correction LMR outcomes]\n";
+    for (std::size_t router = 0; router < kRouterMarginGroups; ++router) {
+        out << "  {" << router_group_labels[router] << "}\n";
+        for (std::size_t lca = 0; lca < kLcaMagnitudeGroups; ++lca) {
+            out << "    " << lca_group_labels[lca];
+            PrintPhaseFmLmrValue(out, stats.lca_lmr_by_router_and_magnitude[router][lca]);
+            out << '\n';
+        }
+    }
+
+    std::size_t lca_qualifying_strata = 0;
+    std::array<double, kLcaMagnitudeGroups> lca_joint_fh{};
+    std::array<double, kLcaMagnitudeGroups> lca_joint_research{};
+    std::array<double, kLcaMagnitudeGroups> lca_joint_cutoff{};
+    for (std::size_t base = 0; base < kFmJointBaseStrata; ++base) {
+        bool usable = true;
+        for (std::size_t lca = 0; lca < kLcaMagnitudeGroups; ++lca)
+            usable &= stats.lca_lmr_joint[base * kLcaMagnitudeGroups + lca].moves >= 20;
+        if (!usable)
+            continue;
+        ++lca_qualifying_strata;
+        for (std::size_t lca = 0; lca < kLcaMagnitudeGroups; ++lca) {
+            const auto& value = stats.lca_lmr_joint[base * kLcaMagnitudeGroups + lca];
+            lca_joint_fh[lca] += Percent(value.reduced_fail_highs, value.moves);
+            lca_joint_research[lca] += Percent(value.researches, value.moves);
+            lca_joint_cutoff[lca] += Percent(value.final_cutoffs, value.moves);
+        }
+    }
+    out << "[LCA correction jointly controlled LMR outcomes]\n"
+        << "  controls: depth x moveCount x bucket x |staticEval| x router-margin\n"
+        << "  qualifying strata (>=20 moves in every LCA group): "
+        << lca_qualifying_strata << '\n';
+    const double lca_divisor = lca_qualifying_strata ? double(lca_qualifying_strata) : 1.0;
+    for (std::size_t lca = 0; lca < kLcaMagnitudeGroups; ++lca)
+        out << "  " << lca_group_labels[lca]
+            << " macro reduced-FH=" << lca_joint_fh[lca] / lca_divisor << '%'
+            << " re-search=" << lca_joint_research[lca] / lca_divisor << '%'
+            << " cutoff=" << lca_joint_cutoff[lca] / lca_divisor << "%\n";
+
+    out << "[LCA high-tail counterfactual cohorts: no actual Router +1 ply]\n";
+    for (std::size_t threshold = 0; threshold < kLcaThresholdCount; ++threshold) {
+        const auto& cohort = stats.lca_non_router_thresholds[threshold];
+        out << "  threshold >=" << kLcaThresholds[threshold]
+            << " all-LMR-rate=" << Percent(cohort.total.moves, stats.lca_lmr_moves) << '%';
+        PrintPhaseFmLmrValue(out, cohort.total);
+        out << '\n';
+    }
+    const auto print_lca_threshold_breakdown = [&](const char* title, const auto& labels,
+                                                    const auto member) {
+        out << "[LCA high-tail counterfactual by " << title << "]\n";
+        for (std::size_t threshold = 0; threshold < kLcaThresholdCount; ++threshold) {
+            const auto& table = stats.lca_non_router_thresholds[threshold].*member;
+            out << "  {threshold >=" << kLcaThresholds[threshold] << "}\n";
+            for (std::size_t group = 0; group < table.size(); ++group) {
+                if (!table[group].moves)
+                    continue;
+                out << "    " << labels[group];
+                PrintPhaseFmLmrValue(out, table[group]);
+                out << '\n';
+            }
+        }
+    };
+    print_lca_threshold_breakdown("depth", depth_labels,
+                                  &LcaThresholdCohortStats::by_depth);
+    print_lca_threshold_breakdown("move count", move_labels,
+                                  &LcaThresholdCohortStats::by_move_count);
+    print_lca_threshold_breakdown("selected bucket", bucket_labels,
+                                  &LcaThresholdCohortStats::by_bucket);
+    print_lca_threshold_breakdown("|staticEval|", magnitude_labels,
+                                  &LcaThresholdCohortStats::by_static_eval);
+    print_lca_threshold_breakdown("router margin", router_group_labels,
+                                  &LcaThresholdCohortStats::by_router_margin);
+
+    out << "[LCA model-relative high-tail percentiles: no actual Router +1 ply]\n"
+        << "  tie policy: include every move equal to the discrete cutoff\n"
+        << "  population";
+    PrintPhaseFmLmrValue(out, stats.lca_non_router_all);
+    out << '\n';
+    for (const auto basis_points : kLcaTopBasisPoints) {
+        const auto target = (stats.lca_non_router_all.moves * basis_points + 9999) / 10000;
+        PhaseFmLmrBucket tail{};
+        std::size_t cutoff_sum = kLcaDeltaSumMax;
+        for (std::size_t sum = kLcaDeltaSumMax + 1; sum-- > 0;) {
+            AddPhaseFmLmr(tail, stats.lca_non_router_by_delta_sum[sum]);
+            cutoff_sum = sum;
+            if (tail.moves >= target)
+                break;
+        }
+        out << "  top " << (double(basis_points) / 100.0) << '%'
+            << " threshold=" << (double(cutoff_sum) / 32.0)
+            << " actual-rate=" << Percent(tail.moves, stats.lca_non_router_all.moves) << '%';
+        PrintPhaseFmLmrValue(out, tail);
+        out << '\n';
+    }
+
+#if defined(ENABLE_NNUE_LCA_LMR_EXPERIMENT)
+    const auto& lca_experiment = stats.lca_lmr_experiment;
+    out << "[LCA top-tail explicit +1-ply experiment]\n"
+        << "  variant             : " << NNUE_LCA_LMR_VARIANT
+        << (NNUE_LCA_LMR_VARIANT == 0 ? " (production Router-LMR only)\n"
+                                     : " (Router-LMR + LCA explicit +1 ply)\n")
+        << "  exact sum threshold : " << NNUE_LCA_LMR_SUM_THRESHOLD << '\n'
+        << "  mean threshold      : " << (double(NNUE_LCA_LMR_SUM_THRESHOLD) / 32.0)
+        << '\n'
+        << "  overall LMR";
+    PrintPhaseFmLmrValue(out, stats.lca_lmr_all_outcomes);
+    out << "\n  LCA candidate";
+    PrintPhaseFmLmrValue(out, lca_experiment.candidate_outcomes);
+    out << "\n  candidate / all LMR : "
+        << Percent(lca_experiment.candidate_outcomes.moves, stats.lca_lmr_moves) << "%\n"
+        << "  actual +1 ply";
+    PrintPhaseFmLmrValue(out, lca_experiment.adjusted_outcomes);
+    out << "\n  actual +1 / all LMR : "
+        << Percent(lca_experiment.adjusted_outcomes.moves, stats.lca_lmr_moves) << "%\n";
+
+    const auto print_lca_experiment_breakdown =
+      [&](const char* title, const auto& labels, const auto candidate_member,
+          const auto adjusted_member) {
+        const auto& candidate = lca_experiment.*candidate_member;
+        const auto& adjusted = lca_experiment.*adjusted_member;
+        out << "  by " << title << '\n';
+        for (std::size_t group = 0; group < candidate.size(); ++group) {
+            if (!candidate[group].moves && !adjusted[group].moves)
+                continue;
+            out << "    " << labels[group] << " candidate";
+            PrintPhaseFmLmrValue(out, candidate[group]);
+            out << " actual+1";
+            PrintPhaseFmLmrValue(out, adjusted[group]);
+            out << '\n';
+        }
+    };
+    print_lca_experiment_breakdown("bucket", bucket_labels,
+      &LcaLmrExperimentStats::candidate_by_bucket,
+      &LcaLmrExperimentStats::adjusted_by_bucket);
+    print_lca_experiment_breakdown("depth", depth_labels,
+      &LcaLmrExperimentStats::candidate_by_depth,
+      &LcaLmrExperimentStats::adjusted_by_depth);
+    print_lca_experiment_breakdown("moveCount", move_labels,
+      &LcaLmrExperimentStats::candidate_by_move_count,
+      &LcaLmrExperimentStats::adjusted_by_move_count);
+    print_lca_experiment_breakdown("|staticEval|", magnitude_labels,
+      &LcaLmrExperimentStats::candidate_by_static_eval,
+      &LcaLmrExperimentStats::adjusted_by_static_eval);
+#endif
 
     static constexpr const char* control_names[4] = {
       "depth", "|staticEval|", "|materialValue|", "ply"};
