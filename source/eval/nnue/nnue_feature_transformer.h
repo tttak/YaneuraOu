@@ -8,7 +8,8 @@
 
 #if defined(EVAL_NNUE)
 
-#if defined(SFNNwoPSQT) && !defined(USE_ELEMENT_WISE_MULTIPLY)
+#if defined(SFNNwoPSQT) && !defined(USE_ELEMENT_WISE_MULTIPLY) \
+	&& !defined(DISABLE_ELEMENT_WISE_MULTIPLY)
 #define USE_ELEMENT_WISE_MULTIPLY
 #endif
 

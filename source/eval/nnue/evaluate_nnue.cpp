@@ -4,7 +4,9 @@
 
 #if defined(EVAL_NNUE)
 
+#include <algorithm>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <vector>
 
@@ -434,7 +436,14 @@ namespace {
     inline int SelectBucketWithRouter(
         const TransformedFeatureType* transformed_features,
         const TransformedFeatureType* diff_transformed,
-        const TransformedFeatureType* abs_transformed)
+        const TransformedFeatureType* abs_transformed
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+        , NnueSignalSnapshot* signal = nullptr
+#endif
+#if defined(USE_NNUE_ROUTER_LMR)
+        , NnueRouterLmrSignal* router_lmr_signal = nullptr
+#endif
+        )
     {
         alignas(kCacheLineSize) std::uint8_t router_input[384];
         alignas(kCacheLineSize) std::int32_t router_out[32]; // SIMD制約のため32確保
@@ -460,6 +469,38 @@ namespace {
             }
         }
 
+#if defined(ENABLE_NNUE_SIGNAL_LOG) || defined(USE_NNUE_ROUTER_LMR)
+        bool need_second_score = false;
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+        need_second_score |= signal != nullptr;
+#endif
+#if defined(USE_NNUE_ROUTER_LMR)
+        need_second_score |= router_lmr_signal != nullptr;
+#endif
+        if (need_second_score) {
+            std::int32_t second_score = std::numeric_limits<std::int32_t>::min();
+            for (int b = 0; b < kLayerStacks; ++b)
+                if (b != chosen_bucket)
+                    second_score = std::max(second_score, router_out[b]);
+            const std::int64_t margin = static_cast<std::int64_t>(max_score) - second_score;
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+            if (signal) {
+            signal->selected_bucket = chosen_bucket;
+            signal->router_top1_logit = max_score;
+            signal->router_top2_logit = second_score;
+            signal->router_margin = static_cast<std::int32_t>(
+              std::min<std::int64_t>(margin, std::numeric_limits<std::int32_t>::max()));
+            }
+#endif
+#if defined(USE_NNUE_ROUTER_LMR)
+            if (router_lmr_signal) {
+                router_lmr_signal->router_margin = static_cast<std::int32_t>(
+                  std::min<std::int64_t>(margin, std::numeric_limits<std::int32_t>::max()));
+            }
+#endif
+        }
+#endif
+
         return chosen_bucket;
     }
 
@@ -467,6 +508,14 @@ namespace {
     static Value ComputeScore(const Position& pos, bool refresh = false) {
         auto& accumulator = pos.state()->accumulator;
         if (!refresh && accumulator.computed_score) {
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+            SetLastNnueSignalAccess(NnueSignalEvalSource::AccumulatorCached,
+                                    accumulator.nnue_signal.valid ? &accumulator.nnue_signal : nullptr);
+#endif
+#if defined(USE_NNUE_ROUTER_LMR)
+            SetLastNnueRouterLmrSignal(accumulator.nnue_router_lmr_signal.valid
+                                         ? &accumulator.nnue_router_lmr_signal : nullptr);
+#endif
             return accumulator.score;
         }
 
@@ -485,10 +534,29 @@ namespace {
         feature_transformer->Transform(pos, transformed_features, diff_transformed, abs_transformed, refresh, bucket_id1);
 
         // Router による動的バケット選択
-        const auto bucket_id2 = SelectBucketWithRouter(transformed_features, diff_transformed, abs_transformed);
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+        NnueSignalSnapshot signal{};
+#endif
+#if defined(USE_NNUE_ROUTER_LMR)
+        NnueRouterLmrSignal router_lmr_signal{};
+#endif
+        const auto bucket_id2 = SelectBucketWithRouter(
+          transformed_features, diff_transformed, abs_transformed
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+          , &signal
+#endif
+#if defined(USE_NNUE_ROUTER_LMR)
+          , &router_lmr_signal
+#endif
+        );
 
         alignas(kCacheLineSize) char buffer[Network::kBufferSize];
-        const auto output = network[bucket_id2]->Propagate(transformed_features, diff_transformed, abs_transformed, bucket_id1, buffer);
+        const auto output = network[bucket_id2]->Propagate(
+          transformed_features, diff_transformed, abs_transformed, bucket_id1, buffer
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+          , &signal
+#endif
+        );
 
 
         // VALUE_MAX_EVALより大きな値が返ってくるとaspiration searchがfail highして
@@ -511,6 +579,16 @@ namespace {
 
         accumulator.score = score;
         accumulator.computed_score = true;
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+        signal.valid = true;
+        accumulator.nnue_signal = signal;
+        SetLastNnueSignalAccess(NnueSignalEvalSource::FreshNetwork, &accumulator.nnue_signal);
+#endif
+#if defined(USE_NNUE_ROUTER_LMR)
+        router_lmr_signal.valid = true;
+        accumulator.nnue_router_lmr_signal = router_lmr_signal;
+        SetLastNnueRouterLmrSignal(&accumulator.nnue_router_lmr_signal);
+#endif
         return accumulator.score;
     }
 
@@ -650,6 +728,15 @@ Value compute_eval(const Position& pos) {
 Value evaluate(const Position& pos) {
     const auto& accumulator = pos.state()->accumulator;
     if (accumulator.computed_score) {
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+        NNUE::SetLastNnueSignalAccess(
+          NNUE::NnueSignalEvalSource::AccumulatorCached,
+          accumulator.nnue_signal.valid ? &accumulator.nnue_signal : nullptr);
+#endif
+#if defined(USE_NNUE_ROUTER_LMR)
+        NNUE::SetLastNnueRouterLmrSignal(
+          accumulator.nnue_router_lmr_signal.valid ? &accumulator.nnue_router_lmr_signal : nullptr);
+#endif
         return accumulator.score;
     }
 
@@ -669,6 +756,13 @@ Value evaluate(const Position& pos) {
     entry.decode();
     if (entry.key == key) {
         // あった！
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+        NNUE::SetLastNnueSignalAccess(NNUE::NnueSignalEvalSource::EvalHashHit);
+#endif
+#if defined(USE_NNUE_ROUTER_LMR)
+        // Eval hash stores only the score, so no Router signal belongs to this hit.
+        NNUE::SetLastNnueRouterLmrSignal();
+#endif
         return Value(entry.score);
     }
 #endif

@@ -10,6 +10,10 @@
 #include "evaluate_nnue.h"
 #include "nnue_test_command.h"
 
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+#include "../../engine/yaneuraou-engine/nnue_signal_logger.h"
+#endif
+
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -7406,6 +7410,24 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     PrintInfo(stream);
   } else if (sub_command == "accuracy") {
     TestMoveAccuracy(engine, stream);
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+  } else if (sub_command == "signal_log_reset") {
+    Search::NnueSignalLog::Reset();
+    std::cout << "NNUE search signal diagnostics reset." << std::endl;
+  } else if (sub_command == "signal_log_report") {
+    Search::NnueSignalLog::Report(std::cout);
+    std::string output_file;
+    stream >> std::quoted(output_file);
+    if (!output_file.empty()) {
+      std::ofstream output(output_file);
+      if (!output)
+        std::cout << "Failed to open signal report: " << output_file << std::endl;
+      else {
+        Search::NnueSignalLog::Report(output);
+        std::cout << "NNUE search signal report written: " << output_file << std::endl;
+      }
+    }
+#endif
 #if defined(ENABLE_NNUE_BENCH)
   } else if (sub_command == "bench_ft") {
     std::uint64_t repeat_count;
@@ -7496,6 +7518,10 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << " test nnue test_accumulator" << std::endl;
     std::cout << " test nnue accuracy <sfenpack file>" << std::endl;
     std::cout << " test nnue info [path/to/" << kFileName << "...]" << std::endl;
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+    std::cout << " test nnue signal_log_reset" << std::endl;
+    std::cout << " test nnue signal_log_report [output file]" << std::endl;
+#endif
 #if defined(ENABLE_NNUE_BENCH)
     std::cout << " test nnue bench_ft [repeats]" << std::endl;
 #if defined(USE_FINNY_TABLES)

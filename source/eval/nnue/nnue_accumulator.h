@@ -8,6 +8,7 @@
 #if defined(EVAL_NNUE)
 
 #include "nnue_architecture.h"
+#include "nnue_signal.h"
 
 namespace YaneuraOu {
 namespace Eval::NNUE {
@@ -33,6 +34,15 @@ struct alignas(64) Accumulator {
   Value score = VALUE_ZERO;
   bool computed_accumulation = false;
   bool computed_score = false;
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+  // Valid only when computed_score was produced by a full Network evaluation.
+  // Kept diagnostic-only so production StateInfo size and cache behavior do not change.
+  NnueSignalSnapshot nnue_signal{};
+#endif
+#if defined(USE_NNUE_ROUTER_LMR)
+  // Minimal cached Router payload for the logger-free LMR match candidate.
+  NnueRouterLmrSignal nnue_router_lmr_signal{};
+#endif
 };
 
 } // namespace Eval::NNUE

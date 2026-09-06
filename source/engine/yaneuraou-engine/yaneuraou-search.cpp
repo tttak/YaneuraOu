@@ -32,6 +32,31 @@
 #include "../../mate/mate.h"
 #include "../../tune.h"
 
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+#include "nnue_signal_logger.h"
+#endif
+#if defined(USE_NNUE_ROUTER_LMR) && !defined(ENABLE_NNUE_SIGNAL_LOG)
+#include "../../eval/nnue/nnue_signal.h"
+#endif
+
+#if defined(USE_NNUE_ROUTER_LMR)
+#ifndef NNUE_ROUTER_LMR_VARIANT
+#define NNUE_ROUTER_LMR_VARIANT 3
+#endif
+#ifndef NNUE_ROUTER_LMR_MARGIN_THRESHOLD
+#define NNUE_ROUTER_LMR_MARGIN_THRESHOLD 256
+#endif
+#if NNUE_ROUTER_LMR_VARIANT != 3
+#error "USE_NNUE_ROUTER_LMR supports only variant 3 (explicit +1 ply)"
+#endif
+#endif
+
+#if defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)
+#if !defined(ENABLE_NNUE_SIGNAL_LOG)
+#error "ENABLE_NNUE_ROUTER_LMR_EXPERIMENT requires ENABLE_NNUE_SIGNAL_LOG"
+#endif
+#endif
+
 namespace YaneuraOu {
 
 using namespace Search;
@@ -2000,6 +2025,17 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
 	//     nodeの初期化
 
     ss->inCheck        = pos.checkers();
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+    NnueSignalLog::NodeObservation nnueSignalObservation(
+      PvNode, ss->inCheck, depth, static_cast<int>(alpha), static_cast<int>(beta),
+      pos.state()->materialValue, ss->ply);
+#define NNUE_SIGNAL_RETURN(value) nnueSignalObservation.Return(value)
+#else
+#define NNUE_SIGNAL_RETURN(value) (value)
+#endif
+#if defined(USE_NNUE_ROUTER_LMR) && !defined(ENABLE_NNUE_SIGNAL_LOG)
+    Eval::NNUE::NnueRouterLmrSignal nnueRouterLmrSignal{};
+#endif
     priorCapture       = pos.captured_piece();
     Color us           = pos.side_to_move();
     ss->moveCount      = 0;
@@ -2650,17 +2686,45 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
     Value      unadjustedStaticEval = VALUE_NONE;
     const auto correctionValue      = correction_value(*this, pos, ss);
 
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+    auto nnueSignalEvaluate = [&]() {
+        const Value value = evaluate(pos);
+        nnueSignalObservation.SetEvalAccess(Eval::NNUE::LastNnueSignalAccess());
+        return value;
+    };
+#define NNUE_SIGNAL_EVALUATE() nnueSignalEvaluate()
+#elif defined(USE_NNUE_ROUTER_LMR)
+    auto nnueRouterLmrEvaluate = [&]() {
+        const Value value = evaluate(pos);
+        nnueRouterLmrSignal = Eval::NNUE::LastNnueRouterLmrSignal();
+        return value;
+    };
+#define NNUE_SIGNAL_EVALUATE() nnueRouterLmrEvaluate()
+#else
+#define NNUE_SIGNAL_EVALUATE() evaluate(pos)
+#endif
+
 	if (ss->inCheck)
     {
         // Skip early pruning when in check
         // 王手がかかっているときは、early pruning(早期枝刈り)をスキップする
 
 		ss->staticEval = eval = (ss - 2)->staticEval;
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+        nnueSignalObservation.SetSource(Eval::NNUE::NnueSignalEvalSource::InCheckSkipped);
+#endif
         improving             = false;
         goto moves_loop;
     }
-    else if (excludedMove)
+    else if (excludedMove) {
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+        nnueSignalObservation.StaticEvalNeeded();
+#endif
         unadjustedStaticEval = eval = ss->staticEval;
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+        nnueSignalObservation.SetSource(Eval::NNUE::NnueSignalEvalSource::Unavailable);
+#endif
+    }
     /*
 		📝  excludedMoveがあるときは、この局面の情報をTTに保存してはならない。
 			 (同一局面で異なるexcludedMoveを持つ局面が同じhashkeyを持つので情報の一貫性がなくなる。)
@@ -2671,6 +2735,9 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
 	*/
     else if (ss->ttHit)
     {
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+        nnueSignalObservation.StaticEvalNeeded();
+#endif
         // Never assume anything about values stored in TT
         // TTに格納されている値に関して何も仮定はしない
 
@@ -2678,8 +2745,13 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
         //     あとで置換表に書き込むときにこの値を使えるし、各種枝刈りはこの評価値をベースに行なうから。
 
 		unadjustedStaticEval = ttData.eval;
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+        // A following forced evaluate() (invalid TT eval or the existing PV/lazy
+        // rule) overwrites this source with the actual evaluation access path.
+        nnueSignalObservation.SetSource(Eval::NNUE::NnueSignalEvalSource::TtEvalReuse);
+#endif
         if (!is_valid(unadjustedStaticEval))
-            unadjustedStaticEval = evaluate(pos);
+            unadjustedStaticEval = NNUE_SIGNAL_EVALUATE();
 
 #if !STOCKFISH
 #if defined(YANEURAOU_ENGINE_NNUE)
@@ -2687,7 +2759,7 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
         // 🌈 これ書かないとR70ぐらい弱くなる。
         else if (PvNode)
         {
-			unadjustedStaticEval = evaluate(pos);
+			unadjustedStaticEval = NNUE_SIGNAL_EVALUATE();
 
 			/*
 				 🤔 : ここでevaluate() が必須な理由がよくわからない。
@@ -2702,7 +2774,7 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
 #else
         // lazy evalを使わないなら、この時点でどうにかしておく。
         else
-			unadjustedStaticEval = evaluate(pos);
+			unadjustedStaticEval = NNUE_SIGNAL_EVALUATE();
 #endif
 #endif
 #endif
@@ -2728,7 +2800,10 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
     }
     else
     {
-        unadjustedStaticEval = evaluate(pos);
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+        nnueSignalObservation.StaticEvalNeeded();
+#endif
+        unadjustedStaticEval = NNUE_SIGNAL_EVALUATE();
 
         ss->staticEval = eval = to_corrected_static_eval(unadjustedStaticEval, correctionValue);
 
@@ -2747,6 +2822,10 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
 		// どうせ毎node評価関数を呼び出すので、evalの値にそんなに価値はないのだが、mate_1ply()を
         // 実行したという証にはなるので意味がある。
     }
+
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+    nnueSignalObservation.SetStaticEval(static_cast<int>(ss->staticEval));
+#endif
 
 	// -----------------------
     //   evalベースの枝刈り
@@ -2830,7 +2909,7 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
     // PvNode では、チェックメイトが返されるのを防ぐためのガードが必要です。
 
     if (!PvNode && eval < alpha - 514 - 294 * depth * depth)
-        return qsearch<NonPV>(pos, ss, alpha, beta);
+        return NNUE_SIGNAL_RETURN(qsearch<NonPV>(pos, ss, alpha, beta));
 
 	// -----------------------
     // Step 8. Futility pruning: child node
@@ -2864,9 +2943,28 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
                  + std::abs(correctionValue) / 158105;
         };
 
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+        // This is the structural eligibility of the reverse-futility test,
+        // separated from its score threshold. The normal condition below is
+        // deliberately left untouched.
+        const Value nnueSignalFutilityMargin = futility_margin(depth);
+        const bool nnueSignalFutilityEligible =
+          !ss->ttPv && depth < 14 && (!ttData.move || ttCapture)
+          && !is_loss(beta) && !is_win(eval);
+        if (nnueSignalFutilityEligible)
+            nnueSignalObservation.MarkReverseFutilityEligible(
+              static_cast<int>(eval - nnueSignalFutilityMargin - beta),
+              eval - nnueSignalFutilityMargin >= beta && eval >= beta);
+#endif
+
         if (!ss->ttPv && depth < 14 && eval - futility_margin(depth) >= beta && eval >= beta
             && (!ttData.move || ttCapture) && !is_loss(beta) && !is_win(eval))
-            return (2 * beta + eval) / 3;
+        {
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+            nnueSignalObservation.MarkFutilityPruned();
+#endif
+            return NNUE_SIGNAL_RETURN((2 * beta + eval) / 3);
+        }
     }
 
 	// -----------------------
@@ -2918,7 +3016,7 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
             // これをもう少しちゃんと検証しなおす。
 
             if (nmpMinPly || depth < 16)
-                return nullValue;
+                return NNUE_SIGNAL_RETURN(nullValue);
 
             ASSERT_LV3(!nmpMinPly);  // Recursive verification is not allowed
                                      // 再帰的な検証は認めていない。
@@ -2939,7 +3037,7 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
             nmpMinPly = 0;
 
             if (v >= beta)
-                return nullValue;
+                return NNUE_SIGNAL_RETURN(nullValue);
         }
     }
 
@@ -2972,7 +3070,7 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
 	// (depthをreductionした結果、)もしdepth <= 0ならqsearchを用いる
 
 	if (depth <= 0)
-		return qsearch<PV>(pos, ss, alpha, beta);
+		return NNUE_SIGNAL_RETURN(qsearch<PV>(pos, ss, alpha, beta));
 
 	// For cutNodes, if depth is high enough, decrease depth by 2 if there is no ttMove,
 	// or by 1 if there is a ttMove with an upper bound.
@@ -3061,7 +3159,7 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
                                probCutDepth + 1, move, unadjustedStaticEval, tt.generation());
 
                 if (!is_decisive(value))
-                    return value - (probCutBeta - beta);
+                    return NNUE_SIGNAL_RETURN(value - (probCutBeta - beta));
             }
         } // end of while
     }
@@ -3077,7 +3175,7 @@ moves_loop:  // When in check, search starts here
     probCutBeta = beta + 418;
     if ((ttData.bound & BOUND_LOWER) && ttData.depth >= depth - 4 && ttData.value >= probCutBeta
         && !is_decisive(beta) && is_valid(ttData.value) && !is_decisive(ttData.value))
-        return probCutBeta;
+        return NNUE_SIGNAL_RETURN(probCutBeta);
 
 	// -----------------------
     // 🚀 moves loopに入る前の準備
@@ -3261,8 +3359,12 @@ moves_loop:  // When in check, search starts here
 										+ PieceValue[capturedPiece] + 130 * captHist / 1024;
 
 
-                    if (futilityValue <= alpha)
+                    if (futilityValue <= alpha) {
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+                        nnueSignalObservation.MarkFutilityPruned();
+#endif
                         continue;
+                    }
                 }
 
                 // SEE based pruning for captures and checks
@@ -3318,6 +3420,9 @@ moves_loop:  // When in check, search starts here
 
                 if (!ss->inCheck && lmrDepth < 11 && futilityValue <= alpha)
                 {
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+                    nnueSignalObservation.MarkFutilityPruned();
+#endif
                     if (bestValue <= futilityValue && !is_decisive(bestValue) && !is_win(futilityValue))
                         bestValue = futilityValue;
                     continue;
@@ -3459,7 +3564,7 @@ moves_loop:  // When in check, search starts here
             else if (value >= beta && !is_decisive(value))
             {
                 ttMoveHistory << std::max(-400 - 100 * depth, -4000);
-                return value;
+                return NNUE_SIGNAL_RETURN(value);
             }
 
             // Negative extensions
@@ -3589,8 +3694,74 @@ moves_loop:  // When in check, search starts here
 		        Late Move Reductionは、遅い指し手の削減を意味していて、LMRと略される。
 		*/
 
+#if defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)
+        bool nnueRouterLmrWouldAdjust = false;
+        int nnueRouterLmrCandidateDepthIncrease = 0;
+        int nnueRouterLmrOriginalRemainder = 0;
+        unsigned nnueRouterLmrCounterfactualDeltaMask = 0;
+        bool nnueRouterLmrOutcomePending = false;
+        bool nnueRouterLmrReducedFailHigh = false;
+        bool nnueRouterLmrWasResearched = false;
+        Value nnueRouterLmrReducedValue = VALUE_ZERO;
+#endif
+#if defined(USE_NNUE_ROUTER_LMR) && !defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)
+        bool nnueRouterLmrWouldAdjust = false;
+#endif
+
         if (depth >= 2 && moveCount > 1)
         {
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+            nnueSignalObservation.MarkLmr();
+            bool nnueSignalLmrResearched = false;
+#endif
+#if defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)
+            bool nnueRouterLmrAdjusted = false;
+            Depth nnueRouterLmrOriginalDepth = 0;
+
+            if (const auto* signal = nnueSignalObservation.Signal()) {
+                // Keep the Router-LMR rule independent of the selected bucket so
+                // the experiment remains applicable across networks whose bucket
+                // semantics and distributions differ.
+                const bool limitedRange = NNUE_ROUTER_LMR_VARIANT == 1
+                  || (depth >= 3 && depth <= 8 && moveCount <= 8);
+                nnueRouterLmrWouldAdjust = !PvNode && limitedRange
+                  && signal->router_margin <= NNUE_ROUTER_LMR_MARGIN_THRESHOLD;
+            }
+
+            if (nnueRouterLmrWouldAdjust) {
+                nnueRouterLmrOriginalRemainder = ((r % 1024) + 1024) % 1024;
+                nnueRouterLmrOriginalDepth =
+                  std::max(1, std::min(newDepth - r / 1024, newDepth + 2)) + PvNode;
+                const auto candidateDepth = std::max(
+                  1, std::min(newDepth - (r - NNUE_ROUTER_LMR_REDUCTION_DELTA) / 1024,
+                              newDepth + 2)) + PvNode;
+                nnueRouterLmrCandidateDepthIncrease =
+                  static_cast<int>(candidateDepth - nnueRouterLmrOriginalDepth);
+                const int counterfactualDeltas[4] = {256, 512, 768, 1024};
+                for (unsigned deltaIndex = 0; deltaIndex < 4; ++deltaIndex) {
+                    const auto counterfactualDepth = std::max(
+                      1, std::min(newDepth - (r - counterfactualDeltas[deltaIndex]) / 1024,
+                                  newDepth + 2)) + PvNode;
+                    if (counterfactualDepth > nnueRouterLmrOriginalDepth)
+                        nnueRouterLmrCounterfactualDeltaMask |= 1U << deltaIndex;
+                }
+            }
+            nnueRouterLmrAdjusted = NNUE_ROUTER_LMR_VARIANT != 0
+                                  && NNUE_ROUTER_LMR_VARIANT != 3
+                                  && nnueRouterLmrWouldAdjust;
+            if (nnueRouterLmrAdjusted) {
+                // r is fixed-point with 1024 units per ply.  Remove only 1/4 ply;
+                // integer rounding therefore changes the actual search depth only
+                // when the existing reduction lies close to a ply boundary.
+                r -= NNUE_ROUTER_LMR_REDUCTION_DELTA;
+            }
+#elif defined(USE_NNUE_ROUTER_LMR)
+            if (nnueRouterLmrSignal.valid) {
+                const bool limitedRange = depth >= 3 && depth <= 8 && moveCount <= 8;
+                nnueRouterLmrWouldAdjust = !PvNode && limitedRange
+                  && nnueRouterLmrSignal.router_margin <= NNUE_ROUTER_LMR_MARGIN_THRESHOLD;
+            }
+#endif
             /*
 			  💡 depthを減らして探索させて、その指し手がfail highしたら元のdepthで再度探索する。
 			      moveCountが大きいものなどは探索深さを減らしてざっくり調べる。
@@ -3615,9 +3786,33 @@ moves_loop:  // When in check, search starts here
 
 			Depth d = std::max(1, std::min(newDepth - r / 1024, newDepth + 2)) + PvNode;
 
+#if defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)
+            if (NNUE_ROUTER_LMR_VARIANT == 3 && nnueRouterLmrWouldAdjust
+                && d < newDepth) {
+                // Explicitly turn a positive N-ply reduction into N-1.  Checking
+                // d < newDepth is essential: a zero reduction must never become
+                // an extension, and r's sign/remainder no longer controls whether
+                // this experimental move receives the extra ply.
+                ++d;
+                nnueRouterLmrAdjusted = true;
+                nnueRouterLmrCandidateDepthIncrease =
+                  static_cast<int>(d - nnueRouterLmrOriginalDepth);
+            }
+#elif defined(USE_NNUE_ROUTER_LMR)
+            if (nnueRouterLmrWouldAdjust && d < newDepth)
+                // Only weaken an existing positive reduction.  A zero reduction
+                // can never become an extension.
+                ++d;
+#endif
+
             ss->reduction = newDepth - d;
             value         = -search<NonPV>(pos, ss + 1, -(alpha + 1), -alpha, d, true);
             ss->reduction = 0;
+#if defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)
+            nnueRouterLmrOutcomePending = nnueRouterLmrWouldAdjust;
+            nnueRouterLmrReducedFailHigh = value > alpha;
+            nnueRouterLmrReducedValue = value;
+#endif
 
             // Do a full-depth search when reduced LMR search fails high
             // 深さを減らした LMR 探索がfail highを出した場合は、full depth(元の探索深さ)で探索を行う
@@ -3637,8 +3832,16 @@ moves_loop:  // When in check, search starts here
 
                 newDepth += doDeeperSearch - doShallowerSearch;
 
-                if (newDepth > d)
+                if (newDepth > d) {
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+                    nnueSignalObservation.MarkLmrResearch();
+                    nnueSignalLmrResearched = true;
+#if defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)
+                    nnueRouterLmrWasResearched = true;
+#endif
+#endif
                     value = -search<NonPV>(pos, ss + 1, -(alpha + 1), -alpha, newDepth, !cutNode);
+                }
 
                 // Post LMR continuation history updates
                 // LMR後のcontinuation historyの更新
@@ -3647,6 +3850,17 @@ moves_loop:  // When in check, search starts here
             }
             else if (value > alpha && value < bestValue + 9)
                 newDepth--;
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+            nnueSignalObservation.RecordLmrEvent(moveCount, nnueSignalLmrResearched);
+#endif
+#if defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)
+            nnueSignalObservation.RecordRouterLmrExperiment(
+              nnueRouterLmrWouldAdjust, nnueRouterLmrAdjusted,
+              nnueRouterLmrAdjusted
+                ? (NNUE_ROUTER_LMR_VARIANT == 3 ? 1024 : NNUE_ROUTER_LMR_REDUCTION_DELTA) : 0,
+              nnueRouterLmrAdjusted ? static_cast<int>(d - nnueRouterLmrOriginalDepth) : 0,
+              nnueRouterLmrReducedFailHigh, nnueSignalLmrResearched);
+#endif
         }
 
 		// -----------------------
@@ -3833,6 +4047,19 @@ moves_loop:  // When in check, search starts here
 
         int inc = (value == bestValue && ss->ply + 2 >= rootDepth && (int(nodes) & 14) == 0
                    && !is_win(std::abs(value) + 1));
+
+#if defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)
+        if (nnueRouterLmrOutcomePending) {
+            const bool finalCutoff = value + inc > bestValue && value + inc > alpha
+                                  && value >= beta;
+            nnueSignalObservation.RecordRouterLmrCohortOutcome(
+              nnueRouterLmrCandidateDepthIncrease, nnueRouterLmrOriginalRemainder,
+              nnueRouterLmrCounterfactualDeltaMask, depth, moveCount,
+              nnueRouterLmrReducedFailHigh,
+              nnueRouterLmrWasResearched, static_cast<int>(nnueRouterLmrReducedValue),
+              static_cast<int>(value), value >= beta, finalCutoff);
+        }
+#endif
 
         if (value + inc > bestValue)
         {
@@ -4059,7 +4286,13 @@ moves_loop:  // When in check, search starts here
 	// 👉 qsearch()内の末尾にあるassertの文の説明を読むこと。
 	ASSERT_LV3(-VALUE_INFINITE < bestValue && bestValue < VALUE_INFINITE);
 
-    return bestValue;
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+    nnueSignalObservation.SetMoveCount(moveCount);
+#endif
+    const Value nnueSignalReturnValue = NNUE_SIGNAL_RETURN(bestValue);
+#undef NNUE_SIGNAL_EVALUATE
+#undef NNUE_SIGNAL_RETURN
+    return nnueSignalReturnValue;
 }
 
 
@@ -4175,6 +4408,11 @@ Value Search::YaneuraOuWorker::qsearch(Position& pos, Stack* ss, Value alpha, Va
     ss->inCheck                 = pos.checkers();
     moveCount                   = 0;
 
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+    NnueSignalLog::NodeObservation nnueQSignalObservation(
+      PvNode, ss->inCheck, Depth(0), alpha, beta, pos.state()->materialValue, ss->ply, true);
+#endif
+
 #if defined(USE_CLASSIC_EVAL) && defined(USE_LAZY_EVALUATE)
     bool evaluated = false;
     auto evaluate  = [&](Position& pos) {
@@ -4189,6 +4427,17 @@ Value Search::YaneuraOuWorker::qsearch(Position& pos, Stack* ss, Value alpha, Va
         }
         this->do_move(pos, move, st, givesCheck, ss);
     };
+#endif
+
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+    auto nnueQSignalEvaluate = [&]() {
+        const Value value = evaluate(pos);
+        nnueQSignalObservation.SetEvalAccess(Eval::NNUE::LastNnueSignalAccess());
+        return value;
+    };
+#define NNUE_QSIGNAL_EVALUATE() nnueQSignalEvaluate()
+#else
+#define NNUE_QSIGNAL_EVALUATE() evaluate(pos)
 #endif
 
 #if STOCKFISH
@@ -4329,6 +4578,9 @@ Value Search::YaneuraOuWorker::qsearch(Position& pos, Stack* ss, Value alpha, Va
     Value unadjustedStaticEval = VALUE_NONE;
     if (ss->inCheck)
     {
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+        nnueQSignalObservation.SetSource(Eval::NNUE::NnueSignalEvalSource::InCheckSkipped);
+#endif
         /*
 			📓	bestValueはalphaとは違う。
 				王手がかかっているときは-VALUE_INFINITEを初期値として、
@@ -4343,6 +4595,10 @@ Value Search::YaneuraOuWorker::qsearch(Position& pos, Stack* ss, Value alpha, Va
 
 		if (ss->ttHit)
         {
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+            nnueQSignalObservation.StaticEvalNeeded();
+            nnueQSignalObservation.SetSource(Eval::NNUE::NnueSignalEvalSource::TtEvalReuse);
+#endif
             // Never assume anything about values stored in TT
             // TT（置換表）に保存されている値については、決して何も仮定しないこと。
 
@@ -4351,11 +4607,11 @@ Value Search::YaneuraOuWorker::qsearch(Position& pos, Stack* ss, Value alpha, Va
 
             unadjustedStaticEval = ttData.eval;
             if (!is_valid(unadjustedStaticEval))
-                unadjustedStaticEval = evaluate(pos);
+                unadjustedStaticEval = NNUE_QSIGNAL_EVALUATE();
 #if defined(USE_CLASSIC_EVAL)
 			else if (PvNode) {
 				// 🌈 やねうら王独自
-				unadjustedStaticEval = evaluate(pos);
+				unadjustedStaticEval = NNUE_QSIGNAL_EVALUATE();
 				// ⇨ NNUEだとこれ入れたほうが強い可能性が…。
 			}
 #endif
@@ -4419,7 +4675,10 @@ Value Search::YaneuraOuWorker::qsearch(Position& pos, Stack* ss, Value alpha, Va
 
 			// 📌 ここからStockfishの元のコード 📌
 
-            unadjustedStaticEval = evaluate(pos);
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+            nnueQSignalObservation.StaticEvalNeeded();
+#endif
+            unadjustedStaticEval = NNUE_QSIGNAL_EVALUATE();
 
             ss->staticEval = bestValue =
 				to_corrected_static_eval(unadjustedStaticEval, correctionValue);
@@ -4432,6 +4691,10 @@ Value Search::YaneuraOuWorker::qsearch(Position& pos, Stack* ss, Value alpha, Va
 #endif
 
         }
+
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+        nnueQSignalObservation.SetStaticEval(ss->staticEval);
+#endif
 
         // Stand pat. Return immediately if static value is at least beta
         // Stand pat。静的評価値が少なくともベータ値に達している場合は直ちに返します
@@ -4775,6 +5038,7 @@ Value Search::YaneuraOuWorker::qsearch(Position& pos, Stack* ss, Value alpha, Va
 
 	ASSERT_LV3(-VALUE_INFINITE < bestValue && bestValue < VALUE_INFINITE);
 
+#undef NNUE_QSIGNAL_EVALUATE
     return bestValue;
 }
 

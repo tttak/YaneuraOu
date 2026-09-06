@@ -371,11 +371,48 @@
 // ここ以降では、↑↑↑で設定した内容に基づき必要なdefineを行う。
 // ===============================================================
 
+// NNUEの診断・実験用switch。
+// 必要なときだけコメントを解除する。通常公開buildではすべて無効のままにする。
+// #define ENABLE_NNUE_TRACE       // trace_fullなどのNNUE詳細trace
+// #define ENABLE_NNUE_BENCH       // test nnue bench_* の専用benchmark
+// #define ENABLE_NNUE_SIGNAL_LOG  // 探索中のNNUE内部signal収集・report
+//
+// ENABLE_NNUE_ROUTER_LMR_EXPERIMENTはENABLE_NNUE_SIGNAL_LOGを必要とするため、
+// 下の既定設定でsignal log有効時に自動定義する。ここでは直接定義しない。
+
+// SFNNwoP1536ではFeatureTransformerのelement-wise multiply構成を標準使用する。
+// 比較・検証用buildではDISABLE_ELEMENT_WISE_MULTIPLYを定義して無効化できる。
+#if defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536) \
+	&& !defined(DISABLE_ELEMENT_WISE_MULTIPLY)
+	#define USE_ELEMENT_WISE_MULTIPLY
+#endif
+
 // SFNNwoP1536ではFinny Tablesを標準使用する。
 // 比較・検証用buildではDISABLE_FINNY_TABLESを定義して無効化できる。
 #if defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536) \
 	&& !defined(DISABLE_FINNY_TABLES)
 	#define USE_FINNY_TABLES
+#endif
+
+// SFNNwoP1536ではMain/FM gateの近似sigmoid LUTを標準使用する。
+// 比較・検証用buildではDISABLE_NNUE_APPROX_SIGMOID_LUTを定義して無効化できる。
+#if defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536) \
+	&& !defined(DISABLE_NNUE_APPROX_SIGMOID_LUT)
+	#define USE_NNUE_APPROX_SIGMOID_LUT
+#endif
+
+// SFNNwoP1536ではRouter marginによるLMR variant 3を標準使用する。
+// ENABLE_NNUE_ROUTER_LMR_EXPERIMENTはsignal logger専用なので、通常buildでは
+// loggerを含まないUSE_NNUE_ROUTER_LMRを使用し、ENABLE_NNUE_SIGNAL_LOG付きの
+// 診断buildだけexperiment macroへ切り替える。
+// 比較・検証用buildではDISABLE_NNUE_ROUTER_LMRを定義して無効化できる。
+#if defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536) \
+	&& !defined(DISABLE_NNUE_ROUTER_LMR)
+	#if defined(ENABLE_NNUE_SIGNAL_LOG)
+		#define ENABLE_NNUE_ROUTER_LMR_EXPERIMENT
+	#else
+		#define USE_NNUE_ROUTER_LMR
+	#endif
 #endif
 
 // 通常探索時の最大探索深さ

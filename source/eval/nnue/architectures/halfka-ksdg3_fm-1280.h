@@ -4,11 +4,14 @@
 #include "../features/feature_set.h"
 #include "../features/half_ka.h"
 #include "../features/king_safety3_distinguishgolds.h"
+#include "../nnue_signal.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 
 #include "../layers/affine_transform_explicit.h"
 #include "../layers/affine_transform_sparse_input_explicit.h"
@@ -405,7 +408,11 @@ struct Network {
 #if defined(ENABLE_NNUE_BENCH)
 	template<bool UsePhasePrefix = true>
 #endif
-	const OutputType* Propagate(const TransformedFeatureType* transformedFeatures, const TransformedFeatureType* diffFeatures, const TransformedFeatureType* absFeatures, const int bucket_id, char* buffer) const {
+	const OutputType* Propagate(const TransformedFeatureType* transformedFeatures, const TransformedFeatureType* diffFeatures, const TransformedFeatureType* absFeatures, const int bucket_id, char* buffer
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+		, NnueSignalSnapshot* signal = nullptr
+#endif
+	) const {
 		auto& buf = *reinterpret_cast<Buffer*>(buffer);
 
 		// --- 1. Phase Gate: 局面の進行度や激しさに応じた動的スケーリング ---
@@ -442,6 +449,20 @@ struct Network {
 		float abs_raw_scale  = (0.5f + 0.5f * phase_val[3]) * 0.7f;
 		float abs_sqr_scale  = (0.5f + 0.5f * phase_val[4]) * 0.88f;
 		float cross_scale    = (0.5f + 0.5f * phase_val[5]) * 1.5f;
+
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+		if (signal) {
+			signal->phase_scale[0] = main_sqr_scale;
+			signal->phase_scale[1] = main_raw_scale;
+			signal->phase_scale[2] = diff_scale;
+			signal->phase_scale[3] = abs_raw_scale;
+			signal->phase_scale[4] = abs_sqr_scale;
+			signal->phase_scale[5] = cross_scale;
+			signal->main_reliance = main_sqr_scale + main_raw_scale;
+			signal->fm_reliance = diff_scale + abs_raw_scale + abs_sqr_scale;
+			signal->cross_reliance = cross_scale;
+		}
+#endif
 
 
 		// --- 2. FM Path: Factorization Machines 的な相互作用抽出 ---
@@ -556,6 +577,19 @@ struct Network {
 
 		// Main パスの 31 番目の要素を Bypass Path（直接出力）として利用
 		int32_t fwdOut_main = (int(buf.fc_0_out[31]) * (600 * 16)) / (127 * 64);
+
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+		if (signal) {
+			signal->deep_output = buf.fc_2_out[0];
+			signal->bypass_output = fwdOut_main;
+			const std::int64_t delta = static_cast<std::int64_t>(buf.fc_2_out[0]) - fwdOut_main;
+			signal->signed_deep_bypass = static_cast<std::int32_t>(
+				std::clamp<std::int64_t>(delta, std::numeric_limits<std::int32_t>::min(),
+				                         std::numeric_limits<std::int32_t>::max()));
+			signal->deep_bypass_disagreement = static_cast<std::int32_t>(
+				std::min<std::int64_t>(std::llabs(delta), std::numeric_limits<std::int32_t>::max()));
+		}
+#endif
 
 		// Deep Path (L3) と Bypass Path をバケットごとの alpha で加重平均
 		int64_t combined = (static_cast<int64_t>(buf.fc_2_out[0]) * bucket_blend_alpha) + 
