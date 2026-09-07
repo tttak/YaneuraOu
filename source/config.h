@@ -377,8 +377,10 @@
 // #define ENABLE_NNUE_BENCH       // test nnue bench_* の専用benchmark
 // #define ENABLE_NNUE_SIGNAL_LOG  // 探索中のNNUE内部signal収集・report
 // #define ENABLE_NNUE_RFP_SHADOW  // 成立したreverse futilityの一部をshadow探索
+// #define ENABLE_NNUE_CROSS_LMR_EXPERIMENT // Cross maxによるLMR +1 plyの診断A/B
 // #define USE_NNUE_PHASE_FM_LMR   // Router非対象の高評価・低FM relianceを明示的に+1 ply
 // #define DISABLE_NNUE_LCA_LMR    // 295/epoch20用LCA top-1% LMRを比較時に無効化
+// #define DISABLE_NNUE_CROSS_LMR  // Cross high-tail LMRを比較時に無効化
 //
 // ENABLE_NNUE_ROUTER_LMR_EXPERIMENTはENABLE_NNUE_SIGNAL_LOGを必要とするため、
 // 下の既定設定でsignal log有効時に自動定義する。ここでは直接定義しない。
@@ -436,6 +438,17 @@
 	#ifndef NNUE_LCA_LMR_SUM_THRESHOLD
 		#define NNUE_LCA_LMR_SUM_THRESHOLD 1897
 	#endif
+#endif
+
+// SFNNwoP1536の通常buildでは、Router/LCAで実際に+1 plyされなかったmoveのうち、
+// Cross出力が飽和上限に達した高リスク群も明示的に+1 plyする。
+// 診断logger側はENABLE_NNUE_CROSS_LMR_EXPERIMENTを使用するため、通常buildだけを
+// 既定ONにする。比較・検証用buildではDISABLE_NNUE_CROSS_LMRで無効化できる。
+#if defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536) \
+	&& !defined(ENABLE_NNUE_SIGNAL_LOG) \
+	&& defined(USE_NNUE_LCA_LMR) \
+	&& !defined(DISABLE_NNUE_CROSS_LMR)
+	#define USE_NNUE_CROSS_LMR
 #endif
 
 // 通常探索時の最大探索深さ

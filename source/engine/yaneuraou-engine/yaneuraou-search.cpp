@@ -66,6 +66,19 @@
 #error "ENABLE_NNUE_RFP_SHADOW requires ENABLE_NNUE_SIGNAL_LOG"
 #endif
 
+#if defined(ENABLE_NNUE_CROSS_LMR_EXPERIMENT) && !defined(ENABLE_NNUE_SIGNAL_LOG)
+#error "ENABLE_NNUE_CROSS_LMR_EXPERIMENT requires ENABLE_NNUE_SIGNAL_LOG"
+#endif
+
+#if defined(USE_NNUE_CROSS_LMR)
+#if !defined(USE_NNUE_ROUTER_LMR) || !defined(USE_NNUE_LCA_LMR)
+#error "USE_NNUE_CROSS_LMR requires production Router-LMR and LCA-LMR"
+#endif
+#ifndef NNUE_CROSS_LMR_MAX_THRESHOLD
+#define NNUE_CROSS_LMR_MAX_THRESHOLD 127
+#endif
+#endif
+
 namespace YaneuraOu {
 
 using namespace Search;
@@ -3735,13 +3748,18 @@ moves_loop:  // When in check, search starts here
         Value nnuePhaseFmLmrReducedValue = VALUE_ZERO;
         bool nnueLcaLmrCandidate = false;
         bool nnueLcaLmrAdjusted = false;
+        bool nnueCrossLmrCandidate = false;
+        bool nnueCrossLmrAdjusted = false;
 #endif
 
         if (depth >= 2 && moveCount > 1)
         {
 #if defined(ENABLE_NNUE_SIGNAL_LOG) || defined(USE_NNUE_PHASE_FM_LMR) \
- || defined(USE_NNUE_LCA_LMR)
+ || defined(USE_NNUE_LCA_LMR) || defined(USE_NNUE_CROSS_LMR)
             bool nnueRouterLmrActuallyAdjusted = false;
+#endif
+#if defined(USE_NNUE_CROSS_LMR)
+            bool nnueLcaLmrActuallyAdjusted = false;
 #endif
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
             nnueSignalObservation.MarkLmr();
@@ -3860,12 +3878,17 @@ moves_loop:  // When in check, search starts here
             // ensures that a zero reduction can never become an extension.
             if (!nnueRouterLmrActuallyAdjusted && nnueRouterLmrSignal.valid
                 && nnueRouterLmrSignal.lca_abs_delta_sum >= NNUE_LCA_LMR_SUM_THRESHOLD
-                && d < newDepth)
+                && d < newDepth) {
                 ++d;
+#if defined(USE_NNUE_CROSS_LMR)
+                nnueLcaLmrActuallyAdjusted = true;
+#endif
+            }
 #endif
 
-#if defined(ENABLE_NNUE_SIGNAL_LOG) && defined(ENABLE_NNUE_LCA_LMR_EXPERIMENT)
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
             if (const auto* signal = nnueSignalObservation.Signal()) {
+#if defined(ENABLE_NNUE_LCA_LMR_EXPERIMENT)
                 // 295/epoch20 calibration: top-1% mean delta 59.28125 is the
                 // exact byte-domain sum 1897 over 32 Diff channels.  Exclude
                 // moves already deepened by Router-LMR, and require d < newDepth
@@ -3876,6 +3899,40 @@ moves_loop:  // When in check, search starts here
                 if (NNUE_LCA_LMR_VARIANT == 1 && nnueLcaLmrCandidate) {
                     ++d;
                     nnueLcaLmrAdjusted = true;
+                }
+#else
+                // Shadow the deployable LCA cohort with the per-EvalDir
+                // diagnostic calibration. This records eligibility only and
+                // deliberately does not change d.
+                nnueLcaLmrCandidate = !nnueRouterLmrActuallyAdjusted
+                  && signal->lca_abs_delta_sum >= NNUE_COMBINED_LCA_SUM_THRESHOLD
+                  && d < newDepth;
+#endif
+            }
+#endif
+
+#if defined(USE_NNUE_CROSS_LMR) && !defined(ENABLE_NNUE_SIGNAL_LOG)
+            if (!nnueRouterLmrActuallyAdjusted && !nnueLcaLmrActuallyAdjusted
+                && nnueRouterLmrSignal.valid
+                && nnueRouterLmrSignal.cross_abs_max >= NNUE_CROSS_LMR_MAX_THRESHOLD
+                && depth >= 3 && depth <= 8 && moveCount <= 8
+                && d < newDepth) {
+                // Explicitly weaken only an existing positive reduction. The
+                // d < newDepth guard prevents reduction 0 becoming extension.
+                ++d;
+            }
+#endif
+
+#if defined(ENABLE_NNUE_CROSS_LMR_EXPERIMENT)
+            if (const auto* signal = nnueSignalObservation.Signal()) {
+                nnueCrossLmrCandidate = !nnueRouterLmrActuallyAdjusted
+                  && !nnueLcaLmrAdjusted
+                  && signal->cross_abs_max >= NNUE_CROSS_LMR_MAX_THRESHOLD
+                  && depth >= 3 && depth <= 8 && moveCount <= 8
+                  && d < newDepth;
+                if (NNUE_CROSS_LMR_VARIANT == 1 && nnueCrossLmrCandidate) {
+                    ++d;
+                    nnueCrossLmrAdjusted = true;
                 }
             }
 #endif
@@ -4163,7 +4220,8 @@ moves_loop:  // When in check, search starts here
               static_cast<int>(nnuePhaseFmLmrReducedValue), static_cast<int>(value),
               value >= beta, finalCutoff, nnuePhaseFmLmrCandidate,
               nnuePhaseFmLmrAdjusted, nnueLcaLmrCandidate,
-              nnueLcaLmrAdjusted);
+              nnueLcaLmrAdjusted, nnueCrossLmrCandidate,
+              nnueCrossLmrAdjusted);
         }
 #endif
 

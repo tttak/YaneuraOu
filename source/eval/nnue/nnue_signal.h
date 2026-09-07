@@ -23,6 +23,10 @@ struct NnueRouterLmrSignal {
     // The 295/epoch20 top-1% experiment compares this integer directly.
     std::int32_t lca_abs_delta_sum = 0;
 #endif
+#if defined(USE_NNUE_CROSS_LMR)
+    // Maximum of the 32 uint8 Cross activations, used by Cross-LMR.
+    std::uint8_t cross_abs_max = 0;
+#endif
 #if defined(USE_NNUE_PHASE_FM_LMR)
     float fm_reliance = 0.0f;
 #endif
@@ -56,6 +60,14 @@ struct NnueSignalSnapshot {
     float main_reliance = 0.0f;
     float fm_reliance = 0.0f;
     float cross_reliance = 0.0f;
+    // Existing Diff RMSNorm reduction result. This is the sum of squares of
+    // the 32 value channels before sqrt/division; diagnostics reuse it without
+    // another pass over diff_fc_out.
+    float diff_rms_energy_sum = 0.0f;
+    // Cross activation is uint8_t, so abs(value) == value. Both summaries are
+    // collected from the completed 32-byte output without changing its values.
+    std::uint16_t cross_abs_sum = 0;
+    std::uint8_t cross_abs_max = 0;
     float lca_mean_abs_delta = 0.0f;
     std::int32_t lca_max_abs_delta = 0;
     std::int32_t lca_abs_delta_sum = 0;

@@ -8,6 +8,17 @@
 
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
 
+#include <memory>
+
+#ifndef NNUE_COMBINED_LCA_SUM_THRESHOLD
+// Per-build calibration for the combined Router/LCA diagnostic.
+// 295/epoch20 top 1%: 1897. 297/epoch0 top 1%: 1230.
+#define NNUE_COMBINED_LCA_SUM_THRESHOLD 1897
+#endif
+#if NNUE_COMBINED_LCA_SUM_THRESHOLD < 0 || NNUE_COMBINED_LCA_SUM_THRESHOLD > 4064
+#error "NNUE_COMBINED_LCA_SUM_THRESHOLD must be in [0, 4064]"
+#endif
+
 #if defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)
 #ifndef NNUE_ROUTER_LMR_VARIANT
 #define NNUE_ROUTER_LMR_VARIANT 3
@@ -27,6 +38,7 @@
 #ifndef NNUE_LCA_LMR_VARIANT
 #define NNUE_LCA_LMR_VARIANT 0
 #endif
+
 #ifndef NNUE_LCA_LMR_SUM_THRESHOLD
 // 295/epoch20 top-1% cutoff: mean 59.28125 == exact delta sum 1897 / 32.
 #define NNUE_LCA_LMR_SUM_THRESHOLD 1897
@@ -36,6 +48,18 @@
 #endif
 #if NNUE_LCA_LMR_SUM_THRESHOLD < 0 || NNUE_LCA_LMR_SUM_THRESHOLD > 4064
 #error "NNUE_LCA_LMR_SUM_THRESHOLD must be in [0, 4064]"
+#endif
+#endif
+
+#if defined(ENABLE_NNUE_CROSS_LMR_EXPERIMENT)
+#ifndef NNUE_CROSS_LMR_VARIANT
+#define NNUE_CROSS_LMR_VARIANT 0
+#endif
+#ifndef NNUE_CROSS_LMR_MAX_THRESHOLD
+#define NNUE_CROSS_LMR_MAX_THRESHOLD 127
+#endif
+#if NNUE_CROSS_LMR_VARIANT < 0 || NNUE_CROSS_LMR_VARIANT > 1
+#error "NNUE_CROSS_LMR_VARIANT must be 0 (shadow) or 1 (explicit +1 ply)"
 #endif
 #endif
 
@@ -84,6 +108,20 @@ constexpr std::array<float, kLcaThresholdCount> kLcaThresholds = {
   16.0f, 24.0f, 32.0f, 48.0f, 64.0f};
 constexpr std::size_t kLcaDeltaSumMax = 32 * 127;
 constexpr std::size_t kLcaPercentileCount = 5;
+constexpr std::size_t kCombinedSignalGroups = 4;
+constexpr std::size_t kDiffRmsEnergyBins = 10;
+constexpr std::array<float, kDiffRmsEnergyBins - 1> kDiffRmsEdges = {
+  512.0f, 1024.0f, 2048.0f, 4096.0f, 8192.0f,
+  16384.0f, 32768.0f, 65536.0f, 131072.0f};
+constexpr std::size_t kCrossActivityBins = 10;
+constexpr std::size_t kCrossOverlapGroups = 8;
+constexpr std::size_t kCrossDeployableThresholdCount = 3;
+constexpr std::array<std::uint8_t, kCrossDeployableThresholdCount>
+  kCrossDeployableThresholds = {125, 126, 127};
+constexpr std::array<std::uint16_t, kCrossActivityBins - 1> kCrossMeanAbsEdges = {
+  4, 8, 16, 24, 32, 48, 64, 80, 96};
+constexpr std::array<std::uint8_t, kCrossActivityBins - 1> kCrossMaxAbsEdges = {
+  16, 32, 48, 64, 80, 96, 112, 120, 126};
 constexpr std::array<std::uint32_t, kLcaPercentileCount> kLcaTopBasisPoints = {
   100, 250, 500, 1000, 2000};
 constexpr std::size_t kFmJointBaseStrata =
@@ -181,6 +219,18 @@ struct PhaseFmLmrBucket {
     std::uint64_t research_score_samples = 0;
     std::uint64_t research_score_abs_delta_sum = 0;
     std::uint64_t research_score_abs_delta_max = 0;
+};
+
+template<std::size_t Bins>
+struct ConditionedLmrSignalStats {
+    std::array<PhaseFmLmrBucket, Bins> all{};
+    std::array<std::array<PhaseFmLmrBucket, Bins>, kConditionBins> by_depth{};
+    std::array<std::array<PhaseFmLmrBucket, Bins>, kConditionBins> by_move_count{};
+    std::array<std::array<PhaseFmLmrBucket, Bins>, kBucketCount> by_bucket{};
+    std::array<std::array<PhaseFmLmrBucket, Bins>, kConditionBins> by_static_eval{};
+    std::array<std::array<PhaseFmLmrBucket, Bins>, kRouterMarginGroups> by_router{};
+    std::array<std::array<PhaseFmLmrBucket, Bins>, 2> by_lca_tail{};
+    std::array<PhaseFmLmrBucket, kFmJointBaseStrata * 2 * Bins> joint{};
 };
 
 // Counterfactual LCA cohorts. These are diagnostic-only observations of moves
@@ -338,6 +388,7 @@ struct ThreadStats {
       phase_fm_lmr_extreme_by_sign_and_bucket{};
     PhaseFmLmrExperimentStats phase_fm_lmr_experiment{};
     LcaLmrExperimentStats lca_lmr_experiment{};
+    LcaLmrExperimentStats cross_lmr_experiment{};
     std::uint64_t lca_lmr_moves = 0;
     std::uint64_t lca_lmr_signal_valid_moves = 0;
     PhaseFmLmrBucket lca_lmr_all_outcomes{};
@@ -364,6 +415,49 @@ struct ThreadStats {
     // back into production search.
     std::array<PhaseFmLmrBucket, kLcaDeltaSumMax + 1>
       lca_non_router_by_delta_sum{};
+    // A=Router only, B=LCA only, C=both, D=neither. Keep Router danger exactly
+    // aligned with the production variant-3 predicate: non-PV, configured
+    // margin threshold, depth 3..8, moveCount 2..8, no bucket exclusion.
+    std::array<PhaseFmLmrBucket, kCombinedSignalGroups> combined_signal{};
+    std::array<std::array<PhaseFmLmrBucket, kConditionBins>, kCombinedSignalGroups>
+      combined_signal_by_depth{};
+    std::array<std::array<PhaseFmLmrBucket, kConditionBins>, kCombinedSignalGroups>
+      combined_signal_by_move_count{};
+    std::array<std::array<PhaseFmLmrBucket, kBucketCount>, kCombinedSignalGroups>
+      combined_signal_by_bucket{};
+    std::array<std::array<PhaseFmLmrBucket, kConditionBins>, kCombinedSignalGroups>
+      combined_signal_by_static_eval{};
+    // Diff RMS energy reuses the existing RMSNorm sum-of-squares. Detailed
+    // bins are expressed as equivalent RMS ranges, but classification compares
+    // sum_sq directly and therefore performs no diagnostic sqrt or reduction.
+    std::array<PhaseFmLmrBucket, kDiffRmsEnergyBins> diff_rms_lmr{};
+    std::array<std::array<PhaseFmLmrBucket, kDiffRmsEnergyBins>, kConditionBins>
+      diff_rms_lmr_by_depth{};
+    std::array<std::array<PhaseFmLmrBucket, kDiffRmsEnergyBins>, kConditionBins>
+      diff_rms_lmr_by_move_count{};
+    std::array<std::array<PhaseFmLmrBucket, kDiffRmsEnergyBins>, kBucketCount>
+      diff_rms_lmr_by_bucket{};
+    std::array<std::array<PhaseFmLmrBucket, kDiffRmsEnergyBins>, kConditionBins>
+      diff_rms_lmr_by_static_eval{};
+    std::array<std::array<PhaseFmLmrBucket, kDiffRmsEnergyBins>, kRouterMarginGroups>
+      diff_rms_lmr_by_router{};
+    std::array<std::array<PhaseFmLmrBucket, kDiffRmsEnergyBins>, 2>
+      diff_rms_lmr_by_lca_tail{};
+    // Flat index: (depth, moveCount, bucket, |staticEval|, router group,
+    // calibrated LCA high-tail, Diff RMS energy bin).
+    std::array<PhaseFmLmrBucket,
+               kFmJointBaseStrata * 2 * kDiffRmsEnergyBins> diff_rms_lmr_joint{};
+    ConditionedLmrSignalStats<kCrossActivityBins> cross_mean_abs_lmr{};
+    ConditionedLmrSignalStats<kCrossActivityBins> cross_max_abs_lmr{};
+    // Bit layout: bit2=Cross max>=126, bit1=Router actual +1 ply,
+    // bit0=LCA. Raw uses the calibrated LCA threshold irrespective of Router;
+    // eligible uses the actual shadow application predicate after Router.
+    std::array<PhaseFmLmrBucket, kCrossOverlapGroups> cross_overlap_raw{};
+    std::array<PhaseFmLmrBucket, kCrossOverlapGroups> cross_overlap_eligible{};
+    // Counterfactual Cross cohorts which neither production Router-LMR nor
+    // the calibrated LCA-LMR predicate would deepen. Thresholds are cumulative.
+    std::array<LcaThresholdCohortStats, kCrossDeployableThresholdCount>
+      cross_deployable_thresholds{};
     std::array<CorrelationSums, 4> control_correlation{};  // depth, |eval|, |material|, ply
     std::array<std::array<std::array<std::array<PhaseStratum, kConditionBins>,
                                      kConditionBins>,
@@ -493,6 +587,50 @@ inline std::size_t LcaMagnitudeGroup(const float value) {
     if (value < 8.00f) return 1;
     if (value < 32.0f) return 2;
     return 3;
+}
+
+inline std::size_t DiffRmsEnergyBin(const float sum_sq) {
+    // sum_sq is the already-computed sum over 32 value channels. Compare
+    // against 32 * RMS^2 so diagnostics do not add sqrt or another reduction.
+    for (std::size_t bin = 0; bin < kDiffRmsEdges.size(); ++bin)
+        if (sum_sq < 32.0f * kDiffRmsEdges[bin] * kDiffRmsEdges[bin])
+            return bin;
+    return kDiffRmsEnergyBins - 1;
+}
+
+inline std::string DiffRmsEnergyLabel(const std::size_t bin) {
+    if (bin == 0)
+        return "RMS<" + std::to_string(static_cast<int>(kDiffRmsEdges[0]));
+    if (bin + 1 == kDiffRmsEnergyBins)
+        return "RMS>=" + std::to_string(
+          static_cast<int>(kDiffRmsEdges[kDiffRmsEdges.size() - 1]));
+    return "RMS[" + std::to_string(static_cast<int>(kDiffRmsEdges[bin - 1]))
+         + "," + std::to_string(static_cast<int>(kDiffRmsEdges[bin])) + ")";
+}
+
+inline std::size_t CrossMeanAbsBin(const std::uint16_t sum) {
+    for (std::size_t bin = 0; bin < kCrossMeanAbsEdges.size(); ++bin)
+        if (sum < 32U * kCrossMeanAbsEdges[bin])
+            return bin;
+    return kCrossActivityBins - 1;
+}
+
+inline std::size_t CrossMaxAbsBin(const std::uint8_t maximum) {
+    for (std::size_t bin = 0; bin < kCrossMaxAbsEdges.size(); ++bin)
+        if (maximum < kCrossMaxAbsEdges[bin])
+            return bin;
+    return kCrossActivityBins - 1;
+}
+
+template<typename EdgeType, std::size_t Size>
+inline std::string CrossActivityLabel(const char* name, const std::size_t bin,
+                                      const std::array<EdgeType, Size>& edges) {
+    if (bin == 0)
+        return std::string(name) + "<" + std::to_string(edges[0]);
+    if (bin == Size)
+        return std::string(name) + ">=" + std::to_string(edges[Size - 1]);
+    return std::string(name) + "[" + std::to_string(edges[bin - 1]) + ","
+         + std::to_string(edges[bin]) + ")";
 }
 
 inline std::size_t FmRelianceGroup(const float value) {
@@ -811,7 +949,8 @@ class NodeObservation {
                                  const int final_value, const bool beta_exceeded,
                                  const bool final_cutoff, const bool phase_fm_candidate,
                                  const bool phase_fm_adjusted,
-                                 const bool lca_candidate, const bool lca_adjusted) {
+                                 const bool lca_candidate, const bool lca_adjusted,
+                                 const bool cross_candidate, const bool cross_adjusted) {
         auto& stats = LocalStats();
         const auto add = [&](PhaseFmLmrBucket& value) {
             ++value.moves;
@@ -846,6 +985,74 @@ class NodeObservation {
         const auto router_group = RouterMarginGroup(access_.signal.router_margin);
         const auto fm_group = FmRelianceGroup(access_.signal.fm_reliance);
         const auto fm_fine_group = FmRelianceFineGroup(access_.signal.fm_reliance);
+
+        const bool router_danger = !pv_ && depth >= 3 && depth <= 8
+          && move_count >= 2 && move_count <= 8
+          && access_.signal.router_margin <= NNUE_ROUTER_LMR_MARGIN_THRESHOLD;
+        const bool lca_danger =
+          access_.signal.lca_abs_delta_sum >= NNUE_COMBINED_LCA_SUM_THRESHOLD;
+        const std::size_t combined_group = router_danger
+          ? (lca_danger ? 2U : 0U)
+          : (lca_danger ? 1U : 3U);
+        add(stats.combined_signal[combined_group]);
+        add(stats.combined_signal_by_depth[combined_group][depth_bin]);
+        add(stats.combined_signal_by_move_count[combined_group][move_bin]);
+        add(stats.combined_signal_by_bucket[combined_group][bucket]);
+        add(stats.combined_signal_by_static_eval[combined_group][static_bin]);
+
+        const auto diff_rms_bin = DiffRmsEnergyBin(access_.signal.diff_rms_energy_sum);
+        const std::size_t lca_tail = lca_danger ? 1U : 0U;
+        add(stats.diff_rms_lmr[diff_rms_bin]);
+        add(stats.diff_rms_lmr_by_depth[depth_bin][diff_rms_bin]);
+        add(stats.diff_rms_lmr_by_move_count[move_bin][diff_rms_bin]);
+        add(stats.diff_rms_lmr_by_bucket[bucket][diff_rms_bin]);
+        add(stats.diff_rms_lmr_by_static_eval[static_bin][diff_rms_bin]);
+        add(stats.diff_rms_lmr_by_router[router_group][diff_rms_bin]);
+        add(stats.diff_rms_lmr_by_lca_tail[lca_tail][diff_rms_bin]);
+        const auto diff_rms_joint =
+          (FmJointBaseIndex(depth_bin, move_bin, bucket, static_bin, router_group) * 2
+             + lca_tail) * kDiffRmsEnergyBins + diff_rms_bin;
+        add(stats.diff_rms_lmr_joint[diff_rms_joint]);
+
+        const auto add_cross_activity = [&](auto& activity, const std::size_t bin) {
+            add(activity.all[bin]);
+            add(activity.by_depth[depth_bin][bin]);
+            add(activity.by_move_count[move_bin][bin]);
+            add(activity.by_bucket[bucket][bin]);
+            add(activity.by_static_eval[static_bin][bin]);
+            add(activity.by_router[router_group][bin]);
+            add(activity.by_lca_tail[lca_tail][bin]);
+            const auto joint =
+              (FmJointBaseIndex(depth_bin, move_bin, bucket, static_bin, router_group) * 2
+                 + lca_tail) * kCrossActivityBins + bin;
+            add(activity.joint[joint]);
+        };
+        add_cross_activity(stats.cross_mean_abs_lmr,
+                           CrossMeanAbsBin(access_.signal.cross_abs_sum));
+        add_cross_activity(stats.cross_max_abs_lmr,
+                           CrossMaxAbsBin(access_.signal.cross_abs_max));
+        const bool cross_danger = access_.signal.cross_abs_max >= 126;
+        const std::size_t raw_overlap = (cross_danger ? 4U : 0U)
+                                      | (router_adjusted ? 2U : 0U)
+                                      | (lca_danger ? 1U : 0U);
+        const std::size_t eligible_overlap = (cross_danger ? 4U : 0U)
+                                           | (router_adjusted ? 2U : 0U)
+                                           | (lca_candidate ? 1U : 0U);
+        add(stats.cross_overlap_raw[raw_overlap]);
+        add(stats.cross_overlap_eligible[eligible_overlap]);
+        if (!router_adjusted && !lca_candidate) {
+            for (std::size_t threshold = 0;
+                 threshold < kCrossDeployableThresholdCount; ++threshold) {
+                if (access_.signal.cross_abs_max < kCrossDeployableThresholds[threshold])
+                    continue;
+                auto& cohort = stats.cross_deployable_thresholds[threshold];
+                add(cohort.total);
+                add(cohort.by_depth[depth_bin]);
+                add(cohort.by_move_count[move_bin]);
+                add(cohort.by_bucket[bucket]);
+                add(cohort.by_static_eval[static_bin]);
+            }
+        }
 
         add(stats.phase_fm_lmr[fm_bin]);
         add(stats.phase_fm_lmr_by_depth[depth_bin][fm_bin]);
@@ -928,6 +1135,21 @@ class NodeObservation {
             add(lca_experiment.adjusted_by_depth[depth_bin]);
             add(lca_experiment.adjusted_by_move_count[move_bin]);
             add(lca_experiment.adjusted_by_static_eval[static_bin]);
+        }
+        auto& cross_experiment = stats.cross_lmr_experiment;
+        if (cross_candidate) {
+            add(cross_experiment.candidate_outcomes);
+            add(cross_experiment.candidate_by_bucket[bucket]);
+            add(cross_experiment.candidate_by_depth[depth_bin]);
+            add(cross_experiment.candidate_by_move_count[move_bin]);
+            add(cross_experiment.candidate_by_static_eval[static_bin]);
+        }
+        if (cross_adjusted) {
+            add(cross_experiment.adjusted_outcomes);
+            add(cross_experiment.adjusted_by_bucket[bucket]);
+            add(cross_experiment.adjusted_by_depth[depth_bin]);
+            add(cross_experiment.adjusted_by_move_count[move_bin]);
+            add(cross_experiment.adjusted_by_static_eval[static_bin]);
         }
     }
 #if defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)
@@ -1157,8 +1379,7 @@ inline void AddCorrelation(CorrelationSums& dst, const CorrelationSums& src) {
     dst.sxy += src.sxy;
 }
 
-inline ThreadStats Snapshot() {
-    ThreadStats result{};
+inline void Snapshot(ThreadStats& result) {
     std::lock_guard<std::mutex> lock(g_registry_mutex);
     for (const auto* stats : g_thread_stats) {
         AddCoverage(result.total, stats->total);
@@ -1275,6 +1496,8 @@ inline ThreadStats Snapshot() {
                                 stats->phase_fm_lmr_experiment);
         AddLcaLmrExperiment(result.lca_lmr_experiment,
                             stats->lca_lmr_experiment);
+        AddLcaLmrExperiment(result.cross_lmr_experiment,
+                            stats->cross_lmr_experiment);
         result.lca_lmr_moves += stats->lca_lmr_moves;
         result.lca_lmr_signal_valid_moves += stats->lca_lmr_signal_valid_moves;
         AddPhaseFmLmr(result.lca_lmr_all_outcomes, stats->lca_lmr_all_outcomes);
@@ -1320,6 +1543,82 @@ inline ThreadStats Snapshot() {
         for (std::size_t sum = 0; sum <= kLcaDeltaSumMax; ++sum)
             AddPhaseFmLmr(result.lca_non_router_by_delta_sum[sum],
                           stats->lca_non_router_by_delta_sum[sum]);
+        for (std::size_t group = 0; group < kCombinedSignalGroups; ++group) {
+            AddPhaseFmLmr(result.combined_signal[group], stats->combined_signal[group]);
+            for (std::size_t bin = 0; bin < kConditionBins; ++bin) {
+                AddPhaseFmLmr(result.combined_signal_by_depth[group][bin],
+                              stats->combined_signal_by_depth[group][bin]);
+                AddPhaseFmLmr(result.combined_signal_by_move_count[group][bin],
+                              stats->combined_signal_by_move_count[group][bin]);
+                AddPhaseFmLmr(result.combined_signal_by_static_eval[group][bin],
+                              stats->combined_signal_by_static_eval[group][bin]);
+            }
+            for (std::size_t bucket = 0; bucket < kBucketCount; ++bucket)
+                AddPhaseFmLmr(result.combined_signal_by_bucket[group][bucket],
+                              stats->combined_signal_by_bucket[group][bucket]);
+        }
+        for (std::size_t bin = 0; bin < kDiffRmsEnergyBins; ++bin) {
+            AddPhaseFmLmr(result.diff_rms_lmr[bin], stats->diff_rms_lmr[bin]);
+            for (std::size_t group = 0; group < kConditionBins; ++group) {
+                AddPhaseFmLmr(result.diff_rms_lmr_by_depth[group][bin],
+                              stats->diff_rms_lmr_by_depth[group][bin]);
+                AddPhaseFmLmr(result.diff_rms_lmr_by_move_count[group][bin],
+                              stats->diff_rms_lmr_by_move_count[group][bin]);
+                AddPhaseFmLmr(result.diff_rms_lmr_by_static_eval[group][bin],
+                              stats->diff_rms_lmr_by_static_eval[group][bin]);
+            }
+            for (std::size_t bucket = 0; bucket < kBucketCount; ++bucket)
+                AddPhaseFmLmr(result.diff_rms_lmr_by_bucket[bucket][bin],
+                              stats->diff_rms_lmr_by_bucket[bucket][bin]);
+            for (std::size_t router = 0; router < kRouterMarginGroups; ++router)
+                AddPhaseFmLmr(result.diff_rms_lmr_by_router[router][bin],
+                              stats->diff_rms_lmr_by_router[router][bin]);
+            for (std::size_t tail = 0; tail < 2; ++tail)
+                AddPhaseFmLmr(result.diff_rms_lmr_by_lca_tail[tail][bin],
+                              stats->diff_rms_lmr_by_lca_tail[tail][bin]);
+        }
+        for (std::size_t index = 0; index < result.diff_rms_lmr_joint.size(); ++index)
+            AddPhaseFmLmr(result.diff_rms_lmr_joint[index],
+                          stats->diff_rms_lmr_joint[index]);
+        const auto add_cross_activity = [&](auto& dst, const auto& src) {
+            for (std::size_t bin = 0; bin < kCrossActivityBins; ++bin) {
+                AddPhaseFmLmr(dst.all[bin], src.all[bin]);
+                for (std::size_t group = 0; group < kConditionBins; ++group) {
+                    AddPhaseFmLmr(dst.by_depth[group][bin], src.by_depth[group][bin]);
+                    AddPhaseFmLmr(dst.by_move_count[group][bin], src.by_move_count[group][bin]);
+                    AddPhaseFmLmr(dst.by_static_eval[group][bin], src.by_static_eval[group][bin]);
+                }
+                for (std::size_t bucket = 0; bucket < kBucketCount; ++bucket)
+                    AddPhaseFmLmr(dst.by_bucket[bucket][bin], src.by_bucket[bucket][bin]);
+                for (std::size_t router = 0; router < kRouterMarginGroups; ++router)
+                    AddPhaseFmLmr(dst.by_router[router][bin], src.by_router[router][bin]);
+                for (std::size_t tail = 0; tail < 2; ++tail)
+                    AddPhaseFmLmr(dst.by_lca_tail[tail][bin], src.by_lca_tail[tail][bin]);
+            }
+            for (std::size_t index = 0; index < dst.joint.size(); ++index)
+                AddPhaseFmLmr(dst.joint[index], src.joint[index]);
+        };
+        add_cross_activity(result.cross_mean_abs_lmr, stats->cross_mean_abs_lmr);
+        add_cross_activity(result.cross_max_abs_lmr, stats->cross_max_abs_lmr);
+        for (std::size_t group = 0; group < kCrossOverlapGroups; ++group) {
+            AddPhaseFmLmr(result.cross_overlap_raw[group],
+                          stats->cross_overlap_raw[group]);
+            AddPhaseFmLmr(result.cross_overlap_eligible[group],
+                          stats->cross_overlap_eligible[group]);
+        }
+        for (std::size_t threshold = 0;
+             threshold < kCrossDeployableThresholdCount; ++threshold) {
+            auto& dst = result.cross_deployable_thresholds[threshold];
+            const auto& src = stats->cross_deployable_thresholds[threshold];
+            AddPhaseFmLmr(dst.total, src.total);
+            for (std::size_t group = 0; group < kConditionBins; ++group) {
+                AddPhaseFmLmr(dst.by_depth[group], src.by_depth[group]);
+                AddPhaseFmLmr(dst.by_move_count[group], src.by_move_count[group]);
+                AddPhaseFmLmr(dst.by_static_eval[group], src.by_static_eval[group]);
+            }
+            for (std::size_t bucket = 0; bucket < kBucketCount; ++bucket)
+                AddPhaseFmLmr(dst.by_bucket[bucket], src.by_bucket[bucket]);
+        }
         for (std::size_t bin = 0; bin < kSignalBins; ++bin) {
             auto& dst = result.futility_eligible[bin];
             const auto& src = stats->futility_eligible[bin];
@@ -1412,7 +1711,6 @@ inline ThreadStats Snapshot() {
                   source_experiment.counterfactual_delta_by_remainder[delta_index][bin];
 #endif
     }
-    return result;
 }
 
 inline double Percent(const std::uint64_t numerator, const std::uint64_t denominator) {
@@ -1612,8 +1910,50 @@ inline void PrintConditionalLcaLmr(
     }
 }
 
+template<std::size_t Groups>
+inline void PrintConditionalDiffRms(
+  std::ostream& out, const char* title, const std::array<const char*, Groups>& labels,
+  const std::array<std::array<PhaseFmLmrBucket, kDiffRmsEnergyBins>, Groups>& table) {
+    out << '[' << title << "]\n";
+    for (std::size_t group = 0; group < Groups; ++group) {
+        out << "  {" << labels[group] << "}\n";
+        for (std::size_t bin = 0; bin < kDiffRmsEnergyBins; ++bin) {
+            const auto& value = table[group][bin];
+            if (!value.moves)
+                continue;
+            out << "    " << DiffRmsEnergyLabel(bin);
+            PrintPhaseFmLmrValue(out, value);
+            out << '\n';
+        }
+    }
+}
+
+template<std::size_t Groups, typename EdgeType, std::size_t EdgeCount>
+inline void PrintConditionalCrossActivity(
+  std::ostream& out, const char* title, const char* signal_name,
+  const std::array<const char*, Groups>& labels,
+  const std::array<std::array<PhaseFmLmrBucket, kCrossActivityBins>, Groups>& table,
+  const std::array<EdgeType, EdgeCount>& edges) {
+    out << '[' << title << "]\n";
+    for (std::size_t group = 0; group < Groups; ++group) {
+        out << "  {" << labels[group] << "}\n";
+        for (std::size_t bin = 0; bin < kCrossActivityBins; ++bin) {
+            const auto& value = table[group][bin];
+            if (!value.moves)
+                continue;
+            out << "    " << CrossActivityLabel(signal_name, bin, edges);
+            PrintPhaseFmLmrValue(out, value);
+            out << '\n';
+        }
+    }
+}
+
 inline void Report(std::ostream& out) {
-    const auto stats = Snapshot();
+    // Diagnostic matrices can be several MiB. Keep the aggregate off the
+    // search thread's fixed-size stack while producing the report.
+    const auto stats_storage = std::make_unique<ThreadStats>();
+    Snapshot(*stats_storage);
+    const auto& stats = *stats_storage;
     out << "[NNUE search signal diagnostics]\n"
         << "  coverage scope: main search and qsearch nodes\n"
         << "  prediction population: main-search fresh evaluations with an observed non-decisive return value\n"
@@ -2140,6 +2480,260 @@ inline void Report(std::ostream& out) {
         out << '\n';
     }
 
+    static constexpr std::array<const char*, kCombinedSignalGroups>
+      combined_group_labels = {
+        "A Router danger only", "B LCA danger only",
+        "C Router danger AND LCA danger", "D neither danger"};
+    out << "[Router margin x calibrated LCA top-tail complementary groups]\n"
+        << "  Router danger: production variant-3 predicate; non-PV, margin<="
+        << NNUE_ROUTER_LMR_MARGIN_THRESHOLD << ", "
+           "depth=3..8, moveCount=2..8, no bucket exclusion\n"
+        << "  LCA danger   : exact delta sum >=" << NNUE_COMBINED_LCA_SUM_THRESHOLD
+        << " (mean >=" << (double(NNUE_COMBINED_LCA_SUM_THRESHOLD) / 32.0) << ")\n";
+    std::uint64_t combined_classified_moves = 0;
+    for (const auto& group : stats.combined_signal)
+        combined_classified_moves += group.moves;
+    out << "  classified signal-valid LMR moves: " << combined_classified_moves
+        << " / " << stats.lca_lmr_moves << " ("
+        << Percent(combined_classified_moves, stats.lca_lmr_moves) << "%)\n";
+    for (std::size_t group = 0; group < kCombinedSignalGroups; ++group) {
+        out << "  " << combined_group_labels[group]
+            << " all-LMR-rate="
+            << Percent(stats.combined_signal[group].moves, stats.lca_lmr_moves) << '%';
+        PrintPhaseFmLmrValue(out, stats.combined_signal[group]);
+        out << '\n';
+    }
+    const auto print_combined_breakdown =
+      [&](const char* title, const auto& labels, const auto member) {
+        out << "  by " << title << '\n';
+        for (std::size_t group = 0; group < kCombinedSignalGroups; ++group) {
+            out << "    {" << combined_group_labels[group] << "}\n";
+            const auto& table = stats.*member;
+            for (std::size_t bin = 0; bin < table[group].size(); ++bin) {
+                if (!table[group][bin].moves)
+                    continue;
+                out << "      " << labels[bin];
+                PrintPhaseFmLmrValue(out, table[group][bin]);
+                out << '\n';
+            }
+        }
+      };
+    print_combined_breakdown("depth", depth_labels,
+                             &ThreadStats::combined_signal_by_depth);
+    print_combined_breakdown("moveCount", move_labels,
+                             &ThreadStats::combined_signal_by_move_count);
+    print_combined_breakdown("selected bucket", bucket_labels,
+                             &ThreadStats::combined_signal_by_bucket);
+    print_combined_breakdown("|staticEval|", magnitude_labels,
+                             &ThreadStats::combined_signal_by_static_eval);
+
+    out << "[Diff RMS energy LMR move outcomes]\n"
+        << "  signal: existing RMSNorm sum_sq over 32 Diff value channels; "
+           "labels show sqrt(sum_sq/32) ranges\n"
+        << "  implementation: reuses sum_sq; no extra channel reduction or sqrt\n";
+    for (std::size_t bin = 0; bin < kDiffRmsEnergyBins; ++bin) {
+        const auto& value = stats.diff_rms_lmr[bin];
+        if (!value.moves)
+            continue;
+        out << "  " << DiffRmsEnergyLabel(bin);
+        PrintPhaseFmLmrValue(out, value);
+        out << '\n';
+    }
+    PrintConditionalDiffRms(out, "Diff RMS conditioned by depth",
+                            depth_labels, stats.diff_rms_lmr_by_depth);
+    PrintConditionalDiffRms(out, "Diff RMS conditioned by move count",
+                            move_labels, stats.diff_rms_lmr_by_move_count);
+    PrintConditionalDiffRms(out, "Diff RMS conditioned by selected bucket",
+                            bucket_labels, stats.diff_rms_lmr_by_bucket);
+    PrintConditionalDiffRms(out, "Diff RMS conditioned by |staticEval|",
+                            magnitude_labels, stats.diff_rms_lmr_by_static_eval);
+    PrintConditionalDiffRms(out, "Diff RMS conditioned by router margin",
+                            router_group_labels, stats.diff_rms_lmr_by_router);
+    static constexpr std::array<const char*, 2> lca_tail_labels = {
+      "below calibrated LCA tail", "calibrated LCA high-tail"};
+    PrintConditionalDiffRms(out, "Diff RMS conditioned by LCA high-tail",
+                            lca_tail_labels, stats.diff_rms_lmr_by_lca_tail);
+
+    // Joint control without requiring every RMS bin to be populated in every
+    // stratum. For each sufficiently populated cell, subtract its own stratum's
+    // overall rate, then macro-average those within-stratum deltas per RMS bin.
+    std::array<double, kDiffRmsEnergyBins> rms_joint_fh_delta{};
+    std::array<double, kDiffRmsEnergyBins> rms_joint_research_delta{};
+    std::array<double, kDiffRmsEnergyBins> rms_joint_cutoff_delta{};
+    std::array<std::size_t, kDiffRmsEnergyBins> rms_joint_qualifying{};
+    constexpr std::size_t rms_joint_base_count = kFmJointBaseStrata * 2;
+    for (std::size_t base = 0; base < rms_joint_base_count; ++base) {
+        PhaseFmLmrBucket total{};
+        for (std::size_t bin = 0; bin < kDiffRmsEnergyBins; ++bin)
+            AddPhaseFmLmr(total,
+              stats.diff_rms_lmr_joint[base * kDiffRmsEnergyBins + bin]);
+        if (!total.moves)
+            continue;
+        const double total_fh = Percent(total.reduced_fail_highs, total.moves);
+        const double total_research = Percent(total.researches, total.moves);
+        const double total_cutoff = Percent(total.final_cutoffs, total.moves);
+        for (std::size_t bin = 0; bin < kDiffRmsEnergyBins; ++bin) {
+            const auto& value = stats.diff_rms_lmr_joint[
+              base * kDiffRmsEnergyBins + bin];
+            if (value.moves < 20)
+                continue;
+            ++rms_joint_qualifying[bin];
+            rms_joint_fh_delta[bin] +=
+              Percent(value.reduced_fail_highs, value.moves) - total_fh;
+            rms_joint_research_delta[bin] +=
+              Percent(value.researches, value.moves) - total_research;
+            rms_joint_cutoff_delta[bin] +=
+              Percent(value.final_cutoffs, value.moves) - total_cutoff;
+        }
+    }
+    out << "[Diff RMS jointly controlled LMR outcomes]\n"
+        << "  controls: depth x moveCount x bucket x |staticEval| x "
+           "router-margin x calibrated-LCA-tail\n"
+        << "  metric: macro mean within-stratum rate delta; cells require >=20 moves\n";
+    for (std::size_t bin = 0; bin < kDiffRmsEnergyBins; ++bin) {
+        const double divisor = rms_joint_qualifying[bin]
+                             ? double(rms_joint_qualifying[bin]) : 1.0;
+        out << "  " << DiffRmsEnergyLabel(bin)
+            << " qualifying=" << rms_joint_qualifying[bin]
+            << " FH-delta=" << rms_joint_fh_delta[bin] / divisor << "%"
+            << " re-search-delta=" << rms_joint_research_delta[bin] / divisor << "%"
+            << " cutoff-delta=" << rms_joint_cutoff_delta[bin] / divisor << "%\n";
+    }
+
+    const auto print_cross_activity = [&](const char* title, const char* signal_name,
+                                           const auto& activity, const auto& edges) {
+        out << '[' << title << " LMR move outcomes]\n";
+        for (std::size_t bin = 0; bin < kCrossActivityBins; ++bin) {
+            const auto& value = activity.all[bin];
+            if (!value.moves)
+                continue;
+            out << "  " << CrossActivityLabel(signal_name, bin, edges);
+            PrintPhaseFmLmrValue(out, value);
+            out << '\n';
+        }
+        const std::string prefix = std::string(title) + " conditioned by ";
+        PrintConditionalCrossActivity(out, (prefix + "depth").c_str(), signal_name,
+                                      depth_labels, activity.by_depth, edges);
+        PrintConditionalCrossActivity(out, (prefix + "move count").c_str(), signal_name,
+                                      move_labels, activity.by_move_count, edges);
+        PrintConditionalCrossActivity(out, (prefix + "selected bucket").c_str(), signal_name,
+                                      bucket_labels, activity.by_bucket, edges);
+        PrintConditionalCrossActivity(out, (prefix + "|staticEval|").c_str(), signal_name,
+                                      magnitude_labels, activity.by_static_eval, edges);
+        PrintConditionalCrossActivity(out, (prefix + "router margin").c_str(), signal_name,
+                                      router_group_labels, activity.by_router, edges);
+        PrintConditionalCrossActivity(out, (prefix + "LCA high-tail").c_str(), signal_name,
+                                      lca_tail_labels, activity.by_lca_tail, edges);
+
+        std::array<double, kCrossActivityBins> fh_delta{};
+        std::array<double, kCrossActivityBins> research_delta{};
+        std::array<double, kCrossActivityBins> cutoff_delta{};
+        std::array<std::size_t, kCrossActivityBins> qualifying{};
+        constexpr std::size_t base_count = kFmJointBaseStrata * 2;
+        for (std::size_t base = 0; base < base_count; ++base) {
+            PhaseFmLmrBucket total{};
+            for (std::size_t bin = 0; bin < kCrossActivityBins; ++bin)
+                AddPhaseFmLmr(total,
+                  activity.joint[base * kCrossActivityBins + bin]);
+            if (!total.moves)
+                continue;
+            const double total_fh = Percent(total.reduced_fail_highs, total.moves);
+            const double total_research = Percent(total.researches, total.moves);
+            const double total_cutoff = Percent(total.final_cutoffs, total.moves);
+            for (std::size_t bin = 0; bin < kCrossActivityBins; ++bin) {
+                const auto& value = activity.joint[base * kCrossActivityBins + bin];
+                if (value.moves < 20)
+                    continue;
+                ++qualifying[bin];
+                fh_delta[bin] += Percent(value.reduced_fail_highs, value.moves) - total_fh;
+                research_delta[bin] += Percent(value.researches, value.moves) - total_research;
+                cutoff_delta[bin] += Percent(value.final_cutoffs, value.moves) - total_cutoff;
+            }
+        }
+        out << '[' << title << " jointly controlled LMR outcomes]\n"
+            << "  controls: depth x moveCount x bucket x |staticEval| x "
+               "router-margin x calibrated-LCA-tail\n"
+            << "  metric: macro mean within-stratum rate delta; cells require >=20 moves\n";
+        for (std::size_t bin = 0; bin < kCrossActivityBins; ++bin) {
+            const double divisor = qualifying[bin] ? double(qualifying[bin]) : 1.0;
+            out << "  " << CrossActivityLabel(signal_name, bin, edges)
+                << " qualifying=" << qualifying[bin]
+                << " FH-delta=" << fh_delta[bin] / divisor << "%"
+                << " re-search-delta=" << research_delta[bin] / divisor << "%"
+                << " cutoff-delta=" << cutoff_delta[bin] / divisor << "%\n";
+        }
+    };
+    print_cross_activity("Cross mean absolute activity", "mean_abs_cross",
+                         stats.cross_mean_abs_lmr, kCrossMeanAbsEdges);
+    print_cross_activity("Cross max absolute activity", "max_abs_cross",
+                         stats.cross_max_abs_lmr, kCrossMaxAbsEdges);
+    static constexpr std::array<const char*, kCrossOverlapGroups> overlap_labels = {
+      "none", "LCA only", "Router only", "Router + LCA",
+      "Cross only", "Cross + LCA", "Cross + Router", "Cross + Router + LCA"};
+    const auto print_cross_overlap = [&](const char* title, const auto& groups) {
+        std::uint64_t total = 0;
+        for (const auto& group : groups)
+            total += group.moves;
+        out << '[' << title << "]\n";
+        for (std::size_t group = 0; group < groups.size(); ++group) {
+            const auto& value = groups[group];
+            out << "  " << overlap_labels[group]
+                << " count=" << value.moves
+                << " signal-valid-LMR=" << Percent(value.moves, total) << "%";
+            PrintPhaseFmLmrValue(out, value);
+            out << '\n';
+        }
+    };
+    print_cross_overlap(
+      "Cross/Router/LCA raw-signal overlap",
+      stats.cross_overlap_raw);
+    print_cross_overlap(
+      "Cross/Router/LCA deployable-cohort overlap",
+      stats.cross_overlap_eligible);
+
+    out << "[Cross deployable counterfactual thresholds]\n"
+        << "  population: signal-valid LMR AND Router actual +1 ply=no"
+           " AND calibrated LCA candidate=no\n"
+        << "  thresholds are cumulative\n";
+    for (std::size_t threshold = 0;
+         threshold < kCrossDeployableThresholdCount; ++threshold) {
+        const auto& value = stats.cross_deployable_thresholds[threshold].total;
+        out << "  max_abs_cross >= "
+            << static_cast<unsigned>(kCrossDeployableThresholds[threshold])
+            << " count=" << value.moves
+            << " all-LMR=" << Percent(value.moves, stats.lca_lmr_moves) << "%"
+            << " signal-valid-LMR="
+            << Percent(value.moves, stats.lca_lmr_signal_valid_moves) << "%";
+        PrintPhaseFmLmrValue(out, value);
+        out << '\n';
+    }
+    const auto print_cross_deployable_breakdown =
+      [&](const char* title, const auto& labels, const auto member) {
+        out << "[Cross deployable cohorts by " << title << "]\n";
+        for (std::size_t group = 0; group < labels.size(); ++group) {
+            out << "  {" << labels[group] << "}\n";
+            for (std::size_t threshold = 0;
+                 threshold < kCrossDeployableThresholdCount; ++threshold) {
+                const auto& value =
+                  (stats.cross_deployable_thresholds[threshold].*member)[group];
+                out << "    max_abs_cross >= "
+                    << static_cast<unsigned>(kCrossDeployableThresholds[threshold])
+                    << " count=" << value.moves
+                    << " all-LMR=" << Percent(value.moves, stats.lca_lmr_moves) << "%";
+                PrintPhaseFmLmrValue(out, value);
+                out << '\n';
+            }
+        }
+    };
+    print_cross_deployable_breakdown(
+      "depth", depth_labels, &LcaThresholdCohortStats::by_depth);
+    print_cross_deployable_breakdown(
+      "moveCount", move_labels, &LcaThresholdCohortStats::by_move_count);
+    print_cross_deployable_breakdown(
+      "selected bucket", bucket_labels, &LcaThresholdCohortStats::by_bucket);
+    print_cross_deployable_breakdown(
+      "|staticEval|", magnitude_labels, &LcaThresholdCohortStats::by_static_eval);
+
 #if defined(ENABLE_NNUE_LCA_LMR_EXPERIMENT)
     const auto& lca_experiment = stats.lca_lmr_experiment;
     out << "[LCA top-tail explicit +1-ply experiment]\n"
@@ -2186,6 +2780,55 @@ inline void Report(std::ostream& out) {
       &LcaLmrExperimentStats::candidate_by_move_count,
       &LcaLmrExperimentStats::adjusted_by_move_count);
     print_lca_experiment_breakdown("|staticEval|", magnitude_labels,
+      &LcaLmrExperimentStats::candidate_by_static_eval,
+      &LcaLmrExperimentStats::adjusted_by_static_eval);
+#endif
+
+#if defined(ENABLE_NNUE_CROSS_LMR_EXPERIMENT)
+    const auto& cross_experiment = stats.cross_lmr_experiment;
+    out << "[Cross max explicit +1-ply experiment]\n"
+        << "  variant             : " << NNUE_CROSS_LMR_VARIANT
+        << (NNUE_CROSS_LMR_VARIANT == 0 ? " (shadow current Router + LCA)\n"
+                                        : " (Router + LCA + Cross explicit +1 ply)\n")
+        << "  max threshold       : " << NNUE_CROSS_LMR_MAX_THRESHOLD << '\n'
+        << "  effective predicate : depth 3..8, moveCount 2..8; Router/LCA actual +1=no\n"
+        << "  overall LMR";
+    PrintPhaseFmLmrValue(out, stats.lca_lmr_all_outcomes);
+    out << "\n  Cross candidate";
+    PrintPhaseFmLmrValue(out, cross_experiment.candidate_outcomes);
+    out << "\n  candidate / all LMR : "
+        << Percent(cross_experiment.candidate_outcomes.moves, stats.lca_lmr_moves) << "%\n"
+        << "  actual +1 ply";
+    PrintPhaseFmLmrValue(out, cross_experiment.adjusted_outcomes);
+    out << "\n  actual +1 / all LMR : "
+        << Percent(cross_experiment.adjusted_outcomes.moves, stats.lca_lmr_moves) << "%\n";
+
+    const auto print_cross_experiment_breakdown =
+      [&](const char* title, const auto& labels, const auto candidate_member,
+          const auto adjusted_member) {
+        const auto& candidate = cross_experiment.*candidate_member;
+        const auto& adjusted = cross_experiment.*adjusted_member;
+        out << "  by " << title << '\n';
+        for (std::size_t group = 0; group < candidate.size(); ++group) {
+            if (!candidate[group].moves && !adjusted[group].moves)
+                continue;
+            out << "    " << labels[group] << " candidate";
+            PrintPhaseFmLmrValue(out, candidate[group]);
+            out << " actual+1";
+            PrintPhaseFmLmrValue(out, adjusted[group]);
+            out << '\n';
+        }
+    };
+    print_cross_experiment_breakdown("bucket", bucket_labels,
+      &LcaLmrExperimentStats::candidate_by_bucket,
+      &LcaLmrExperimentStats::adjusted_by_bucket);
+    print_cross_experiment_breakdown("depth", depth_labels,
+      &LcaLmrExperimentStats::candidate_by_depth,
+      &LcaLmrExperimentStats::adjusted_by_depth);
+    print_cross_experiment_breakdown("moveCount", move_labels,
+      &LcaLmrExperimentStats::candidate_by_move_count,
+      &LcaLmrExperimentStats::adjusted_by_move_count);
+    print_cross_experiment_breakdown("|staticEval|", magnitude_labels,
       &LcaLmrExperimentStats::candidate_by_static_eval,
       &LcaLmrExperimentStats::adjusted_by_static_eval);
 #endif

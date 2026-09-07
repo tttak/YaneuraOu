@@ -483,6 +483,10 @@ struct Network {
 			float vd_f = static_cast<float>(buf.diff_fc_out[j + 32]); // val_d
 			sum_sq_d += vd_f * vd_f;
 		}
+		#if defined(ENABLE_NNUE_SIGNAL_LOG)
+		if (signal)
+			signal->diff_rms_energy_sum = sum_sq_d;
+		#endif
 		float inv_rms_d = 1.0f / std::sqrt(sum_sq_d / 32.0f + 1e-8f);
 
 		for (int j = 0; j < 32; ++j) {
@@ -587,7 +591,65 @@ struct Network {
 
 		fc_cross.Propagate(buf.cross_cat, buf.cross_fc_out);
 		ac_cross.Propagate(buf.cross_fc_out, buf.cross_feat);
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+		if (signal) {
+#if defined(USE_AVX2)
+			// One 32-byte load replaces a diagnostic 32-element reduction loop.
+			// cross_feat is uint8_t in [0,127], hence abs(value) == value and
+			// the exact sum is at most 32*127=4064 (fits uint16_t).
+			const __m256i values = _mm256_load_si256(
+				reinterpret_cast<const __m256i*>(buf.cross_feat));
+			const __m256i sums = _mm256_sad_epu8(values, _mm256_setzero_si256());
+			const std::uint64_t sum =
+				static_cast<std::uint64_t>(_mm256_extract_epi64(sums, 0))
+				+ static_cast<std::uint64_t>(_mm256_extract_epi64(sums, 1))
+				+ static_cast<std::uint64_t>(_mm256_extract_epi64(sums, 2))
+				+ static_cast<std::uint64_t>(_mm256_extract_epi64(sums, 3));
+			__m128i maximum = _mm_max_epu8(
+				_mm256_castsi256_si128(values), _mm256_extracti128_si256(values, 1));
+			maximum = _mm_max_epu8(maximum, _mm_srli_si128(maximum, 8));
+			maximum = _mm_max_epu8(maximum, _mm_srli_si128(maximum, 4));
+			maximum = _mm_max_epu8(maximum, _mm_srli_si128(maximum, 2));
+			maximum = _mm_max_epu8(maximum, _mm_srli_si128(maximum, 1));
+			signal->cross_abs_sum = static_cast<std::uint16_t>(sum);
+			signal->cross_abs_max = static_cast<std::uint8_t>(
+				_mm_cvtsi128_si32(maximum) & 0xff);
+#else
+			std::uint16_t sum = 0;
+			std::uint8_t maximum = 0;
+			for (int j = 0; j < 32; ++j) {
+				sum = static_cast<std::uint16_t>(sum + buf.cross_feat[j]);
+				maximum = std::max(maximum, buf.cross_feat[j]);
+			}
+			signal->cross_abs_sum = sum;
+			signal->cross_abs_max = maximum;
+#endif
+		}
+#endif
 
+		// Production Cross-LMR retains only the maximum needed by search.  The
+		// diagnostic build above also records the exact sum for analysis.
+#if defined(USE_NNUE_CROSS_LMR) && !defined(ENABLE_NNUE_SIGNAL_LOG)
+		if (lmr_signal) {
+#if defined(USE_AVX2)
+			const __m256i values = _mm256_load_si256(
+				reinterpret_cast<const __m256i*>(buf.cross_feat));
+			__m128i maximum = _mm_max_epu8(
+				_mm256_castsi256_si128(values), _mm256_extracti128_si256(values, 1));
+			maximum = _mm_max_epu8(maximum, _mm_srli_si128(maximum, 8));
+			maximum = _mm_max_epu8(maximum, _mm_srli_si128(maximum, 4));
+			maximum = _mm_max_epu8(maximum, _mm_srli_si128(maximum, 2));
+			maximum = _mm_max_epu8(maximum, _mm_srli_si128(maximum, 1));
+			lmr_signal->cross_abs_max = static_cast<std::uint8_t>(
+				_mm_cvtsi128_si32(maximum) & 0xff);
+#else
+			std::uint8_t maximum = 0;
+			for (int j = 0; j < 32; ++j)
+				maximum = std::max(maximum, buf.cross_feat[j]);
+			lmr_signal->cross_abs_max = maximum;
+#endif
+		}
+#endif
 
 		// --- 6. L2 Input Assembly: 深層評価パスへの入力構築 (192次元) ---
 		// 各チャネルを Phase Gate で得たスケールで調整しつつ統合
