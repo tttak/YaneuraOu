@@ -434,9 +434,7 @@ namespace {
 
     // Router による動的バケット選択を行うヘルパー関数
     inline int SelectBucketWithRouter(
-        const TransformedFeatureType* transformed_features,
-        const TransformedFeatureType* diff_transformed,
-        const TransformedFeatureType* abs_transformed
+        const std::uint8_t* router_input
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
         , NnueSignalSnapshot* signal = nullptr
 #endif
@@ -445,21 +443,12 @@ namespace {
 #endif
         )
     {
-        alignas(kCacheLineSize) std::uint8_t router_input[384];
         alignas(kCacheLineSize) std::int32_t router_out[32]; // SIMD制約のため32確保
 
-        // 1. Router 用の入力特徴量 (384次元) を構築
-        for (int j = 0; j < 128; ++j) {
-            int32_t abs_val = static_cast<int32_t>(abs_transformed[j]);
-            router_input[j]       = static_cast<std::uint8_t>(std::clamp((abs_val - 64) * 2, 0, 127));
-            router_input[j + 128] = static_cast<std::uint8_t>(diff_transformed[j]);
-            router_input[j + 256] = static_cast<std::uint8_t>(transformed_features[j]);
-        }
-
-        // 2. Router 推論実行
+        // Router consumes the input synchronously and does not retain it.
         router->PropagatePrefix<12>(router_input, router_out);
 
-        // 3. 出力の中から最大値を持つバケットを選択 (Argmax)
+        // 出力の中から最大値を持つバケットを選択 (Argmax)
         int chosen_bucket = 0;
         std::int32_t max_score = router_out[0];
         for (int b = 1; b < kLayerStacks; ++b) {
@@ -533,6 +522,21 @@ namespace {
 
         feature_transformer->Transform(pos, transformed_features, diff_transformed, abs_transformed, refresh, bucket_id1);
 
+        // Router and Phase have the same 384-byte input layout. Build it once
+        // in the Network buffer, let Router consume it, then replace only the
+        // Phase-specific material-bucket byte.
+        alignas(kCacheLineSize) char buffer[Network::kBufferSize];
+        auto& network_buffer = *reinterpret_cast<Network::Buffer*>(buffer);
+        for (int j = 0; j < 128; ++j) {
+            const int32_t abs_val = static_cast<int32_t>(abs_transformed[j]);
+            network_buffer.phase_input[j] = static_cast<std::uint8_t>(
+                std::clamp((abs_val - 64) * 2, 0, 127));
+            network_buffer.phase_input[j + 128] =
+                static_cast<std::uint8_t>(diff_transformed[j]);
+            network_buffer.phase_input[j + 256] =
+                static_cast<std::uint8_t>(transformed_features[j]);
+        }
+
         // Router による動的バケット選択
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
         NnueSignalSnapshot signal{};
@@ -541,7 +545,7 @@ namespace {
         NnueRouterLmrSignal router_lmr_signal{};
 #endif
         const auto bucket_id2 = SelectBucketWithRouter(
-          transformed_features, diff_transformed, abs_transformed
+          network_buffer.phase_input
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
           , &signal
 #endif
@@ -550,8 +554,10 @@ namespace {
 #endif
         );
 
-        alignas(kCacheLineSize) char buffer[Network::kBufferSize];
-        const auto output = network[bucket_id2]->Propagate(
+        network_buffer.phase_input[127] =
+          static_cast<std::uint8_t>((bucket_id1 * 127) / 11);
+
+        const auto output = network[bucket_id2]->Propagate<true, true>(
           transformed_features, diff_transformed, abs_transformed, bucket_id1, buffer
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
           , &signal

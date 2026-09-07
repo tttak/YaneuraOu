@@ -3175,14 +3175,14 @@ void DiagnoseNnueNetworkPhaseAndLca(
 }
 
 template<bool UseTiledFc1>
-std::int32_t ComputeNnueNetworkStagedOutput(
-    const NetworkStageBenchCase& sample, Network::Buffer& work) {
+std::int32_t ComputeNnueNetworkStagedOutputFromPhaseInput(
+    const NetworkStageBenchCase& sample, const int selected_bucket,
+    const std::uint8_t* phase_input, Network::Buffer& work) {
   const Network& selected_network =
-      NnueBenchSelectedNetwork(sample.input.selected_bucket);
-  const auto scales = selected_network.BenchmarkPhase(
-      sample.input.transformed.data(), sample.input.diff_transformed.data(),
-      sample.input.abs_transformed.data(), sample.input.material_bucket,
-      work.phase_input, work.phase_out);
+      NnueBenchSelectedNetwork(selected_bucket);
+  selected_network.BenchmarkPhaseProjection(phase_input, work.phase_out);
+  const auto scales =
+      selected_network.BenchmarkPhaseScalesFromOutput(work.phase_out);
   selected_network.BenchmarkFmAffine(
       sample.input.diff_transformed.data(),
       sample.input.abs_transformed.data(), work.diff_fc_out,
@@ -3215,6 +3215,19 @@ std::int32_t ComputeNnueNetworkStagedOutput(
   selected_network.BenchmarkFc2(work.ac_1_out, work.fc_2_out);
   return selected_network.BenchmarkBlend(work.fc_0_out[31],
                                          work.fc_2_out[0]);
+}
+
+template<bool UseTiledFc1>
+std::int32_t ComputeNnueNetworkStagedOutput(
+    const NetworkStageBenchCase& sample, Network::Buffer& work) {
+  const Network& selected_network =
+      NnueBenchSelectedNetwork(sample.input.selected_bucket);
+  selected_network.BenchmarkPhaseInputAssembly(
+      sample.input.transformed.data(), sample.input.diff_transformed.data(),
+      sample.input.abs_transformed.data(), sample.input.material_bucket,
+      work.phase_input);
+  return ComputeNnueNetworkStagedOutputFromPhaseInput<UseTiledFc1>(
+      sample, sample.input.selected_bucket, work.phase_input, work);
 }
 
 void ValidateNnueNetworkStagedEndToEnd(
@@ -3255,6 +3268,399 @@ void ValidateNnueNetworkStagedEndToEnd(
               << "  max abs diff          : " << mismatch.max_abs_diff
               << std::endl;
   }
+}
+
+enum class RouterPhaseInputImplementation {
+  Separate,
+  Copy,
+  Shared,
+};
+
+void AssembleNnueRouterPhaseCommonInput(
+    const NetworkBenchCase& sample, std::uint8_t* output) {
+  for (int index = 0; index < 128; ++index) {
+    const int abs_value = sample.abs_transformed[index];
+    output[index] = static_cast<std::uint8_t>(
+        std::clamp((abs_value - 64) * 2, 0, 127));
+    output[index + 128] = sample.diff_transformed[index];
+    output[index + 256] = sample.transformed[index];
+  }
+}
+
+template<RouterPhaseInputImplementation Implementation>
+int PrepareNnueRouterAndPhaseInput(
+    const NetworkBenchCase& sample, std::uint8_t* common_or_router_input,
+    std::uint8_t* phase_input, std::int32_t* router_output) {
+  AssembleNnueRouterPhaseCommonInput(sample, common_or_router_input);
+  router->PropagatePrefix<12>(common_or_router_input, router_output);
+  const int selected_bucket = SelectNnueBenchBucket(router_output);
+
+  if constexpr (Implementation == RouterPhaseInputImplementation::Separate) {
+    NnueBenchSelectedNetwork(selected_bucket).BenchmarkPhaseInputAssembly(
+        sample.transformed.data(), sample.diff_transformed.data(),
+        sample.abs_transformed.data(), sample.material_bucket, phase_input);
+  } else {
+    if constexpr (Implementation == RouterPhaseInputImplementation::Copy)
+      std::memcpy(phase_input, common_or_router_input, 384);
+    else
+      phase_input = common_or_router_input;
+    phase_input[127] =
+        static_cast<std::uint8_t>((sample.material_bucket * 127) / 11);
+  }
+  return selected_bucket;
+}
+
+enum class RouterPhaseAssemblyOperation {
+  Router,
+  Phase,
+};
+
+template<RouterPhaseAssemblyOperation Operation>
+NnueBenchTiming MeasureNnueRouterPhaseAssembly(
+    const std::vector<NetworkStageBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  alignas(kCacheLineSize) std::uint8_t output[384];
+  NnueBenchTiming timing;
+  const auto begin = NnueBenchClock::now();
+  for (const auto& sample : corpus) {
+    if constexpr (Operation == RouterPhaseAssemblyOperation::Router)
+      AssembleNnueRouterPhaseCommonInput(sample.input, output);
+    else
+      NnueBenchSelectedNetwork(sample.input.selected_bucket)
+          .BenchmarkPhaseInputAssembly(
+              sample.input.transformed.data(),
+              sample.input.diff_transformed.data(),
+              sample.input.abs_transformed.data(),
+              sample.input.material_bucket, output);
+    const std::size_t index = static_cast<std::size_t>(timing.calls) % 384;
+    MixNnueBenchChecksum(checksum, output[index]);
+    MixNnueBenchChecksum(checksum, output[(index + 193) % 384]);
+    KeepNnueBenchObject(output);
+    ++timing.calls;
+  }
+  const auto end = NnueBenchClock::now();
+  timing.nanoseconds =
+      std::chrono::duration<double, std::nano>(end - begin).count();
+  return timing;
+}
+
+template<RouterPhaseInputImplementation Implementation, bool FullNetwork>
+NnueBenchTiming MeasureNnueRouterPhaseCandidate(
+    const std::vector<NetworkStageBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  alignas(kCacheLineSize) std::uint8_t common_or_router_input[384];
+  alignas(kCacheLineSize) std::uint8_t separate_phase_input[384];
+  alignas(kCacheLineSize) std::int32_t router_output[32];
+  alignas(kCacheLineSize) std::int32_t phase_output[32];
+  alignas(kCacheLineSize) Network::Buffer work{};
+  NnueBenchTiming timing;
+  const auto begin = NnueBenchClock::now();
+  for (const auto& sample : corpus) {
+    std::uint8_t* phase_input =
+        Implementation == RouterPhaseInputImplementation::Shared
+        ? common_or_router_input : separate_phase_input;
+    const int selected_bucket = PrepareNnueRouterAndPhaseInput<Implementation>(
+        sample.input, common_or_router_input, phase_input, router_output);
+    if constexpr (FullNetwork) {
+      const std::int32_t output =
+          ComputeNnueNetworkStagedOutputFromPhaseInput<false>(
+              sample, selected_bucket, phase_input, work);
+      MixNnueBenchChecksum(checksum, output);
+    } else {
+      NnueBenchSelectedNetwork(selected_bucket).BenchmarkPhaseProjection(
+          phase_input, phase_output);
+      const std::size_t index =
+          static_cast<std::size_t>(timing.calls) % 6;
+      MixNnueBenchChecksum(checksum, selected_bucket);
+      MixNnueBenchChecksum(checksum, router_output[index]);
+      MixNnueBenchChecksum(checksum, phase_output[index]);
+    }
+    ++timing.calls;
+  }
+  const auto end = NnueBenchClock::now();
+  timing.nanoseconds =
+      std::chrono::duration<double, std::nano>(end - begin).count();
+  return timing;
+}
+
+template<RouterPhaseInputImplementation Implementation>
+NnueBenchTiming MeasureNnueRouterPhasePreparationCandidate(
+    const std::vector<NetworkStageBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  alignas(kCacheLineSize) std::uint8_t common_or_router_input[384];
+  alignas(kCacheLineSize) std::uint8_t separate_phase_input[384];
+  NnueBenchTiming timing;
+  const auto begin = NnueBenchClock::now();
+  for (const auto& sample : corpus) {
+    AssembleNnueRouterPhaseCommonInput(sample.input,
+                                       common_or_router_input);
+    // C must expose the Router-form input before byte 127 is overwritten.
+    // This compiler barrier has no runtime instructions on clang/GCC.
+    KeepNnueBenchObject(common_or_router_input);
+    std::uint8_t* phase_input = separate_phase_input;
+    if constexpr (Implementation == RouterPhaseInputImplementation::Separate) {
+      NnueBenchSelectedNetwork(sample.input.selected_bucket)
+          .BenchmarkPhaseInputAssembly(
+              sample.input.transformed.data(),
+              sample.input.diff_transformed.data(),
+              sample.input.abs_transformed.data(),
+              sample.input.material_bucket, phase_input);
+    } else {
+      if constexpr (Implementation == RouterPhaseInputImplementation::Copy)
+        std::memcpy(phase_input, common_or_router_input, 384);
+      else
+        phase_input = common_or_router_input;
+      phase_input[127] = static_cast<std::uint8_t>(
+          (sample.input.material_bucket * 127) / 11);
+    }
+    const std::size_t index = static_cast<std::size_t>(timing.calls) % 384;
+    MixNnueBenchChecksum(checksum, phase_input[index]);
+    KeepNnueBenchObject(phase_input[index]);
+    ++timing.calls;
+  }
+  const auto end = NnueBenchClock::now();
+  timing.nanoseconds =
+      std::chrono::duration<double, std::nano>(end - begin).count();
+  return timing;
+}
+
+template<RouterPhaseInputImplementation Implementation>
+NnueBenchTiming MeasureNnueRouterPhasePreparationAfterWarmup(
+    const std::vector<NetworkStageBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  std::uint64_t warmup_checksum = UINT64_C(14695981039346656037);
+  MeasureNnueRouterPhasePreparationCandidate<Implementation>(
+      corpus, warmup_checksum);
+  MixNnueBenchChecksum(checksum, warmup_checksum);
+  return MeasureNnueRouterPhasePreparationCandidate<Implementation>(
+      corpus, checksum);
+}
+
+template<RouterPhaseInputImplementation Implementation, bool FullNetwork>
+NnueBenchTiming MeasureNnueRouterPhaseCandidateAfterWarmup(
+    const std::vector<NetworkStageBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  std::uint64_t warmup_checksum = UINT64_C(14695981039346656037);
+  MeasureNnueRouterPhaseCandidate<Implementation, FullNetwork>(
+      corpus, warmup_checksum);
+  MixNnueBenchChecksum(checksum, warmup_checksum);
+  return MeasureNnueRouterPhaseCandidate<Implementation, FullNetwork>(
+      corpus, checksum);
+}
+
+void PrintNnueRouterPhaseComparison(
+    const char* name, const std::array<NnueBenchSamples, 3>& samples) {
+  std::cout << name << std::endl;
+  constexpr std::array<const char*, 3> names = {
+      "A. separate Router / Phase assembly",
+      "B. common assembly + memcpy + overwrite",
+      "C. shared buffer + post-Router overwrite"};
+  const auto baseline = SummarizeNnueBenchSamples(samples[0]);
+  for (std::size_t index = 0; index < samples.size(); ++index) {
+    PrintNnueBenchSamples(names[index], samples[index]);
+    const auto summary = SummarizeNnueBenchSamples(samples[index]);
+    double variance = 0.0;
+    if (samples[index].ns_per_call.size() > 1) {
+      for (const double value : samples[index].ns_per_call) {
+        const double delta = value - summary.mean;
+        variance += delta * delta;
+      }
+      variance /= static_cast<double>(samples[index].ns_per_call.size() - 1);
+    }
+    const double improvement = baseline.median == 0.0 ? 0.0
+        : (baseline.median - summary.median) * 100.0 / baseline.median;
+    std::cout << "  sample stdev ns/call: " << std::fixed
+              << std::setprecision(1) << std::sqrt(variance) << std::endl
+              << "  relative improvement: "
+              << std::setprecision(2) << improvement << "%" << std::endl;
+  }
+}
+
+void TestRouterPhaseInputBenchmarkCompare(const std::uint64_t repeat_count) {
+  std::cout << "[NNUE benchmark: Router / Phase shared input]" << std::endl
+            << "  seed         : " << kNnueBenchSeed << std::endl
+            << "  corpus games : " << kNnueBenchMeasuredGames << std::endl
+            << "  max ply/game : " << kNnueBenchMaxPly << std::endl
+            << "  repeats      : " << repeat_count << std::endl
+            << "  order        : A/B/C rotated by one per repeat" << std::endl
+            << "  shared source: identical transformed/diff/abs arrays" << std::endl
+            << "  only difference: Phase input[127] material-bucket overwrite"
+            << std::endl;
+
+  const auto corpus = MakeNnueNetworkStageBenchCorpus();
+  if (corpus.empty()) {
+    std::cout << "error: NNUE Router/Phase benchmark corpus is empty"
+              << std::endl;
+    return;
+  }
+  std::cout << "  corpus calls : " << corpus.size() << std::endl
+            << "  warm-up calls: " << corpus.size()
+            << " before every timed sample" << std::endl;
+
+  NnueBenchSamples router_assembly;
+  NnueBenchSamples phase_assembly;
+  std::array<NnueBenchSamples, 3> preparation;
+  std::array<NnueBenchSamples, 3> combined;
+  std::array<NnueBenchSamples, 3> full;
+  std::uint64_t assembly_checksum = UINT64_C(14695981039346656037);
+  std::array<std::uint64_t, 3> preparation_checksums;
+  std::array<std::uint64_t, 3> combined_checksums;
+  std::array<std::uint64_t, 3> full_checksums;
+  preparation_checksums.fill(UINT64_C(14695981039346656037));
+  combined_checksums.fill(UINT64_C(14695981039346656037));
+  full_checksums.fill(UINT64_C(14695981039346656037));
+
+  for (std::uint64_t repeat = 0; repeat < repeat_count; ++repeat) {
+    MeasureNnueRouterPhaseAssembly<RouterPhaseAssemblyOperation::Router>(
+        corpus, assembly_checksum);
+    router_assembly.Add(
+        MeasureNnueRouterPhaseAssembly<RouterPhaseAssemblyOperation::Router>(
+            corpus, assembly_checksum));
+    MeasureNnueRouterPhaseAssembly<RouterPhaseAssemblyOperation::Phase>(
+        corpus, assembly_checksum);
+    phase_assembly.Add(
+        MeasureNnueRouterPhaseAssembly<RouterPhaseAssemblyOperation::Phase>(
+            corpus, assembly_checksum));
+
+    for (std::size_t offset = 0; offset < 3; ++offset) {
+      const std::size_t candidate = (repeat + offset) % 3;
+      if (candidate == 0) {
+        preparation[0].Add(MeasureNnueRouterPhasePreparationAfterWarmup<
+            RouterPhaseInputImplementation::Separate>(
+                corpus, preparation_checksums[0]));
+        combined[0].Add(MeasureNnueRouterPhaseCandidateAfterWarmup<
+            RouterPhaseInputImplementation::Separate, false>(
+                corpus, combined_checksums[0]));
+        full[0].Add(MeasureNnueRouterPhaseCandidateAfterWarmup<
+            RouterPhaseInputImplementation::Separate, true>(
+                corpus, full_checksums[0]));
+      } else if (candidate == 1) {
+        preparation[1].Add(MeasureNnueRouterPhasePreparationAfterWarmup<
+            RouterPhaseInputImplementation::Copy>(
+                corpus, preparation_checksums[1]));
+        combined[1].Add(MeasureNnueRouterPhaseCandidateAfterWarmup<
+            RouterPhaseInputImplementation::Copy, false>(
+                corpus, combined_checksums[1]));
+        full[1].Add(MeasureNnueRouterPhaseCandidateAfterWarmup<
+            RouterPhaseInputImplementation::Copy, true>(
+                corpus, full_checksums[1]));
+      } else {
+        preparation[2].Add(MeasureNnueRouterPhasePreparationAfterWarmup<
+            RouterPhaseInputImplementation::Shared>(
+                corpus, preparation_checksums[2]));
+        combined[2].Add(MeasureNnueRouterPhaseCandidateAfterWarmup<
+            RouterPhaseInputImplementation::Shared, false>(
+                corpus, combined_checksums[2]));
+        full[2].Add(MeasureNnueRouterPhaseCandidateAfterWarmup<
+            RouterPhaseInputImplementation::Shared, true>(
+                corpus, full_checksums[2]));
+      }
+    }
+  }
+
+  PrintNnueBenchSamples("Router input assembly", router_assembly);
+  PrintNnueBenchSamples("Phase input assembly", phase_assembly);
+  PrintNnueRouterPhaseComparison(
+      "combined Router + Phase input preparation", preparation);
+  PrintNnueRouterPhaseComparison(
+      "Router prefix + Phase prefix end-to-end", combined);
+  PrintNnueRouterPhaseComparison("full staged Network", full);
+
+  std::array<std::uint64_t, 3> router_checksums;
+  std::array<std::uint64_t, 3> phase_checksums;
+  std::array<std::uint64_t, 3> final_checksums;
+  router_checksums.fill(UINT64_C(14695981039346656037));
+  phase_checksums.fill(UINT64_C(14695981039346656037));
+  final_checksums.fill(UINT64_C(14695981039346656037));
+  std::array<std::uint64_t, 3> router_mismatches{};
+  std::array<std::uint64_t, 3> phase_mismatches{};
+  std::array<std::uint64_t, 3> final_mismatches{};
+  std::uint64_t source_mismatches = 0;
+  std::uint64_t normal_final_checksum = UINT64_C(14695981039346656037);
+
+  alignas(kCacheLineSize) std::uint8_t common[384];
+  alignas(kCacheLineSize) std::uint8_t phase[384];
+  alignas(kCacheLineSize) std::int32_t router_out[32];
+  alignas(kCacheLineSize) std::int32_t phase_out[32];
+  alignas(kCacheLineSize) Network::Buffer work{};
+  for (std::size_t sample_index = 0; sample_index < corpus.size();
+       ++sample_index) {
+    const auto& sample = corpus[sample_index];
+    AssembleNnueRouterPhaseCommonInput(sample.input, common);
+    for (int i = 0; i < 384; ++i)
+      source_mismatches += common[i] != sample.input.router_input[i];
+    MixNnueBenchChecksum(normal_final_checksum, sample.final_output);
+    alignas(kCacheLineSize) std::int32_t captured_router[32];
+    router->PropagatePrefix<12>(sample.input.router_input.data(),
+                                captured_router);
+
+    for (int candidate = 0; candidate < 3; ++candidate) {
+      const int selected_bucket = candidate == 0
+          ? PrepareNnueRouterAndPhaseInput<
+                RouterPhaseInputImplementation::Separate>(
+                sample.input, common, phase, router_out)
+          : candidate == 1
+          ? PrepareNnueRouterAndPhaseInput<
+                RouterPhaseInputImplementation::Copy>(
+                sample.input, common, phase, router_out)
+          : PrepareNnueRouterAndPhaseInput<
+                RouterPhaseInputImplementation::Shared>(
+                sample.input, common, common, router_out);
+      const std::uint8_t* candidate_phase = candidate == 2 ? common : phase;
+      NnueBenchSelectedNetwork(selected_bucket).BenchmarkPhaseProjection(
+          candidate_phase, phase_out);
+      for (int i = 0; i < 12; ++i) {
+        MixNnueBenchChecksum(router_checksums[candidate], router_out[i]);
+        router_mismatches[candidate] +=
+            router_out[i] != captured_router[i];
+      }
+
+      for (int i = 0; i < 6; ++i) {
+        MixNnueBenchChecksum(phase_checksums[candidate], phase_out[i]);
+        phase_mismatches[candidate] +=
+            phase_out[i] != sample.intermediate.phase_out[i];
+      }
+      const std::int32_t output =
+          ComputeNnueNetworkStagedOutputFromPhaseInput<false>(
+              sample, selected_bucket, candidate_phase, work);
+      MixNnueBenchChecksum(final_checksums[candidate], output);
+      final_mismatches[candidate] += output != sample.final_output;
+    }
+  }
+
+  std::cout << "[correctness]" << std::endl
+            << "  common input vs captured Router input mismatches: "
+            << source_mismatches << std::endl;
+  constexpr std::array<const char*, 3> labels = {"A", "B", "C"};
+  for (std::size_t candidate = 0; candidate < 3; ++candidate) {
+    std::cout << "  " << labels[candidate] << " Router output checksum: 0x"
+              << std::hex << router_checksums[candidate] << std::dec
+              << ", mismatches: " << router_mismatches[candidate]
+              << std::endl
+              << "  " << labels[candidate] << " Phase output checksum : 0x"
+              << std::hex << phase_checksums[candidate] << std::dec
+              << ", mismatches: " << phase_mismatches[candidate]
+              << std::endl
+              << "  " << labels[candidate] << " final output checksum : 0x"
+              << std::hex << final_checksums[candidate] << std::dec
+              << ", mismatches: " << final_mismatches[candidate]
+              << std::endl;
+  }
+  std::cout << "  normal final checksum: 0x" << std::hex
+            << normal_final_checksum << std::dec << std::endl
+            << "  A/B/C timing checksum match: "
+            << (preparation_checksums[0] == preparation_checksums[1]
+                    && preparation_checksums[0] == preparation_checksums[2]
+                    && combined_checksums[0] == combined_checksums[1]
+                    && combined_checksums[0] == combined_checksums[2]
+                    && full_checksums[0] == full_checksums[1]
+                    && full_checksums[0] == full_checksums[2]
+                ? "yes" : "NO")
+            << std::endl
+            << "  note: combined timing includes Router/Phase prefix calls so"
+            << std::endl
+            << "        C's pre-overwrite byte is observably consumed by Router."
+            << std::endl;
 }
 
 template<NetworkStageBenchOperation Operation>
@@ -7538,6 +7944,10 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::uint64_t repeat_count;
     if (ReadNnueBenchRepeatCount(stream, repeat_count))
       TestNetworkStagesBenchmark(repeat_count);
+  } else if (sub_command == "bench_router_phase_input_compare") {
+    std::uint64_t repeat_count;
+    if (ReadNnueBenchRepeatCount(stream, repeat_count))
+      TestRouterPhaseInputBenchmarkCompare(repeat_count);
   } else if (sub_command == "bench_main_gate_compare") {
     std::uint64_t repeat_count;
     if (ReadNnueBenchRepeatCount(stream, repeat_count))
@@ -7611,6 +8021,8 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << " test nnue bench_network [repeats]" << std::endl;
     std::cout << " test nnue bench_network_compare [repeats]" << std::endl;
     std::cout << " test nnue bench_network_stages [repeats]" << std::endl;
+    std::cout << " test nnue bench_router_phase_input_compare [repeats]"
+              << std::endl;
     std::cout << " test nnue bench_main_gate_compare [repeats]"
               << std::endl;
 #if defined(USE_NNUE_APPROX_SIGMOID_LUT)
