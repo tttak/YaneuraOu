@@ -3663,6 +3663,715 @@ void TestRouterPhaseInputBenchmarkCompare(const std::uint64_t repeat_count) {
             << std::endl;
 }
 
+enum class PhaseL2FixedCandidate {
+  CurrentFloat,
+  FixedWidth256,
+  FixedWidth128,
+  FixedWidth64,
+  FixedWidth32,
+};
+
+enum class PhaseL2FixedOperation {
+  PhaseSigmoidValue,
+  ScaleGeneration,
+  L2Assembly,
+  CombinedPhaseL2,
+  FullStagedNetwork,
+};
+
+constexpr std::int32_t kPhaseFixedRawMin = -65536;
+constexpr std::int32_t kPhaseFixedRawMax = 65536;
+
+template<std::int32_t RawStep>
+const auto& NnueBenchPhaseSigmoidQ15Lut() {
+  constexpr std::size_t kLutSize =
+      (kPhaseFixedRawMax - kPhaseFixedRawMin) / RawStep + 1;
+  static const auto lut = [] {
+    std::array<std::uint16_t, kLutSize> values{};
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      const std::int32_t raw = kPhaseFixedRawMin
+          + static_cast<std::int32_t>(i) * RawStep;
+      const float logit = (static_cast<float>(raw) / 8128.0f) * 3.0f + 1.0f;
+      const float sigmoid = 1.0f / (1.0f + std::exp(-logit));
+      values[i] = static_cast<std::uint16_t>(std::clamp(
+          static_cast<int>(std::lround(sigmoid * 32768.0f)), 0, 32768));
+    }
+    return values;
+  }();
+  return lut;
+}
+
+template<std::int32_t RawStep>
+void NnueBenchPhaseFixedSigmoidQ15(const std::int32_t* phase_output,
+                                   std::uint16_t* sigmoid_q15) {
+  const auto& lut = NnueBenchPhaseSigmoidQ15Lut<RawStep>();
+  for (int i = 0; i < 6; ++i) {
+    const std::int32_t raw = phase_output[i];
+    if (raw <= kPhaseFixedRawMin)
+      sigmoid_q15[i] = lut.front();
+    else if (raw >= kPhaseFixedRawMax)
+      sigmoid_q15[i] = lut.back();
+    else {
+      const std::int32_t index =
+          (raw - kPhaseFixedRawMin + RawStep / 2) / RawStep;
+      sigmoid_q15[i] = lut[static_cast<std::size_t>(index)];
+    }
+  }
+}
+
+void NnueBenchPhaseFixedScalesQ23(const std::uint16_t* sigmoid_q15,
+                                  std::int32_t* scales_q23) {
+  // scale = factor * (0.55 + 0.45 * sigmoid).  Both terms are kept in Q15;
+  // Q15*Q15 is then rounded directly to Q23.  The largest intermediate is
+  // below 1.5 * 32768^2, hence it remains within signed int32.
+  constexpr std::int32_t kBaseQ15 = 18022;  // round(0.55 * 32768)
+  constexpr std::int32_t kGainQ15 = 14746;  // round(0.45 * 32768)
+  constexpr std::array<std::int32_t, 6> kFactorQ15 = {
+      42598, 49152, 32768, 22938, 28836, 49152};
+  for (int i = 0; i < 6; ++i) {
+    const std::int32_t base_q15 = kBaseQ15
+        + (static_cast<std::int32_t>(sigmoid_q15[i]) * kGainQ15 + (1 << 14))
+            / (1 << 15);
+    scales_q23[i] =
+        (base_q15 * kFactorQ15[i] + 64) >> 7;
+  }
+}
+
+struct PhaseL2FixedBenchAux {
+  std::array<std::array<std::uint16_t, 6>, 4> fixed_sigmoid_q15{};
+  std::array<std::array<std::int32_t, 6>, 4> fixed_scales_q23{};
+};
+
+std::vector<PhaseL2FixedBenchAux> MakePhaseL2FixedBenchAux(
+    const std::vector<NetworkStageBenchCase>& corpus) {
+  std::vector<PhaseL2FixedBenchAux> auxiliary(corpus.size());
+  for (std::size_t i = 0; i < corpus.size(); ++i) {
+    NnueBenchPhaseFixedSigmoidQ15<256>(
+        corpus[i].intermediate.phase_out, auxiliary[i].fixed_sigmoid_q15[0].data());
+    NnueBenchPhaseFixedSigmoidQ15<128>(
+        corpus[i].intermediate.phase_out, auxiliary[i].fixed_sigmoid_q15[1].data());
+    NnueBenchPhaseFixedSigmoidQ15<64>(
+        corpus[i].intermediate.phase_out, auxiliary[i].fixed_sigmoid_q15[2].data());
+    NnueBenchPhaseFixedSigmoidQ15<32>(
+        corpus[i].intermediate.phase_out, auxiliary[i].fixed_sigmoid_q15[3].data());
+    for (std::size_t width = 0; width < 4; ++width)
+      NnueBenchPhaseFixedScalesQ23(
+          auxiliary[i].fixed_sigmoid_q15[width].data(),
+          auxiliary[i].fixed_scales_q23[width].data());
+  }
+  return auxiliary;
+}
+
+template<PhaseL2FixedCandidate Candidate>
+constexpr std::int32_t NnueBenchPhaseFixedRawStep() {
+  if constexpr (Candidate == PhaseL2FixedCandidate::FixedWidth256)
+    return 256;
+  else if constexpr (Candidate == PhaseL2FixedCandidate::FixedWidth128)
+    return 128;
+  else if constexpr (Candidate == PhaseL2FixedCandidate::FixedWidth64)
+    return 64;
+  else
+    return 32;
+}
+
+template<PhaseL2FixedCandidate Candidate>
+constexpr std::size_t NnueBenchPhaseFixedAuxIndex() {
+  return static_cast<std::size_t>(Candidate) - 1;
+}
+
+template<PhaseL2FixedCandidate Candidate>
+void NnueBenchComputePhaseScales(
+    const Network& selected_network, const std::int32_t* phase_output,
+    Network::BenchmarkPhaseScales& float_scales,
+    std::int32_t* scales_q23) {
+  if constexpr (Candidate == PhaseL2FixedCandidate::CurrentFloat) {
+    float_scales = selected_network.BenchmarkPhaseScalesFromOutput(phase_output);
+  } else {
+    std::uint16_t sigmoid_q15[6];
+    NnueBenchPhaseFixedSigmoidQ15<NnueBenchPhaseFixedRawStep<Candidate>()>(
+        phase_output, sigmoid_q15);
+    NnueBenchPhaseFixedScalesQ23(sigmoid_q15, scales_q23);
+  }
+}
+
+template<PhaseL2FixedCandidate Candidate>
+void NnueBenchAssembleCandidateL2(
+    const Network& selected_network, const Network::Buffer& source,
+    const Network::BenchmarkPhaseScales& float_scales,
+    const std::int32_t* scales_q23, std::uint8_t* output) {
+  if constexpr (Candidate == PhaseL2FixedCandidate::CurrentFloat) {
+    selected_network.BenchmarkL2Assembly(
+        source.ac_sqr_0_out_temp, source.ac_0_out, source.diff_ac_out,
+        source.abs_ac_out, source.abs_sqr_out, source.cross_feat,
+        float_scales, output);
+  } else {
+    selected_network.BenchmarkL2AssemblyQ23(
+        source.ac_sqr_0_out_temp, source.ac_0_out, source.diff_ac_out,
+        source.abs_ac_out, source.abs_sqr_out, source.cross_feat,
+        scales_q23, output);
+  }
+}
+
+template<PhaseL2FixedCandidate Candidate>
+std::int32_t ComputeNnueNetworkPhaseL2Candidate(
+    const NetworkStageBenchCase& sample, Network::Buffer& work) {
+  const Network& selected_network =
+      NnueBenchSelectedNetwork(sample.input.selected_bucket);
+  selected_network.BenchmarkPhaseInputAssembly(
+      sample.input.transformed.data(), sample.input.diff_transformed.data(),
+      sample.input.abs_transformed.data(), sample.input.material_bucket,
+      work.phase_input);
+  selected_network.BenchmarkPhaseProjection(work.phase_input, work.phase_out);
+  Network::BenchmarkPhaseScales float_scales{};
+  std::int32_t scales_q23[6]{};
+  NnueBenchComputePhaseScales<Candidate>(
+      selected_network, work.phase_out, float_scales, scales_q23);
+  selected_network.BenchmarkFmAffine(
+      sample.input.diff_transformed.data(), sample.input.abs_transformed.data(),
+      work.diff_fc_out, work.abs_fc_out);
+  selected_network.BenchmarkFmActivation(
+      work.diff_fc_out, work.abs_fc_out, work.diff_ac_out, work.abs_ac_out,
+      work.abs_sqr_out);
+  selected_network.BenchmarkMain(
+      sample.input.transformed.data(), work.diff_fc_out, work.fc_0_out,
+      work.ac_sqr_0_out_temp, work.ac_0_out);
+  selected_network.BenchmarkLca(
+      work.ac_0_out, work.diff_ac_out, work.abs_ac_out, work.diff_ac_out,
+      work.fm_cat_uint8, work.lca_q_out, work.lca_k_out, work.lca_v_out);
+  selected_network.BenchmarkCross(
+      work.ac_sqr_0_out_temp, work.ac_0_out, work.diff_ac_out,
+      work.abs_ac_out, work.cross_cat, work.cross_fc_out, work.cross_feat);
+  NnueBenchAssembleCandidateL2<Candidate>(
+      selected_network, work, float_scales, scales_q23, work.l2_input);
+  selected_network.BenchmarkFc1(work.l2_input, work.fc_1_out);
+  selected_network.BenchmarkAc1(work.fc_1_out, work.ac_1_out);
+  selected_network.BenchmarkFc2(work.ac_1_out, work.fc_2_out);
+  return selected_network.BenchmarkBlend(work.fc_0_out[31], work.fc_2_out[0]);
+}
+
+template<PhaseL2FixedCandidate Candidate, PhaseL2FixedOperation Operation>
+NnueBenchTiming MeasurePhaseL2FixedCorpus(
+    const std::vector<NetworkStageBenchCase>& corpus,
+    const std::vector<PhaseL2FixedBenchAux>& auxiliary,
+    std::uint64_t& checksum) {
+  alignas(kCacheLineSize) Network::Buffer work{};
+  NnueBenchTiming timing;
+  const auto begin = NnueBenchClock::now();
+  for (std::size_t sample_index = 0; sample_index < corpus.size();
+       ++sample_index) {
+    const auto& sample = corpus[sample_index];
+    const auto& aux = auxiliary[sample_index];
+    const Network& selected_network =
+        NnueBenchSelectedNetwork(sample.input.selected_bucket);
+    std::uint64_t representative = 0;
+    if constexpr (Operation == PhaseL2FixedOperation::PhaseSigmoidValue) {
+      if constexpr (Candidate != PhaseL2FixedCandidate::CurrentFloat) {
+        std::uint16_t values[6];
+        NnueBenchPhaseFixedSigmoidQ15<
+            NnueBenchPhaseFixedRawStep<Candidate>()>(
+                sample.intermediate.phase_out, values);
+        KeepNnueBenchObject(values);
+        representative = values[timing.calls % 6];
+      } else {
+        float values[6];
+        selected_network.BenchmarkPhaseSigmoid(
+            sample.intermediate.phase_out, values);
+        KeepNnueBenchObject(values);
+        representative = NnueBenchFloatBits(values[timing.calls % 6]);
+      }
+    } else if constexpr (Operation == PhaseL2FixedOperation::ScaleGeneration) {
+      if constexpr (Candidate == PhaseL2FixedCandidate::CurrentFloat) {
+        const auto scales = selected_network.BenchmarkPhaseChannelScales(
+            sample.phase_values.data());
+        KeepNnueBenchObject(scales);
+        representative = NnueBenchFloatBits(
+            NnueBenchPhaseScalesToArray(scales)[timing.calls % 6]);
+      } else {
+        std::int32_t q23[6];
+        NnueBenchPhaseFixedScalesQ23(
+            aux.fixed_sigmoid_q15[NnueBenchPhaseFixedAuxIndex<Candidate>()].data(),
+            q23);
+        KeepNnueBenchObject(q23);
+        representative = static_cast<std::uint32_t>(q23[timing.calls % 6]);
+      }
+    } else if constexpr (Operation == PhaseL2FixedOperation::L2Assembly) {
+      if constexpr (Candidate == PhaseL2FixedCandidate::CurrentFloat) {
+        selected_network.BenchmarkL2Assembly(
+            sample.intermediate.ac_sqr_0_out_temp,
+            sample.intermediate.ac_0_out, sample.intermediate.diff_ac_out,
+            sample.intermediate.abs_ac_out, sample.intermediate.abs_sqr_out,
+            sample.intermediate.cross_feat, sample.phase_scales,
+            work.l2_input);
+      } else {
+        const std::int32_t* q23 =
+            aux.fixed_scales_q23[NnueBenchPhaseFixedAuxIndex<Candidate>()].data();
+        selected_network.BenchmarkL2AssemblyQ23(
+            sample.intermediate.ac_sqr_0_out_temp,
+            sample.intermediate.ac_0_out, sample.intermediate.diff_ac_out,
+            sample.intermediate.abs_ac_out, sample.intermediate.abs_sqr_out,
+            sample.intermediate.cross_feat, q23, work.l2_input);
+      }
+      KeepNnueBenchObject(work.l2_input);
+      representative = work.l2_input[timing.calls % 192];
+    } else if constexpr (Operation == PhaseL2FixedOperation::CombinedPhaseL2) {
+      Network::BenchmarkPhaseScales float_scales{};
+      std::int32_t q23[6]{};
+      NnueBenchComputePhaseScales<Candidate>(
+          selected_network, sample.intermediate.phase_out, float_scales, q23);
+      NnueBenchAssembleCandidateL2<Candidate>(
+          selected_network, sample.intermediate, float_scales, q23,
+          work.l2_input);
+      KeepNnueBenchObject(work.l2_input);
+      representative = work.l2_input[timing.calls % 192];
+    } else {
+      const std::int32_t output =
+          ComputeNnueNetworkPhaseL2Candidate<Candidate>(sample, work);
+      KeepNnueBenchObject(work);
+      representative = static_cast<std::uint32_t>(output);
+    }
+    MixNnueBenchChecksum(checksum, representative);
+    ++timing.calls;
+  }
+  const auto end = NnueBenchClock::now();
+  timing.nanoseconds =
+      std::chrono::duration<double, std::nano>(end - begin).count();
+  return timing;
+}
+
+template<PhaseL2FixedCandidate Candidate, PhaseL2FixedOperation Operation>
+NnueBenchTiming MeasurePhaseL2FixedCorpusAfterWarmup(
+    const std::vector<NetworkStageBenchCase>& corpus,
+    const std::vector<PhaseL2FixedBenchAux>& auxiliary,
+    std::uint64_t& checksum) {
+  std::uint64_t warmup_checksum = UINT64_C(14695981039346656037);
+  MeasurePhaseL2FixedCorpus<Candidate, Operation>(
+      corpus, auxiliary, warmup_checksum);
+  MixNnueBenchChecksum(checksum, warmup_checksum);
+  return MeasurePhaseL2FixedCorpus<Candidate, Operation>(
+      corpus, auxiliary, checksum);
+}
+
+template<PhaseL2FixedCandidate Candidate>
+void AddPhaseL2FixedCandidateSamples(
+    const std::vector<NetworkStageBenchCase>& corpus,
+    const std::vector<PhaseL2FixedBenchAux>& auxiliary,
+    std::array<NnueBenchSamples, 5>& samples,
+    std::array<std::uint64_t, 5>& checksums) {
+  samples[0].Add(MeasurePhaseL2FixedCorpusAfterWarmup<
+      Candidate, PhaseL2FixedOperation::PhaseSigmoidValue>(
+          corpus, auxiliary, checksums[0]));
+  samples[1].Add(MeasurePhaseL2FixedCorpusAfterWarmup<
+      Candidate, PhaseL2FixedOperation::ScaleGeneration>(
+          corpus, auxiliary, checksums[1]));
+  samples[2].Add(MeasurePhaseL2FixedCorpusAfterWarmup<
+      Candidate, PhaseL2FixedOperation::L2Assembly>(
+          corpus, auxiliary, checksums[2]));
+  samples[3].Add(MeasurePhaseL2FixedCorpusAfterWarmup<
+      Candidate, PhaseL2FixedOperation::CombinedPhaseL2>(
+          corpus, auxiliary, checksums[3]));
+  samples[4].Add(MeasurePhaseL2FixedCorpusAfterWarmup<
+      Candidate, PhaseL2FixedOperation::FullStagedNetwork>(
+          corpus, auxiliary, checksums[4]));
+}
+
+double NnueBenchPhaseL2Percentile(const std::vector<double>& sorted,
+                                  const double percentile) {
+  if (sorted.empty())
+    return 0.0;
+  const std::size_t index = static_cast<std::size_t>(std::ceil(
+      percentile * static_cast<double>(sorted.size()))) - 1;
+  return sorted[std::min(index, sorted.size() - 1)];
+}
+
+template<bool UseFixedPhaseL2>
+NnueBenchTiming MeasureProductionPhaseL2NetworkCorpus(
+    const std::vector<NetworkBenchCase>& corpus, std::uint64_t& checksum) {
+  alignas(kCacheLineSize) Network::Buffer work{};
+  NnueBenchTiming timing;
+  const auto begin = NnueBenchClock::now();
+  for (const auto& sample : corpus) {
+    const Network& selected_network =
+        NnueBenchSelectedNetwork(sample.selected_bucket);
+    const auto output = selected_network.Propagate<true, false,
+        UseFixedPhaseL2>(
+            sample.transformed.data(), sample.diff_transformed.data(),
+            sample.abs_transformed.data(), sample.material_bucket,
+            reinterpret_cast<char*>(&work));
+    MixNnueBenchChecksum(checksum, output[0]);
+    ++timing.calls;
+  }
+  const auto end = NnueBenchClock::now();
+  timing.nanoseconds =
+      std::chrono::duration<double, std::nano>(end - begin).count();
+  return timing;
+}
+
+template<bool UseFixedPhaseL2>
+NnueBenchTiming MeasureProductionPhaseL2NetworkCorpusAfterWarmup(
+    const std::vector<NetworkBenchCase>& corpus, std::uint64_t& checksum) {
+  std::uint64_t warmup_checksum = UINT64_C(14695981039346656037);
+  MeasureProductionPhaseL2NetworkCorpus<UseFixedPhaseL2>(
+      corpus, warmup_checksum);
+  MixNnueBenchChecksum(checksum, warmup_checksum);
+  return MeasureProductionPhaseL2NetworkCorpus<UseFixedPhaseL2>(
+      corpus, checksum);
+}
+
+double NnueBenchSampleStandardDeviation(const NnueBenchSamples& samples) {
+  if (samples.ns_per_call.size() < 2)
+    return 0.0;
+  const auto summary = SummarizeNnueBenchSamples(samples);
+  double sum = 0.0;
+  for (const double value : samples.ns_per_call) {
+    const double difference = value - summary.mean;
+    sum += difference * difference;
+  }
+  return std::sqrt(sum /
+      static_cast<double>(samples.ns_per_call.size() - 1));
+}
+
+void TestPhaseL2FixedBenchmarkCompare(const std::uint64_t repeat_count) {
+  std::cout << "[NNUE benchmark: Phase scale + L2 fixed-point]" << std::endl
+            << "  seed         : " << kNnueBenchSeed << std::endl
+            << "  corpus games : " << kNnueBenchMeasuredGames << std::endl
+            << "  max ply/game : " << kNnueBenchMaxPly << std::endl
+            << "  repeats      : " << repeat_count << std::endl
+            << "  order        : A/C256/C128/C64/C32 rotated per repeat"
+            << std::endl
+            << "  fixed L2     : uint8 * Q23, shift 23, clamp [0,127]"
+            << std::endl
+            << "  Phase LUT    : Q15, raw [-65536,65536], nearest, no interpolation"
+            << std::endl
+            << "  LUT bytes    : C256=1026 C128=2050 C64=4098 C32=8194"
+            << std::endl;
+  const auto corpus = MakeNnueNetworkStageBenchCorpus();
+  if (corpus.empty()) {
+    std::cout << "error: NNUE Phase/L2 benchmark corpus is empty" << std::endl;
+    return;
+  }
+  const auto auxiliary = MakePhaseL2FixedBenchAux(corpus);
+  std::cout << "  corpus calls : " << corpus.size() << std::endl
+            << "  L2 values    : " << corpus.size() * 192 << std::endl
+            << "  warm-up calls: " << corpus.size()
+            << " before every timed sample" << std::endl;
+
+  std::array<std::array<NnueBenchSamples, 5>, 5> samples;
+  std::array<std::array<std::uint64_t, 5>, 5> timing_checksums;
+  for (auto& candidate : timing_checksums)
+    candidate.fill(UINT64_C(14695981039346656037));
+  for (std::uint64_t repeat = 0; repeat < repeat_count; ++repeat) {
+    for (std::size_t offset = 0; offset < 5; ++offset) {
+      const std::size_t candidate = (repeat + offset) % 5;
+      if (candidate == 0)
+        AddPhaseL2FixedCandidateSamples<PhaseL2FixedCandidate::CurrentFloat>(
+            corpus, auxiliary, samples[0], timing_checksums[0]);
+      else if (candidate == 1)
+        AddPhaseL2FixedCandidateSamples<
+            PhaseL2FixedCandidate::FixedWidth256>(
+                corpus, auxiliary, samples[1], timing_checksums[1]);
+      else if (candidate == 2)
+        AddPhaseL2FixedCandidateSamples<
+            PhaseL2FixedCandidate::FixedWidth128>(
+                corpus, auxiliary, samples[2], timing_checksums[2]);
+      else if (candidate == 3)
+        AddPhaseL2FixedCandidateSamples<
+            PhaseL2FixedCandidate::FixedWidth64>(
+                corpus, auxiliary, samples[3], timing_checksums[3]);
+      else
+        AddPhaseL2FixedCandidateSamples<
+            PhaseL2FixedCandidate::FixedWidth32>(
+                corpus, auxiliary, samples[4], timing_checksums[4]);
+    }
+  }
+
+  constexpr std::array<const char*, 5> candidate_names = {
+      "A. current float Phase + float L2",
+      "C256. Q15 nearest width 256 + Q23 L2",
+      "C128. Q15 nearest width 128 + Q23 L2",
+      "C64. Q15 nearest width 64 + Q23 L2",
+      "C32. Q15 nearest width 32 + Q23 L2"};
+  constexpr std::array<const char*, 5> operation_names = {
+      "phase sigmoid / value", "scale generation", "L2 assembly",
+      "combined Phase scale + L2", "full staged Network"};
+  for (std::size_t operation = 0; operation < operation_names.size();
+       ++operation) {
+    std::cout << operation_names[operation] << std::endl;
+    const auto baseline = SummarizeNnueBenchSamples(samples[0][operation]);
+    for (std::size_t candidate = 0; candidate < 5; ++candidate) {
+      PrintNnueBenchSamples(candidate_names[candidate],
+                            samples[candidate][operation]);
+      const auto summary =
+          SummarizeNnueBenchSamples(samples[candidate][operation]);
+      const double improvement = baseline.median == 0.0 ? 0.0
+          : (baseline.median - summary.median) * 100.0 / baseline.median;
+      std::cout << "  improvement vs A : " << std::fixed
+                << std::setprecision(2) << improvement << "%" << std::endl
+                << "  timing checksum   : 0x" << std::hex
+                << timing_checksums[candidate][operation] << std::dec
+                << std::endl;
+    }
+  }
+
+  struct Accuracy {
+    std::uint64_t l2_mismatches = 0;
+    int l2_max_diff = 0;
+    std::uint64_t final_mismatches = 0;
+    std::int64_t final_max_raw_diff = 0;
+    std::uint64_t l2_checksum = UINT64_C(14695981039346656037);
+    std::uint64_t final_checksum = UINT64_C(14695981039346656037);
+    double cp_sum = 0.0;
+    std::vector<double> cp_differences;
+  };
+  std::array<Accuracy, 5> accuracy;
+  for (auto& value : accuracy)
+    value.cp_differences.reserve(corpus.size());
+  std::vector<std::int32_t> phase_raw;
+  phase_raw.reserve(corpus.size() * 6);
+  float scale_min = std::numeric_limits<float>::max();
+  float scale_max = std::numeric_limits<float>::lowest();
+  std::array<float, 6> channel_scale_min;
+  std::array<float, 6> channel_scale_max;
+  channel_scale_min.fill(std::numeric_limits<float>::max());
+  channel_scale_max.fill(std::numeric_limits<float>::lowest());
+
+  alignas(kCacheLineSize) Network::Buffer work{};
+  alignas(kCacheLineSize) std::uint8_t l2[192];
+  for (std::size_t sample_index = 0; sample_index < corpus.size();
+       ++sample_index) {
+    const auto& sample = corpus[sample_index];
+    const Network& selected_network =
+        NnueBenchSelectedNetwork(sample.input.selected_bucket);
+    const auto float_scale_values =
+        NnueBenchPhaseScalesToArray(sample.phase_scales);
+    for (int channel = 0; channel < 6; ++channel) {
+      phase_raw.push_back(sample.intermediate.phase_out[channel]);
+      scale_min = std::min(scale_min, float_scale_values[channel]);
+      scale_max = std::max(scale_max, float_scale_values[channel]);
+      channel_scale_min[channel] =
+          std::min(channel_scale_min[channel], float_scale_values[channel]);
+      channel_scale_max[channel] =
+          std::max(channel_scale_max[channel], float_scale_values[channel]);
+    }
+
+    for (std::size_t candidate = 0; candidate < 5; ++candidate) {
+      std::int32_t output;
+      if (candidate == 0) {
+        selected_network.BenchmarkL2Assembly(
+            sample.intermediate.ac_sqr_0_out_temp,
+            sample.intermediate.ac_0_out, sample.intermediate.diff_ac_out,
+            sample.intermediate.abs_ac_out, sample.intermediate.abs_sqr_out,
+            sample.intermediate.cross_feat, sample.phase_scales, l2);
+        output = ComputeNnueNetworkPhaseL2Candidate<
+            PhaseL2FixedCandidate::CurrentFloat>(sample, work);
+      } else {
+        const std::int32_t* q23 =
+            auxiliary[sample_index].fixed_scales_q23[candidate - 1].data();
+        selected_network.BenchmarkL2AssemblyQ23(
+            sample.intermediate.ac_sqr_0_out_temp,
+            sample.intermediate.ac_0_out, sample.intermediate.diff_ac_out,
+            sample.intermediate.abs_ac_out, sample.intermediate.abs_sqr_out,
+            sample.intermediate.cross_feat, q23, l2);
+        if (candidate == 1)
+          output = ComputeNnueNetworkPhaseL2Candidate<
+              PhaseL2FixedCandidate::FixedWidth256>(sample, work);
+        else if (candidate == 2)
+          output = ComputeNnueNetworkPhaseL2Candidate<
+              PhaseL2FixedCandidate::FixedWidth128>(sample, work);
+        else if (candidate == 3)
+          output = ComputeNnueNetworkPhaseL2Candidate<
+              PhaseL2FixedCandidate::FixedWidth64>(sample, work);
+        else
+          output = ComputeNnueNetworkPhaseL2Candidate<
+              PhaseL2FixedCandidate::FixedWidth32>(sample, work);
+      }
+      for (int i = 0; i < 192; ++i) {
+        MixNnueBenchChecksum(accuracy[candidate].l2_checksum, l2[i]);
+        const int difference = std::abs(
+            static_cast<int>(l2[i])
+            - static_cast<int>(sample.intermediate.l2_input[i]));
+        accuracy[candidate].l2_mismatches += difference != 0;
+        accuracy[candidate].l2_max_diff =
+            std::max(accuracy[candidate].l2_max_diff, difference);
+      }
+      MixNnueBenchChecksum(accuracy[candidate].final_checksum, output);
+      const std::int64_t raw_difference = std::abs(
+          static_cast<std::int64_t>(output) - sample.final_output);
+      accuracy[candidate].final_mismatches += raw_difference != 0;
+      accuracy[candidate].final_max_raw_diff =
+          std::max(accuracy[candidate].final_max_raw_diff, raw_difference);
+      const double cp_difference =
+          static_cast<double>(raw_difference) / static_cast<double>(FV_SCALE);
+      accuracy[candidate].cp_sum += cp_difference;
+      accuracy[candidate].cp_differences.push_back(cp_difference);
+    }
+  }
+
+  std::sort(phase_raw.begin(), phase_raw.end());
+  auto raw_percentile = [&](const double p) {
+    const std::size_t index = static_cast<std::size_t>(std::ceil(
+        p * static_cast<double>(phase_raw.size()))) - 1;
+    return phase_raw[std::min(index, phase_raw.size() - 1)];
+  };
+  constexpr std::array<double, 7> percentiles = {
+      0.0, 0.01, 0.10, 0.50, 0.90, 0.99, 1.0};
+  constexpr std::array<const char*, 7> percentile_names = {
+      "min", "p1", "p10", "median", "p90", "p99", "max"};
+  std::cout << "[phase_out / logit distribution, all 6 channels]" << std::endl;
+  for (std::size_t i = 0; i < percentiles.size(); ++i) {
+    const std::int32_t raw = percentiles[i] == 0.0 ? phase_raw.front()
+        : percentiles[i] == 1.0 ? phase_raw.back()
+        : raw_percentile(percentiles[i]);
+    const double logit = (static_cast<double>(raw) / 8128.0) * 3.0 + 1.0;
+    std::cout << "  " << std::setw(6) << percentile_names[i]
+              << " raw=" << std::setw(9) << raw
+              << " logit=" << std::fixed << std::setprecision(6) << logit
+              << std::endl;
+  }
+  std::cout << "  current float scale range: [" << scale_min << ", "
+            << scale_max << "]" << std::endl;
+  for (int channel = 0; channel < 6; ++channel)
+    std::cout << "  channel " << channel << " scale range: ["
+              << channel_scale_min[channel] << ", "
+              << channel_scale_max[channel] << "]" << std::endl;
+
+  std::cout << "[accuracy vs current production]" << std::endl;
+  const double l2_total = static_cast<double>(corpus.size() * 192);
+  for (std::size_t candidate = 0; candidate < 5; ++candidate) {
+    auto& result = accuracy[candidate];
+    std::sort(result.cp_differences.begin(), result.cp_differences.end());
+    const double final_total = static_cast<double>(corpus.size());
+    std::cout << candidate_names[candidate] << std::endl
+              << "  L2 checksum           : 0x" << std::hex
+              << result.l2_checksum << std::dec << std::endl
+              << "  L2 byte mismatch      : " << result.l2_mismatches << " / "
+              << static_cast<std::uint64_t>(l2_total) << " ("
+              << std::fixed << std::setprecision(6)
+              << 100.0 * result.l2_mismatches / l2_total << "%)" << std::endl
+              << "  L2 max byte diff      : " << result.l2_max_diff << std::endl
+              << "  final checksum        : 0x" << std::hex
+              << result.final_checksum << std::dec << std::endl
+              << "  final mismatch        : " << result.final_mismatches << " / "
+              << corpus.size() << " (" << std::fixed << std::setprecision(6)
+              << 100.0 * result.final_mismatches / final_total << "%)"
+              << std::endl
+              << "  final max raw diff    : " << result.final_max_raw_diff
+              << std::endl
+              << "  eval/cp abs diff mean : "
+              << result.cp_sum / final_total << std::endl
+              << "  eval/cp abs diff median: "
+              << NnueBenchPhaseL2Percentile(result.cp_differences, 0.50)
+              << std::endl
+              << "  eval/cp abs diff max  : "
+              << result.cp_differences.back() << std::endl
+              << "  eval/cp abs diff p90  : "
+              << NnueBenchPhaseL2Percentile(result.cp_differences, 0.90) << std::endl
+              << "  eval/cp abs diff p95  : "
+              << NnueBenchPhaseL2Percentile(result.cp_differences, 0.95) << std::endl
+              << "  eval/cp abs diff p99  : "
+              << NnueBenchPhaseL2Percentile(result.cp_differences, 0.99) << std::endl
+              << "  eval/cp abs diff p99.9: "
+              << NnueBenchPhaseL2Percentile(result.cp_differences, 0.999) << std::endl;
+  }
+
+  std::cout << "[actual Network::Propagate A / C32]" << std::endl;
+  const auto production_corpus = MakeNnueNetworkBenchCorpus();
+  NnueBenchSamples production_float_samples;
+  NnueBenchSamples production_fixed_samples;
+  std::uint64_t production_float_timing_checksum =
+      UINT64_C(14695981039346656037);
+  std::uint64_t production_fixed_timing_checksum =
+      UINT64_C(14695981039346656037);
+  for (std::uint64_t repeat = 0; repeat < repeat_count; ++repeat) {
+    if ((repeat & 1) == 0) {
+      production_float_samples.Add(
+          MeasureProductionPhaseL2NetworkCorpusAfterWarmup<false>(
+              production_corpus, production_float_timing_checksum));
+      production_fixed_samples.Add(
+          MeasureProductionPhaseL2NetworkCorpusAfterWarmup<true>(
+              production_corpus, production_fixed_timing_checksum));
+    } else {
+      production_fixed_samples.Add(
+          MeasureProductionPhaseL2NetworkCorpusAfterWarmup<true>(
+              production_corpus, production_fixed_timing_checksum));
+      production_float_samples.Add(
+          MeasureProductionPhaseL2NetworkCorpusAfterWarmup<false>(
+              production_corpus, production_float_timing_checksum));
+    }
+  }
+  PrintNnueBenchSamples("A. production float", production_float_samples);
+  std::cout << "  SD ns/call : "
+            << NnueBenchSampleStandardDeviation(production_float_samples)
+            << std::endl;
+  PrintNnueBenchSamples("C32. production fixed", production_fixed_samples);
+  std::cout << "  SD ns/call : "
+            << NnueBenchSampleStandardDeviation(production_fixed_samples)
+            << std::endl;
+  const auto production_float_summary =
+      SummarizeNnueBenchSamples(production_float_samples);
+  const auto production_fixed_summary =
+      SummarizeNnueBenchSamples(production_fixed_samples);
+  std::cout << "  median improvement: " << std::fixed << std::setprecision(2)
+            << (production_float_summary.median
+                    - production_fixed_summary.median)
+                * 100.0 / production_float_summary.median
+            << "%" << std::endl
+            << "  timing checksum match: "
+            << (production_float_timing_checksum
+                    == production_fixed_timing_checksum
+                ? "yes" : "NO (expected for approximate C32)")
+            << std::endl;
+
+  std::uint64_t production_l2_mismatches = 0;
+  std::uint64_t production_final_mismatches = 0;
+  int production_l2_max_diff = 0;
+  std::int64_t production_final_max_diff = 0;
+  alignas(kCacheLineSize) Network::Buffer float_work{};
+  alignas(kCacheLineSize) Network::Buffer fixed_work{};
+  for (const auto& sample : production_corpus) {
+    const Network& selected_network =
+        NnueBenchSelectedNetwork(sample.selected_bucket);
+    const auto float_output = selected_network.Propagate<true, false, false>(
+        sample.transformed.data(), sample.diff_transformed.data(),
+        sample.abs_transformed.data(), sample.material_bucket,
+        reinterpret_cast<char*>(&float_work));
+    const auto fixed_output = selected_network.Propagate<true, false, true>(
+        sample.transformed.data(), sample.diff_transformed.data(),
+        sample.abs_transformed.data(), sample.material_bucket,
+        reinterpret_cast<char*>(&fixed_work));
+    for (int i = 0; i < 192; ++i) {
+      const int difference = std::abs(
+          static_cast<int>(float_work.l2_input[i])
+          - static_cast<int>(fixed_work.l2_input[i]));
+      production_l2_mismatches += difference != 0;
+      production_l2_max_diff = std::max(production_l2_max_diff, difference);
+    }
+    const std::int64_t difference = std::abs(
+        static_cast<std::int64_t>(float_output[0]) - fixed_output[0]);
+    production_final_mismatches += difference != 0;
+    production_final_max_diff =
+        std::max(production_final_max_diff, difference);
+  }
+  std::cout << "  production L2 mismatch       : "
+            << production_l2_mismatches << " / "
+            << production_corpus.size() * 192 << std::endl
+            << "  production L2 max byte diff : "
+            << production_l2_max_diff << std::endl
+            << "  production final mismatch   : "
+            << production_final_mismatches << " / "
+            << production_corpus.size() << std::endl
+            << "  production max raw diff     : "
+            << production_final_max_diff << std::endl
+            << "  matches reconstructed C32 counts: "
+            << (production_l2_mismatches == accuracy[4].l2_mismatches
+                    && production_final_mismatches
+                        == accuracy[4].final_mismatches
+                    && production_l2_max_diff == accuracy[4].l2_max_diff
+                    && production_final_max_diff
+                        == accuracy[4].final_max_raw_diff
+                ? "yes" : "NO")
+            << std::endl;
+}
+
 template<NetworkStageBenchOperation Operation>
 NnueBenchTiming MeasureNnueNetworkStageCorpus(
     const std::vector<NetworkStageBenchCase>& corpus,
@@ -7948,6 +8657,10 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::uint64_t repeat_count;
     if (ReadNnueBenchRepeatCount(stream, repeat_count))
       TestRouterPhaseInputBenchmarkCompare(repeat_count);
+  } else if (sub_command == "bench_phase_l2_fixed_compare") {
+    std::uint64_t repeat_count;
+    if (ReadNnueBenchRepeatCount(stream, repeat_count))
+      TestPhaseL2FixedBenchmarkCompare(repeat_count);
   } else if (sub_command == "bench_main_gate_compare") {
     std::uint64_t repeat_count;
     if (ReadNnueBenchRepeatCount(stream, repeat_count))
@@ -8022,6 +8735,8 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << " test nnue bench_network_compare [repeats]" << std::endl;
     std::cout << " test nnue bench_network_stages [repeats]" << std::endl;
     std::cout << " test nnue bench_router_phase_input_compare [repeats]"
+              << std::endl;
+    std::cout << " test nnue bench_phase_l2_fixed_compare [repeats]"
               << std::endl;
     std::cout << " test nnue bench_main_gate_compare [repeats]"
               << std::endl;

@@ -115,6 +115,10 @@ struct Network {
 		// network-loading path before search workers can evaluate positions.
 		MainGateCompactQ64Lut();
 #endif
+#if defined(USE_NNUE_PHASE_L2_FIXED_C32)
+		// Construct before worker threads start (-fno-threadsafe-statics).
+		PhaseFixedC32SigmoidQ15Lut();
+#endif
 		return Tools::ResultCode::Ok;
 	}
 
@@ -406,6 +410,93 @@ struct Network {
 		}
 	}
 
+	static constexpr std::int32_t kPhaseFixedRawMinimum = -65536;
+	static constexpr std::int32_t kPhaseFixedRawMaximum = 65536;
+	static constexpr std::int32_t kPhaseFixedC32RawStep = 32;
+	static constexpr std::size_t kPhaseFixedC32LutSize =
+		(kPhaseFixedRawMaximum - kPhaseFixedRawMinimum)
+			/ kPhaseFixedC32RawStep + 1;
+
+	static const std::array<std::uint16_t, kPhaseFixedC32LutSize>&
+	PhaseFixedC32SigmoidQ15Lut() {
+		static const auto lut = []() {
+			std::array<std::uint16_t, kPhaseFixedC32LutSize> values{};
+			for (std::size_t i = 0; i < values.size(); ++i) {
+				const std::int32_t raw = kPhaseFixedRawMinimum
+					+ static_cast<std::int32_t>(i) * kPhaseFixedC32RawStep;
+				const float logit =
+					(static_cast<float>(raw) / 8128.0f) * 3.0f + 1.0f;
+				const float sigmoid = 1.0f / (1.0f + std::exp(-logit));
+				values[i] = static_cast<std::uint16_t>(std::clamp(
+					static_cast<int>(std::lround(sigmoid * 32768.0f)),
+					0, 32768));
+			}
+			return values;
+		}();
+		return lut;
+	}
+
+	static inline void ComputePhaseFixedC32ScalesQ23(
+		const std::int32_t* phase_output, std::int32_t* scales_q23) {
+		const auto& lut = PhaseFixedC32SigmoidQ15Lut();
+		constexpr std::int32_t kBaseQ15 = 18022;
+		constexpr std::int32_t kGainQ15 = 14746;
+		constexpr std::array<std::int32_t, 6> kFactorQ15 = {
+			42598, 49152, 32768, 22938, 28836, 49152};
+		for (int i = 0; i < 6; ++i) {
+			const std::int32_t raw = phase_output[i];
+			std::uint16_t sigmoid_q15;
+			if (raw <= kPhaseFixedRawMinimum)
+				sigmoid_q15 = lut.front();
+			else if (raw >= kPhaseFixedRawMaximum)
+				sigmoid_q15 = lut.back();
+			else {
+				const auto index = static_cast<std::size_t>(
+					(raw - kPhaseFixedRawMinimum + kPhaseFixedC32RawStep / 2)
+						/ kPhaseFixedC32RawStep);
+				sigmoid_q15 = lut[index];
+			}
+			const std::int32_t base_q15 = kBaseQ15
+				+ (static_cast<std::int32_t>(sigmoid_q15) * kGainQ15
+					+ (1 << 14)) / (1 << 15);
+			scales_q23[i] = (base_q15 * kFactorQ15[i] + 64) >> 7;
+		}
+	}
+
+	template<IndexType Dimensions>
+	static inline void AssembleL2ChannelQ23(
+		const std::uint8_t* input, std::uint8_t* output,
+		const std::int32_t scale_q23) {
+		// input <= 127 and scale <= 1.5, so the maximum product is
+		// 127 * round(1.5 * 2^23) = 1,597,829,824 < INT32_MAX.
+#if defined(USE_AVX2)
+		constexpr IndexType kSimdDimensions = Dimensions / 8 * 8;
+		const __m256i scale = _mm256_set1_epi32(scale_q23);
+		const __m256i upper = _mm256_set1_epi32(127);
+		for (IndexType i = 0; i < kSimdDimensions; i += 8) {
+			const __m128i bytes = _mm_loadl_epi64(
+				reinterpret_cast<const __m128i*>(input + i));
+			const __m256i values = _mm256_cvtepu8_epi32(bytes);
+			const __m256i product = _mm256_mullo_epi32(values, scale);
+			const __m256i shifted = _mm256_srli_epi32(product, 23);
+			const __m256i clamped = _mm256_min_epi32(shifted, upper);
+			const __m128i packed16 = _mm_packus_epi32(
+				_mm256_castsi256_si128(clamped),
+				_mm256_extracti128_si256(clamped, 1));
+			const __m128i packed8 = _mm_packus_epi16(
+				packed16, _mm_setzero_si128());
+			_mm_storel_epi64(reinterpret_cast<__m128i*>(output + i), packed8);
+		}
+#else
+		constexpr IndexType kSimdDimensions = 0;
+#endif
+		for (IndexType i = kSimdDimensions; i < Dimensions; ++i) {
+			const std::int32_t scaled =
+				(static_cast<std::int32_t>(input[i]) * scale_q23) >> 23;
+			output[i] = static_cast<std::uint8_t>(std::min(scaled, 127));
+		}
+	}
+
 	struct alignas(kCacheLineSize) Buffer {
 		// 各レイヤーの中間出力を保持するバッファ
 		alignas(kCacheLineSize) typename decltype(fc_0)::OutputBuffer fc_0_out;
@@ -443,7 +534,12 @@ struct Network {
 
 	static constexpr std::size_t kBufferSize = sizeof(Buffer);
 
-	template<bool UsePhasePrefix = true, bool PhaseInputPrepared = false>
+	template<bool UsePhasePrefix = true, bool PhaseInputPrepared = false,
+#if defined(USE_NNUE_PHASE_L2_FIXED_C32)
+		bool UseFixedPhaseL2 = true>
+#else
+		bool UseFixedPhaseL2 = false>
+#endif
 	const OutputType* Propagate(const TransformedFeatureType* transformedFeatures, const TransformedFeatureType* diffFeatures, const TransformedFeatureType* absFeatures, const int bucket_id, char* buffer
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
 		, NnueSignalSnapshot* signal = nullptr
@@ -476,20 +572,39 @@ struct Network {
 			phase_proj.PropagatePrefix<6>(buf.phase_input, buf.phase_out);
 		else
 			phase_proj.Propagate(buf.phase_input, buf.phase_out);
-		float phase_val[6];
-		for (int i = 0; i < 6; ++i) {
-			float logit = (static_cast<float>(buf.phase_out[i]) / 8128.0f) * 3.0f + 1.0f;
-			float sig = 1.0f / (1.0f + std::exp(-logit));
-			phase_val[i] = 0.1f + 0.9f * sig;
+		std::int32_t phase_scales_q23[6]{};
+		float main_sqr_scale = 0.0f;
+		float main_raw_scale = 0.0f;
+		float diff_scale = 0.0f;
+		float abs_raw_scale = 0.0f;
+		float abs_sqr_scale = 0.0f;
+		float cross_scale = 0.0f;
+		if constexpr (UseFixedPhaseL2) {
+			ComputePhaseFixedC32ScalesQ23(buf.phase_out, phase_scales_q23);
+#if defined(ENABLE_NNUE_SIGNAL_LOG) || defined(USE_NNUE_PHASE_FM_LMR)
+			constexpr float kInverseQ23 = 1.0f / static_cast<float>(1 << 23);
+			main_sqr_scale = phase_scales_q23[0] * kInverseQ23;
+			main_raw_scale = phase_scales_q23[1] * kInverseQ23;
+			diff_scale = phase_scales_q23[2] * kInverseQ23;
+			abs_raw_scale = phase_scales_q23[3] * kInverseQ23;
+			abs_sqr_scale = phase_scales_q23[4] * kInverseQ23;
+			cross_scale = phase_scales_q23[5] * kInverseQ23;
+#endif
+		} else {
+			float phase_val[6];
+			for (int i = 0; i < 6; ++i) {
+				const float logit =
+					(static_cast<float>(buf.phase_out[i]) / 8128.0f) * 3.0f + 1.0f;
+				const float sig = 1.0f / (1.0f + std::exp(-logit));
+				phase_val[i] = 0.1f + 0.9f * sig;
+			}
+			main_sqr_scale = (0.5f + 0.5f * phase_val[0]) * 1.3f;
+			main_raw_scale = (0.5f + 0.5f * phase_val[1]) * 1.5f;
+			diff_scale = (0.5f + 0.5f * phase_val[2]) * 1.0f;
+			abs_raw_scale = (0.5f + 0.5f * phase_val[3]) * 0.7f;
+			abs_sqr_scale = (0.5f + 0.5f * phase_val[4]) * 0.88f;
+			cross_scale = (0.5f + 0.5f * phase_val[5]) * 1.5f;
 		}
-
-		// L2入力時の各チャネルごとの最終スケールを決定
-		float main_sqr_scale = (0.5f + 0.5f * phase_val[0]) * 1.3f;
-		float main_raw_scale = (0.5f + 0.5f * phase_val[1]) * 1.5f;
-		float diff_scale     = (0.5f + 0.5f * phase_val[2]) * 1.0f;
-		float abs_raw_scale  = (0.5f + 0.5f * phase_val[3]) * 0.7f;
-		float abs_sqr_scale  = (0.5f + 0.5f * phase_val[4]) * 0.88f;
-		float cross_scale    = (0.5f + 0.5f * phase_val[5]) * 1.5f;
 
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
 		if (signal) {
@@ -730,12 +845,21 @@ struct Network {
 		// --- 6. L2 Input Assembly: 深層評価パスへの入力構築 (192次元) ---
 		// 各チャネルを Phase Gate で得たスケールで調整しつつ統合
 		// [0:30] MainSqr, [31:61] MainRaw, [62:93] Diff, [94:125] AbsRaw, [126:157] AbsSqr, [158:189] Cross, [190:191] Pad
-		AssembleL2Channel<31>(buf.ac_sqr_0_out_temp, &buf.l2_input[0], main_sqr_scale);
-		AssembleL2Channel<31>(buf.ac_0_out, &buf.l2_input[31], main_raw_scale);
-		AssembleL2Channel<32>(buf.diff_ac_out, &buf.l2_input[62], diff_scale);
-		AssembleL2Channel<32>(buf.abs_ac_out, &buf.l2_input[94], abs_raw_scale);
-		AssembleL2Channel<32>(buf.abs_sqr_out, &buf.l2_input[126], abs_sqr_scale);
-		AssembleL2Channel<32>(buf.cross_feat, &buf.l2_input[158], cross_scale);
+		if constexpr (UseFixedPhaseL2) {
+			AssembleL2ChannelQ23<31>(buf.ac_sqr_0_out_temp, &buf.l2_input[0], phase_scales_q23[0]);
+			AssembleL2ChannelQ23<31>(buf.ac_0_out, &buf.l2_input[31], phase_scales_q23[1]);
+			AssembleL2ChannelQ23<32>(buf.diff_ac_out, &buf.l2_input[62], phase_scales_q23[2]);
+			AssembleL2ChannelQ23<32>(buf.abs_ac_out, &buf.l2_input[94], phase_scales_q23[3]);
+			AssembleL2ChannelQ23<32>(buf.abs_sqr_out, &buf.l2_input[126], phase_scales_q23[4]);
+			AssembleL2ChannelQ23<32>(buf.cross_feat, &buf.l2_input[158], phase_scales_q23[5]);
+		} else {
+			AssembleL2Channel<31>(buf.ac_sqr_0_out_temp, &buf.l2_input[0], main_sqr_scale);
+			AssembleL2Channel<31>(buf.ac_0_out, &buf.l2_input[31], main_raw_scale);
+			AssembleL2Channel<32>(buf.diff_ac_out, &buf.l2_input[62], diff_scale);
+			AssembleL2Channel<32>(buf.abs_ac_out, &buf.l2_input[94], abs_raw_scale);
+			AssembleL2Channel<32>(buf.abs_sqr_out, &buf.l2_input[126], abs_sqr_scale);
+			AssembleL2Channel<32>(buf.cross_feat, &buf.l2_input[158], cross_scale);
+		}
 		std::memset(buf.l2_input + 190, 0, 2);
 
 
@@ -1321,6 +1445,27 @@ struct Network {
 		AssembleL2Channel<32>(abs_input, output + 94, scales.abs_raw);
 		AssembleL2Channel<32>(abs_sqr, output + 126, scales.abs_sqr);
 		AssembleL2Channel<32>(cross_input, output + 158, scales.cross);
+		std::memset(output + 190, 0, 2);
+	}
+
+	template<IndexType Dimensions>
+	static void BenchmarkAssembleL2ChannelQ23(
+		const std::uint8_t* input, std::uint8_t* output,
+		const std::int32_t scale_q23) {
+		AssembleL2ChannelQ23<Dimensions>(input, output, scale_q23);
+	}
+
+	void BenchmarkL2AssemblyQ23(const std::uint8_t* main_sqr,
+		const std::uint8_t* main_raw, const std::uint8_t* diff_input,
+		const std::uint8_t* abs_input, const std::uint8_t* abs_sqr,
+		const std::uint8_t* cross_input, const std::int32_t* scales_q23,
+		std::uint8_t* output) const {
+		BenchmarkAssembleL2ChannelQ23<31>(main_sqr, output, scales_q23[0]);
+		BenchmarkAssembleL2ChannelQ23<31>(main_raw, output + 31, scales_q23[1]);
+		BenchmarkAssembleL2ChannelQ23<32>(diff_input, output + 62, scales_q23[2]);
+		BenchmarkAssembleL2ChannelQ23<32>(abs_input, output + 94, scales_q23[3]);
+		BenchmarkAssembleL2ChannelQ23<32>(abs_sqr, output + 126, scales_q23[4]);
+		BenchmarkAssembleL2ChannelQ23<32>(cross_input, output + 158, scales_q23[5]);
 		std::memset(output + 190, 0, 2);
 	}
 
