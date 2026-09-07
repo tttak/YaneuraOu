@@ -3746,6 +3746,7 @@ moves_loop:  // When in check, search starts here
         bool nnuePhaseFmLmrReducedFailHigh = false;
         bool nnuePhaseFmLmrWasResearched = false;
         Value nnuePhaseFmLmrReducedValue = VALUE_ZERO;
+        bool nnueCalibrationPositiveReduction = false;
         bool nnueLcaLmrCandidate = false;
         bool nnueLcaLmrAdjusted = false;
         bool nnueCrossLmrCandidate = false;
@@ -3836,6 +3837,12 @@ moves_loop:  // When in check, search starts here
 			*/
 
 			Depth d = std::max(1, std::min(newDepth - r / 1024, newDepth + 2)) + PvNode;
+
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+            // Snapshot the unmodified LMR depth before any NNUE signal can add
+            // a ply. Calibration uses this to exclude reduction-zero moves.
+            nnueCalibrationPositiveReduction = d < newDepth;
+#endif
 
 #if defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)
             if (NNUE_ROUTER_LMR_VARIANT == 3 && nnueRouterLmrWouldAdjust
@@ -4218,7 +4225,8 @@ moves_loop:  // When in check, search starts here
               depth, moveCount, nnuePhaseFmLmrRouterAdjusted,
               nnuePhaseFmLmrReducedFailHigh, nnuePhaseFmLmrWasResearched,
               static_cast<int>(nnuePhaseFmLmrReducedValue), static_cast<int>(value),
-              value >= beta, finalCutoff, nnuePhaseFmLmrCandidate,
+              value >= beta, finalCutoff, nnueCalibrationPositiveReduction,
+              nnuePhaseFmLmrCandidate,
               nnuePhaseFmLmrAdjusted, nnueLcaLmrCandidate,
               nnueLcaLmrAdjusted, nnueCrossLmrCandidate,
               nnueCrossLmrAdjusted);

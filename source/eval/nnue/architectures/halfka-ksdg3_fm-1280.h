@@ -260,7 +260,18 @@ struct Network {
 #endif
 
 	static inline void ComputeMainGateSigmoid(
-		const std::int32_t* diff_fc_output, std::int32_t* gate_q64) {
+		const std::int32_t* diff_fc_output, std::int32_t* gate_q64
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+		, NnueSignalSnapshot* signal = nullptr
+#endif
+	) {
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+		std::uint16_t gate_sum = 0;
+		std::uint8_t gate_min = 63;
+		std::uint8_t gate_max = 0;
+		std::uint8_t saturated_low_count = 0;
+		std::uint8_t saturated_high_count = 0;
+#endif
 		for (int j = 0; j < 32; ++j) {
 #if defined(USE_NNUE_APPROX_SIGMOID_LUT)
 			gate_q64[j] = MainGateCompactQ64Value(
@@ -268,7 +279,26 @@ struct Network {
 #else
 			gate_q64[j] = sigmoid_gate_slow(diff_fc_output[j] - 2438, 64);
 #endif
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+			if (signal) {
+				const auto gate = static_cast<std::uint8_t>(gate_q64[j]);
+				gate_sum += gate;
+				gate_min = std::min(gate_min, gate);
+				gate_max = std::max(gate_max, gate);
+				saturated_low_count += gate <= 1;
+				saturated_high_count += gate >= 63;
+			}
+#endif
 		}
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+		if (signal) {
+			signal->main_gate_sum = gate_sum;
+			signal->main_gate_min = gate_min;
+			signal->main_gate_max = gate_max;
+			signal->main_gate_saturated_low_count = saturated_low_count;
+			signal->main_gate_saturated_high_count = saturated_high_count;
+		}
+#endif
 	}
 
 	static inline void ComputeMainGateApply(const std::int32_t* fc_input,
@@ -286,10 +316,18 @@ struct Network {
 	}
 
 	static inline void ComputeMainGate(const std::int32_t* fc_input,
-		const std::int32_t* diff_fc_output, std::int32_t* fc_output) {
+		const std::int32_t* diff_fc_output, std::int32_t* fc_output
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+		, NnueSignalSnapshot* signal = nullptr
+#endif
+	) {
 		std::int32_t gate_q64[32];
 		std::int32_t before_clamp[32];
-		ComputeMainGateSigmoid(diff_fc_output, gate_q64);
+		ComputeMainGateSigmoid(diff_fc_output, gate_q64
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+			, signal
+#endif
+		);
 		ComputeMainGateApply(fc_input, gate_q64, before_clamp);
 		ComputeMainGateClamp(before_clamp, fc_output);
 	}
@@ -489,6 +527,14 @@ struct Network {
 		#endif
 		float inv_rms_d = 1.0f / std::sqrt(sum_sq_d / 32.0f + 1e-8f);
 
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+		std::uint16_t fm_diff_activity_sum = 0;
+		std::uint16_t fm_abs_activity_sum = 0;
+		std::uint8_t fm_diff_activity_max = 0;
+		std::uint8_t fm_abs_activity_max = 0;
+		std::uint8_t fm_diff_saturated_count = 0;
+		std::uint8_t fm_abs_saturated_count = 0;
+#endif
 		for (int j = 0; j < 32; ++j) {
 			int32_t gd = buf.diff_fc_out[j];      // gate_d
 			int32_t vd = buf.diff_fc_out[j + 32]; // val_d
@@ -510,7 +556,34 @@ struct Network {
 			);
 			buf.abs_ac_out[j] = static_cast<uint8_t>(a_scaled);
 
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+			if (signal) {
+				// Diff is offset-binary: 64 is neutral and both clamp endpoints
+				// are saturation. Abs is a nonnegative [0,127] activation.
+				const auto diff_q = buf.diff_ac_out[j];
+				const auto diff_activity = static_cast<std::uint8_t>(
+					std::abs(static_cast<int>(diff_q) - 64));
+				fm_diff_activity_sum += diff_activity;
+				fm_diff_activity_max = std::max(fm_diff_activity_max, diff_activity);
+				fm_diff_saturated_count += diff_q <= 1 || diff_q >= 126;
+
+				const auto abs_q = buf.abs_ac_out[j];
+				fm_abs_activity_sum += abs_q;
+				fm_abs_activity_max = std::max(fm_abs_activity_max, abs_q);
+				fm_abs_saturated_count += abs_q >= 126;
+			}
+#endif
 		}
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+		if (signal) {
+			signal->fm_diff_activity_sum = fm_diff_activity_sum;
+			signal->fm_diff_activity_max = fm_diff_activity_max;
+			signal->fm_diff_saturated_count = fm_diff_saturated_count;
+			signal->fm_abs_activity_sum = fm_abs_activity_sum;
+			signal->fm_abs_activity_max = fm_abs_activity_max;
+			signal->fm_abs_saturated_count = fm_abs_saturated_count;
+		}
+#endif
 		// Abs Sqr Path: 二乗による非線形強調
 		ComputeAbsSquared(buf.abs_ac_out, buf.abs_sqr_out);
 
@@ -518,7 +591,11 @@ struct Network {
 		// --- 3. Main Path: 基本骨格パスと FM による動的フィルタリング ---
 		fc_0.Propagate(transformedFeatures, buf.fc_0_out);
 		// FM 側の信号（gate_d）で Main パスの情報の通りやすさを制御
-		ComputeMainGate(buf.fc_0_out, buf.diff_fc_out, buf.fc_0_out);
+		ComputeMainGate(buf.fc_0_out, buf.diff_fc_out, buf.fc_0_out
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+			, signal
+#endif
+		);
 
 		ac_sqr_0.Propagate(buf.fc_0_out, buf.ac_sqr_0_out_temp); 
 		ac_0.Propagate(buf.fc_0_out, buf.ac_0_out);

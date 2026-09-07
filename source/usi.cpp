@@ -726,6 +726,10 @@ void USIEngine::bench(std::istream& args) {
                 {
                     engine.go(limits);
                     engine.wait_for_search_finished();
+                    // on_update_full is periodic and may not report the final node
+                    // count. Use the completed search's counter so fixed-node
+                    // calibration can validate the actual aggregate workload.
+                    nodesSearched = engine.get_threads().nodes_searched();
                 }
 
                 nodes += nodesSearched;

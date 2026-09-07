@@ -68,6 +68,21 @@ struct NnueSignalSnapshot {
     // collected from the completed 32-byte output without changing its values.
     std::uint16_t cross_abs_sum = 0;
     std::uint8_t cross_abs_max = 0;
+    // Main gate is an integer Q64 sigmoid in [0,63].  Diagnostics aggregate
+    // these values in the existing 32-channel generation loop.
+    std::uint16_t main_gate_sum = 0;
+    std::uint8_t main_gate_min = 0;
+    std::uint8_t main_gate_max = 0;
+    std::uint8_t main_gate_saturated_low_count = 0;   // gate <= 1
+    std::uint8_t main_gate_saturated_high_count = 0;  // gate >= 63
+    // FM activations are uint8 [0,127]. Diff is a signed-like signal stored
+    // around neutral 64, so its activity is abs(q-64); Abs activity is q.
+    std::uint16_t fm_diff_activity_sum = 0;
+    std::uint8_t fm_diff_activity_max = 0;
+    std::uint8_t fm_diff_saturated_count = 0;
+    std::uint16_t fm_abs_activity_sum = 0;
+    std::uint8_t fm_abs_activity_max = 0;
+    std::uint8_t fm_abs_saturated_count = 0;
     float lca_mean_abs_delta = 0.0f;
     std::int32_t lca_max_abs_delta = 0;
     std::int32_t lca_abs_delta_sum = 0;

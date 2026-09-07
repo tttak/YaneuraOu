@@ -83,6 +83,7 @@
 #include <iomanip>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <ostream>
 #include <string>
 #include <vector>
@@ -122,10 +123,22 @@ constexpr std::array<std::uint16_t, kCrossActivityBins - 1> kCrossMeanAbsEdges =
   4, 8, 16, 24, 32, 48, 64, 80, 96};
 constexpr std::array<std::uint8_t, kCrossActivityBins - 1> kCrossMaxAbsEdges = {
   16, 32, 48, 64, 80, 96, 112, 120, 126};
+constexpr std::size_t kMainGateSignalCount = 5;
+constexpr std::size_t kMainGateActivityBins = 8;
+constexpr std::size_t kFmActivitySignalCount = 6;
+constexpr std::size_t kFmActivityBins = 8;
+constexpr std::size_t kCalibrationRouterBins = 10;
+constexpr std::size_t kCalibrationRouterThresholdCount = 4;
+constexpr std::array<std::int32_t, kCalibrationRouterThresholdCount>
+  kCalibrationRouterThresholds = {128, 256, 512, 1024};
+constexpr std::size_t kCalibrationCrossThresholdCount = 3;
+constexpr std::array<std::uint8_t, kCalibrationCrossThresholdCount>
+  kCalibrationCrossThresholds = {125, 126, 127};
 constexpr std::array<std::uint32_t, kLcaPercentileCount> kLcaTopBasisPoints = {
   100, 250, 500, 1000, 2000};
 constexpr std::size_t kFmJointBaseStrata =
   kConditionBins * kConditionBins * kBucketCount * kConditionBins * kRouterMarginGroups;
+constexpr std::size_t kMainGateJointBaseStrata = kFmJointBaseStrata * 2 * 2;
 
 struct CoverageCell {
     std::uint64_t nodes = 0;
@@ -231,6 +244,59 @@ struct ConditionedLmrSignalStats {
     std::array<std::array<PhaseFmLmrBucket, Bins>, kRouterMarginGroups> by_router{};
     std::array<std::array<PhaseFmLmrBucket, Bins>, 2> by_lca_tail{};
     std::array<PhaseFmLmrBucket, kFmJointBaseStrata * 2 * Bins> joint{};
+};
+
+struct MainGateActivityStats {
+    std::array<PhaseFmLmrBucket, kMainGateActivityBins> all{};
+    std::array<std::array<PhaseFmLmrBucket, kMainGateActivityBins>, kConditionBins>
+      by_depth{};
+    std::array<std::array<PhaseFmLmrBucket, kMainGateActivityBins>, kConditionBins>
+      by_move_count{};
+    std::array<std::array<PhaseFmLmrBucket, kMainGateActivityBins>, kBucketCount>
+      by_bucket{};
+    std::array<std::array<PhaseFmLmrBucket, kMainGateActivityBins>, kConditionBins>
+      by_static_eval{};
+    std::array<std::array<PhaseFmLmrBucket, kMainGateActivityBins>, kRouterMarginGroups>
+      by_router{};
+    std::array<std::array<PhaseFmLmrBucket, kMainGateActivityBins>, 2> by_lca_tail{};
+    std::array<std::array<PhaseFmLmrBucket, kMainGateActivityBins>, 2>
+      by_cross_saturation{};
+    // Moves untouched by all three deployed NNUE-LMR signals. This measures
+    // whether a gate signal would add coverage rather than rediscovering them.
+    std::array<PhaseFmLmrBucket, kMainGateActivityBins> uncovered{};
+    // Flat index: depth x moveCount x bucket x |staticEval| x router group x
+    // calibrated LCA tail x Cross saturation x activity bin.
+    std::array<PhaseFmLmrBucket,
+               kMainGateJointBaseStrata * kMainGateActivityBins> joint{};
+};
+
+// FM activity uses the same conditioning axes and eight-bin layout as Main
+// gate activity, but stores six independently classified summaries.
+using FmActivityStats = MainGateActivityStats;
+
+struct SignalCalibrationStats {
+    std::uint64_t signal_valid_lmr_moves = 0;
+    std::uint64_t router_structural_moves = 0;
+    std::uint64_t router_actual_adjusted_moves = 0;
+    std::uint64_t lca_calibration_eligible_moves = 0;
+    std::uint64_t cross_structural_eligible_moves = 0;
+    std::array<PhaseFmLmrBucket, kCalibrationRouterBins> router_distribution{};
+    std::array<PhaseFmLmrBucket, kCalibrationRouterThresholdCount> router_cohorts{};
+    std::array<PhaseFmLmrBucket, kLcaDeltaSumMax + 1> lca_eligible_by_delta_sum{};
+    std::array<PhaseFmLmrBucket, kCalibrationCrossThresholdCount> cross_all_cohorts{};
+    std::array<PhaseFmLmrBucket, kLcaDeltaSumMax + 1>
+      cross_after_router_all_by_lca_sum{};
+    // Cross threshold x exact LCA sum, after Router and positive-reduction
+    // eligibility. Report-time LCA calibration removes the top tail from this
+    // table to reproduce the sequential Router -> LCA -> Cross deployment.
+    std::array<std::array<PhaseFmLmrBucket, kLcaDeltaSumMax + 1>,
+               kCalibrationCrossThresholdCount> cross_after_router_by_lca_sum{};
+    // Exact LCA sum x {Router danger, Cross danger}.  The LCA top-1% cutoff is
+    // unknown until the run is complete, so keeping this joint histogram lets
+    // the report derive model-calibrated overlap cohorts without a fixed sum.
+    // Low two bits: bit0=Router production predicate, bit1=Cross production
+    // structural predicate (depth/moveCount and max>=127).
+    std::array<PhaseFmLmrBucket, (kLcaDeltaSumMax + 1) * 4> overlap_by_lca_sum{};
 };
 
 // Counterfactual LCA cohorts. These are diagnostic-only observations of moves
@@ -458,6 +524,9 @@ struct ThreadStats {
     // the calibrated LCA-LMR predicate would deepen. Thresholds are cumulative.
     std::array<LcaThresholdCohortStats, kCrossDeployableThresholdCount>
       cross_deployable_thresholds{};
+    std::array<MainGateActivityStats, kMainGateSignalCount> main_gate_activity{};
+    std::array<FmActivityStats, kFmActivitySignalCount> fm_activity{};
+    SignalCalibrationStats signal_calibration{};
     std::array<CorrelationSums, 4> control_correlation{};  // depth, |eval|, |material|, ply
     std::array<std::array<std::array<std::array<PhaseStratum, kConditionBins>,
                                      kConditionBins>,
@@ -622,6 +691,148 @@ inline std::size_t CrossMaxAbsBin(const std::uint8_t maximum) {
     return kCrossActivityBins - 1;
 }
 
+inline std::size_t MainGateActivityBin(
+  const Eval::NNUE::NnueSignalSnapshot& signal, const std::size_t kind) {
+    const auto count_bin = [](const std::uint8_t count) {
+        if (count == 0) return std::size_t{0};
+        if (count == 1) return std::size_t{1};
+        if (count == 2) return std::size_t{2};
+        if (count <= 4) return std::size_t{3};
+        if (count <= 8) return std::size_t{4};
+        if (count <= 16) return std::size_t{5};
+        if (count <= 24) return std::size_t{6};
+        return std::size_t{7};
+    };
+    switch (kind) {
+    case 0: // Mean, classified by exact sum to avoid diagnostic float work.
+        return std::min<std::size_t>(signal.main_gate_sum / (8U * 32U), 7U);
+    case 1: {
+        const auto value = signal.main_gate_min;
+        if (value == 0) return 0;
+        if (value == 1) return 1;
+        if (value <= 3) return 2;
+        if (value <= 7) return 3;
+        if (value <= 15) return 4;
+        if (value <= 31) return 5;
+        if (value <= 47) return 6;
+        return 7;
+    }
+    case 2: {
+        const auto value = signal.main_gate_max;
+        if (value < 16) return 0;
+        if (value < 32) return 1;
+        if (value < 48) return 2;
+        if (value < 56) return 3;
+        if (value < 60) return 4;
+        if (value < 62) return 5;
+        if (value < 63) return 6;
+        return 7;
+    }
+    case 3: return count_bin(signal.main_gate_saturated_low_count);
+    default: return count_bin(signal.main_gate_saturated_high_count);
+    }
+}
+
+inline const char* MainGateActivityName(const std::size_t kind) {
+    static constexpr std::array<const char*, kMainGateSignalCount> names = {
+      "mean_main_gate", "min_main_gate", "max_main_gate",
+      "saturated_low_count(gate<=1)", "saturated_high_count(gate>=63)"};
+    return names[kind];
+}
+
+inline const char* MainGateActivityLabel(const std::size_t kind, const std::size_t bin) {
+    static constexpr std::array<const char*, kMainGateActivityBins> mean_labels = {
+      "mean[0,8)", "mean[8,16)", "mean[16,24)", "mean[24,32)",
+      "mean[32,40)", "mean[40,48)", "mean[48,56)", "mean[56,64)"};
+    static constexpr std::array<const char*, kMainGateActivityBins> min_labels = {
+      "min=0", "min=1", "min=2-3", "min=4-7", "min=8-15", "min=16-31",
+      "min=32-47", "min=48-63"};
+    static constexpr std::array<const char*, kMainGateActivityBins> max_labels = {
+      "max<16", "max=16-31", "max=32-47", "max=48-55", "max=56-59",
+      "max=60-61", "max=62", "max=63"};
+    static constexpr std::array<const char*, kMainGateActivityBins> count_labels = {
+      "count=0", "count=1", "count=2", "count=3-4", "count=5-8",
+      "count=9-16", "count=17-24", "count=25-32"};
+    if (kind == 0) return mean_labels[bin];
+    if (kind == 1) return min_labels[bin];
+    if (kind == 2) return max_labels[bin];
+    return count_labels[bin];
+}
+
+inline std::size_t FmActivityBin(
+  const Eval::NNUE::NnueSignalSnapshot& signal, const std::size_t kind) {
+    const auto count_bin = [](const std::uint8_t count) {
+        if (count == 0) return std::size_t{0};
+        if (count == 1) return std::size_t{1};
+        if (count == 2) return std::size_t{2};
+        if (count <= 4) return std::size_t{3};
+        if (count <= 8) return std::size_t{4};
+        if (count <= 16) return std::size_t{5};
+        if (count <= 24) return std::size_t{6};
+        return std::size_t{7};
+    };
+    const auto edge_bin = [](const auto value, const auto& edges) {
+        for (std::size_t bin = 0; bin < edges.size(); ++bin)
+            if (value < edges[bin])
+                return bin;
+        return edges.size();
+    };
+    static constexpr std::array<std::uint8_t, 7> diff_mean_edges = {
+      4, 8, 12, 16, 24, 32, 48};
+    static constexpr std::array<std::uint8_t, 7> diff_max_edges = {
+      8, 16, 24, 32, 40, 48, 56};
+    static constexpr std::array<std::uint8_t, 7> abs_mean_edges = {
+      16, 32, 48, 64, 80, 96, 112};
+    static constexpr std::array<std::uint8_t, 7> abs_max_edges = {
+      32, 64, 80, 96, 112, 120, 126};
+    switch (kind) {
+    case 0:
+        return edge_bin(signal.fm_diff_activity_sum / 32U, diff_mean_edges);
+    case 1:
+        return edge_bin(signal.fm_diff_activity_max, diff_max_edges);
+    case 2:
+        return count_bin(signal.fm_diff_saturated_count);
+    case 3:
+        return edge_bin(signal.fm_abs_activity_sum / 32U, abs_mean_edges);
+    case 4:
+        return edge_bin(signal.fm_abs_activity_max, abs_max_edges);
+    default:
+        return count_bin(signal.fm_abs_saturated_count);
+    }
+}
+
+inline const char* FmActivityName(const std::size_t kind) {
+    static constexpr std::array<const char*, kFmActivitySignalCount> names = {
+      "mean_diff_activity", "max_diff_activity", "saturated_diff_count",
+      "mean_abs_activity", "max_abs_activity", "saturated_abs_count"};
+    return names[kind];
+}
+
+inline const char* FmActivityLabel(const std::size_t kind, const std::size_t bin) {
+    static constexpr std::array<const char*, kFmActivityBins> diff_mean_labels = {
+      "mean_abs_diff<4", "mean_abs_diff[4,8)", "mean_abs_diff[8,12)",
+      "mean_abs_diff[12,16)", "mean_abs_diff[16,24)", "mean_abs_diff[24,32)",
+      "mean_abs_diff[32,48)", "mean_abs_diff>=48"};
+    static constexpr std::array<const char*, kFmActivityBins> diff_max_labels = {
+      "max_abs_diff<8", "max_abs_diff[8,16)", "max_abs_diff[16,24)",
+      "max_abs_diff[24,32)", "max_abs_diff[32,40)", "max_abs_diff[40,48)",
+      "max_abs_diff[48,56)", "max_abs_diff>=56"};
+    static constexpr std::array<const char*, kFmActivityBins> abs_mean_labels = {
+      "mean_abs<16", "mean_abs[16,32)", "mean_abs[32,48)", "mean_abs[48,64)",
+      "mean_abs[64,80)", "mean_abs[80,96)", "mean_abs[96,112)", "mean_abs>=112"};
+    static constexpr std::array<const char*, kFmActivityBins> abs_max_labels = {
+      "max_abs<32", "max_abs[32,64)", "max_abs[64,80)", "max_abs[80,96)",
+      "max_abs[96,112)", "max_abs[112,120)", "max_abs[120,126)", "max_abs>=126"};
+    static constexpr std::array<const char*, kFmActivityBins> count_labels = {
+      "count=0", "count=1", "count=2", "count=3-4", "count=5-8",
+      "count=9-16", "count=17-24", "count=25-32"};
+    if (kind == 0) return diff_mean_labels[bin];
+    if (kind == 1) return diff_max_labels[bin];
+    if (kind == 3) return abs_mean_labels[bin];
+    if (kind == 4) return abs_max_labels[bin];
+    return count_labels[bin];
+}
+
 template<typename EdgeType, std::size_t Size>
 inline std::string CrossActivityLabel(const char* name, const std::size_t bin,
                                       const std::array<EdgeType, Size>& edges) {
@@ -650,6 +861,23 @@ inline std::size_t FmRelianceFineGroup(const float value) {
 inline std::size_t RouterMarginGroup(const std::int32_t margin) {
     // Match the current conservative Router-LMR high-risk threshold.
     return margin <= 256 ? 0 : 1;
+}
+
+inline std::size_t CalibrationRouterBin(const std::int32_t margin) {
+    static constexpr std::array<std::int32_t, kCalibrationRouterBins - 1> edges = {
+      32, 64, 128, 256, 512, 1024, 2048, 4096, 8192};
+    const auto non_negative = std::max<std::int32_t>(margin, 0);
+    for (std::size_t bin = 0; bin < edges.size(); ++bin)
+        if (non_negative <= edges[bin])
+            return bin;
+    return kCalibrationRouterBins - 1;
+}
+
+inline const char* CalibrationRouterBinLabel(const std::size_t bin) {
+    static constexpr std::array<const char*, kCalibrationRouterBins> labels = {
+      "<=32", "33-64", "65-128", "129-256", "257-512",
+      "513-1024", "1025-2048", "2049-4096", "4097-8192", ">8192"};
+    return labels[bin];
 }
 
 inline std::size_t FmJointBaseIndex(const std::size_t depth_bin,
@@ -947,7 +1175,9 @@ class NodeObservation {
                                  const bool router_adjusted, const bool reduced_fail_high,
                                  const bool researched, const int reduced_value,
                                  const int final_value, const bool beta_exceeded,
-                                 const bool final_cutoff, const bool phase_fm_candidate,
+                                 const bool final_cutoff,
+                                 const bool positive_reduction_before_nnue,
+                                 const bool phase_fm_candidate,
                                  const bool phase_fm_adjusted,
                                  const bool lca_candidate, const bool lca_adjusted,
                                  const bool cross_candidate, const bool cross_adjusted) {
@@ -991,6 +1221,61 @@ class NodeObservation {
           && access_.signal.router_margin <= NNUE_ROUTER_LMR_MARGIN_THRESHOLD;
         const bool lca_danger =
           access_.signal.lca_abs_delta_sum >= NNUE_COMBINED_LCA_SUM_THRESHOLD;
+        const auto lca_sum = static_cast<std::size_t>(std::clamp(
+          access_.signal.lca_abs_delta_sum, 0,
+          static_cast<std::int32_t>(kLcaDeltaSumMax)));
+
+        // Model-calibration diagnostics. These counters observe the completed
+        // LMR move only; they never feed a threshold or decision back to search.
+        auto& calibration = stats.signal_calibration;
+        ++calibration.signal_valid_lmr_moves;
+        const bool router_structural = !pv_ && depth >= 3 && depth <= 8
+          && move_count >= 2 && move_count <= 8;
+        if (router_structural)
+            ++calibration.router_structural_moves;
+        calibration.router_actual_adjusted_moves += router_adjusted;
+        add(calibration.router_distribution[
+          CalibrationRouterBin(access_.signal.router_margin)]);
+        if (router_structural)
+            for (std::size_t threshold = 0;
+                 threshold < kCalibrationRouterThresholdCount; ++threshold)
+                if (access_.signal.router_margin
+                    <= kCalibrationRouterThresholds[threshold])
+                    add(calibration.router_cohorts[threshold]);
+
+        const bool cross_structural = depth >= 3 && depth <= 8
+          && move_count >= 2 && move_count <= 8;
+        // Keep this population identical to the historical model-relative
+        // LCA percentile analysis: every signal-valid LMR move which was not
+        // actually deepened by Router-LMR.  Positive-reduction eligibility is
+        // deliberately applied later to deployable Cross candidates, not to
+        // the model calibration itself.
+        const bool lca_calibration_eligible = !router_adjusted;
+        if (lca_calibration_eligible) {
+            ++calibration.lca_calibration_eligible_moves;
+            add(calibration.lca_eligible_by_delta_sum[lca_sum]);
+        }
+        const bool cross_after_router_eligible = cross_structural
+          && positive_reduction_before_nnue && !router_adjusted;
+        if (cross_after_router_eligible)
+            ++calibration.cross_structural_eligible_moves;
+        if (cross_after_router_eligible)
+            add(calibration.cross_after_router_all_by_lca_sum[lca_sum]);
+        for (std::size_t threshold = 0;
+             threshold < kCalibrationCrossThresholdCount; ++threshold) {
+            if (access_.signal.cross_abs_max
+                < kCalibrationCrossThresholds[threshold])
+                continue;
+            add(calibration.cross_all_cohorts[threshold]);
+            if (cross_after_router_eligible)
+                add(calibration.cross_after_router_by_lca_sum[threshold][lca_sum]);
+        }
+        const bool cross_danger_calibration = cross_structural
+          && access_.signal.cross_abs_max >= 127;
+        const std::size_t overlap_flags = (router_danger ? 1U : 0U)
+                                        | (cross_danger_calibration ? 2U : 0U);
+        add(calibration.overlap_by_lca_sum[lca_sum * 4 + overlap_flags]);
+
         const std::size_t combined_group = router_danger
           ? (lca_danger ? 2U : 0U)
           : (lca_danger ? 1U : 3U);
@@ -1054,6 +1339,51 @@ class NodeObservation {
             }
         }
 
+        // Main-gate summaries were accumulated while the 32 Q64 values were
+        // produced. Classification here adds no NNUE-side reduction. The full
+        // joint table controls for the requested Cross saturation axis too.
+        const std::size_t cross_saturation =
+          access_.signal.cross_abs_max >= 127 ? 1U : 0U;
+        const auto main_gate_joint_base =
+          (FmJointBaseIndex(depth_bin, move_bin, bucket, static_bin, router_group) * 2
+             + lca_tail) * 2 + cross_saturation;
+        const bool uncovered_by_deployed_nnue_lmr =
+          !router_adjusted && !lca_adjusted && !cross_adjusted;
+        for (std::size_t kind = 0; kind < kMainGateSignalCount; ++kind) {
+            auto& activity = stats.main_gate_activity[kind];
+            const auto bin = MainGateActivityBin(access_.signal, kind);
+            add(activity.all[bin]);
+            add(activity.by_depth[depth_bin][bin]);
+            add(activity.by_move_count[move_bin][bin]);
+            add(activity.by_bucket[bucket][bin]);
+            add(activity.by_static_eval[static_bin][bin]);
+            add(activity.by_router[router_group][bin]);
+            add(activity.by_lca_tail[lca_tail][bin]);
+            add(activity.by_cross_saturation[cross_saturation][bin]);
+            if (uncovered_by_deployed_nnue_lmr)
+                add(activity.uncovered[bin]);
+            add(activity.joint[main_gate_joint_base * kMainGateActivityBins + bin]);
+        }
+
+        // FM summaries were accumulated in the existing Diff/Abs output loop.
+        // This records only completed-move outcomes; it does not rescan the 32
+        // activations and does not affect NNUE or LMR decisions.
+        for (std::size_t kind = 0; kind < kFmActivitySignalCount; ++kind) {
+            auto& activity = stats.fm_activity[kind];
+            const auto bin = FmActivityBin(access_.signal, kind);
+            add(activity.all[bin]);
+            add(activity.by_depth[depth_bin][bin]);
+            add(activity.by_move_count[move_bin][bin]);
+            add(activity.by_bucket[bucket][bin]);
+            add(activity.by_static_eval[static_bin][bin]);
+            add(activity.by_router[router_group][bin]);
+            add(activity.by_lca_tail[lca_tail][bin]);
+            add(activity.by_cross_saturation[cross_saturation][bin]);
+            if (uncovered_by_deployed_nnue_lmr)
+                add(activity.uncovered[bin]);
+            add(activity.joint[main_gate_joint_base * kFmActivityBins + bin]);
+        }
+
         add(stats.phase_fm_lmr[fm_bin]);
         add(stats.phase_fm_lmr_by_depth[depth_bin][fm_bin]);
         add(stats.phase_fm_lmr_by_move_count[move_bin][fm_bin]);
@@ -1105,9 +1435,6 @@ class NodeObservation {
         add(stats.lca_lmr_joint[lca_joint]);
         if (!router_adjusted) {
             add(stats.lca_non_router_all);
-            const auto lca_sum = static_cast<std::size_t>(std::clamp(
-              access_.signal.lca_abs_delta_sum, 0,
-              static_cast<std::int32_t>(kLcaDeltaSumMax)));
             add(stats.lca_non_router_by_delta_sum[lca_sum]);
             for (std::size_t threshold = 0; threshold < kLcaThresholdCount; ++threshold) {
                 if (access_.signal.lca_mean_abs_delta < kLcaThresholds[threshold])
@@ -1278,8 +1605,13 @@ class NodeObservation {
 
 inline void Reset() {
     std::lock_guard<std::mutex> lock(g_registry_mutex);
-    for (auto* stats : g_thread_stats)
-        *stats = ThreadStats{};
+    for (auto* stats : g_thread_stats) {
+        // ThreadStats contains large diagnostic matrices. Reconstruct it in
+        // place so reset does not materialize a full-size temporary on the
+        // engine thread's fixed stack.
+        stats->~ThreadStats();
+        ::new (static_cast<void*>(stats)) ThreadStats();
+    }
 }
 
 inline void AddCoverage(CoverageCell& dst, const CoverageCell& src) {
@@ -1543,6 +1875,42 @@ inline void Snapshot(ThreadStats& result) {
         for (std::size_t sum = 0; sum <= kLcaDeltaSumMax; ++sum)
             AddPhaseFmLmr(result.lca_non_router_by_delta_sum[sum],
                           stats->lca_non_router_by_delta_sum[sum]);
+        auto& calibration = result.signal_calibration;
+        const auto& source_calibration = stats->signal_calibration;
+        calibration.signal_valid_lmr_moves += source_calibration.signal_valid_lmr_moves;
+        calibration.router_structural_moves += source_calibration.router_structural_moves;
+        calibration.router_actual_adjusted_moves +=
+          source_calibration.router_actual_adjusted_moves;
+        calibration.lca_calibration_eligible_moves +=
+          source_calibration.lca_calibration_eligible_moves;
+        calibration.cross_structural_eligible_moves +=
+          source_calibration.cross_structural_eligible_moves;
+        for (std::size_t bin = 0; bin < kCalibrationRouterBins; ++bin)
+            AddPhaseFmLmr(calibration.router_distribution[bin],
+                          source_calibration.router_distribution[bin]);
+        for (std::size_t threshold = 0;
+             threshold < kCalibrationRouterThresholdCount; ++threshold)
+            AddPhaseFmLmr(calibration.router_cohorts[threshold],
+                          source_calibration.router_cohorts[threshold]);
+        for (std::size_t sum = 0; sum <= kLcaDeltaSumMax; ++sum)
+            AddPhaseFmLmr(calibration.lca_eligible_by_delta_sum[sum],
+                          source_calibration.lca_eligible_by_delta_sum[sum]);
+        for (std::size_t sum = 0; sum <= kLcaDeltaSumMax; ++sum)
+            AddPhaseFmLmr(calibration.cross_after_router_all_by_lca_sum[sum],
+                          source_calibration.cross_after_router_all_by_lca_sum[sum]);
+        for (std::size_t threshold = 0;
+             threshold < kCalibrationCrossThresholdCount; ++threshold) {
+            AddPhaseFmLmr(calibration.cross_all_cohorts[threshold],
+                          source_calibration.cross_all_cohorts[threshold]);
+            for (std::size_t sum = 0; sum <= kLcaDeltaSumMax; ++sum)
+                AddPhaseFmLmr(
+                  calibration.cross_after_router_by_lca_sum[threshold][sum],
+                  source_calibration.cross_after_router_by_lca_sum[threshold][sum]);
+        }
+        for (std::size_t index = 0;
+             index < calibration.overlap_by_lca_sum.size(); ++index)
+            AddPhaseFmLmr(calibration.overlap_by_lca_sum[index],
+                          source_calibration.overlap_by_lca_sum[index]);
         for (std::size_t group = 0; group < kCombinedSignalGroups; ++group) {
             AddPhaseFmLmr(result.combined_signal[group], stats->combined_signal[group]);
             for (std::size_t bin = 0; bin < kConditionBins; ++bin) {
@@ -1618,6 +1986,54 @@ inline void Snapshot(ThreadStats& result) {
             }
             for (std::size_t bucket = 0; bucket < kBucketCount; ++bucket)
                 AddPhaseFmLmr(dst.by_bucket[bucket], src.by_bucket[bucket]);
+        }
+        for (std::size_t kind = 0; kind < kMainGateSignalCount; ++kind) {
+            auto& dst = result.main_gate_activity[kind];
+            const auto& src = stats->main_gate_activity[kind];
+            for (std::size_t bin = 0; bin < kMainGateActivityBins; ++bin) {
+                AddPhaseFmLmr(dst.all[bin], src.all[bin]);
+                AddPhaseFmLmr(dst.uncovered[bin], src.uncovered[bin]);
+                for (std::size_t group = 0; group < kConditionBins; ++group) {
+                    AddPhaseFmLmr(dst.by_depth[group][bin], src.by_depth[group][bin]);
+                    AddPhaseFmLmr(dst.by_move_count[group][bin], src.by_move_count[group][bin]);
+                    AddPhaseFmLmr(dst.by_static_eval[group][bin], src.by_static_eval[group][bin]);
+                }
+                for (std::size_t bucket = 0; bucket < kBucketCount; ++bucket)
+                    AddPhaseFmLmr(dst.by_bucket[bucket][bin], src.by_bucket[bucket][bin]);
+                for (std::size_t router = 0; router < kRouterMarginGroups; ++router)
+                    AddPhaseFmLmr(dst.by_router[router][bin], src.by_router[router][bin]);
+                for (std::size_t tail = 0; tail < 2; ++tail) {
+                    AddPhaseFmLmr(dst.by_lca_tail[tail][bin], src.by_lca_tail[tail][bin]);
+                    AddPhaseFmLmr(dst.by_cross_saturation[tail][bin],
+                                  src.by_cross_saturation[tail][bin]);
+                }
+            }
+            for (std::size_t index = 0; index < dst.joint.size(); ++index)
+                AddPhaseFmLmr(dst.joint[index], src.joint[index]);
+        }
+        for (std::size_t kind = 0; kind < kFmActivitySignalCount; ++kind) {
+            auto& dst = result.fm_activity[kind];
+            const auto& src = stats->fm_activity[kind];
+            for (std::size_t bin = 0; bin < kFmActivityBins; ++bin) {
+                AddPhaseFmLmr(dst.all[bin], src.all[bin]);
+                AddPhaseFmLmr(dst.uncovered[bin], src.uncovered[bin]);
+                for (std::size_t group = 0; group < kConditionBins; ++group) {
+                    AddPhaseFmLmr(dst.by_depth[group][bin], src.by_depth[group][bin]);
+                    AddPhaseFmLmr(dst.by_move_count[group][bin], src.by_move_count[group][bin]);
+                    AddPhaseFmLmr(dst.by_static_eval[group][bin], src.by_static_eval[group][bin]);
+                }
+                for (std::size_t bucket = 0; bucket < kBucketCount; ++bucket)
+                    AddPhaseFmLmr(dst.by_bucket[bucket][bin], src.by_bucket[bucket][bin]);
+                for (std::size_t router = 0; router < kRouterMarginGroups; ++router)
+                    AddPhaseFmLmr(dst.by_router[router][bin], src.by_router[router][bin]);
+                for (std::size_t tail = 0; tail < 2; ++tail) {
+                    AddPhaseFmLmr(dst.by_lca_tail[tail][bin], src.by_lca_tail[tail][bin]);
+                    AddPhaseFmLmr(dst.by_cross_saturation[tail][bin],
+                                  src.by_cross_saturation[tail][bin]);
+                }
+            }
+            for (std::size_t index = 0; index < dst.joint.size(); ++index)
+                AddPhaseFmLmr(dst.joint[index], src.joint[index]);
         }
         for (std::size_t bin = 0; bin < kSignalBins; ++bin) {
             auto& dst = result.futility_eligible[bin];
@@ -2734,6 +3150,191 @@ inline void Report(std::ostream& out) {
     print_cross_deployable_breakdown(
       "|staticEval|", magnitude_labels, &LcaThresholdCohortStats::by_static_eval);
 
+    static constexpr std::array<const char*, 2> cross_saturation_labels = {
+      "Cross max <127", "Cross max >=127"};
+    out << "[Main gate activity definition]\n"
+        << "  representation: integer Q64 sigmoid, observed/design range [0,63]\n"
+        << "  mean: exact gate sum / 32\n"
+        << "  saturated low: gate <=1\n"
+        << "  saturated high: gate >=63\n";
+    for (std::size_t kind = 0; kind < kMainGateSignalCount; ++kind) {
+        const auto& activity = stats.main_gate_activity[kind];
+        const auto print_values = [&](const char* title, const auto& values) {
+            out << '[' << title << "]\n";
+            for (std::size_t bin = 0; bin < kMainGateActivityBins; ++bin) {
+                const auto& value = values[bin];
+                if (!value.moves)
+                    continue;
+                out << "  " << MainGateActivityLabel(kind, bin)
+                    << " all-LMR=" << Percent(value.moves, stats.lca_lmr_moves) << '%';
+                PrintPhaseFmLmrValue(out, value);
+                out << '\n';
+            }
+        };
+        const auto print_conditioned = [&](const char* title, const auto& labels,
+                                            const auto& table) {
+            out << '[' << title << "]\n";
+            for (std::size_t group = 0; group < labels.size(); ++group) {
+                out << "  {" << labels[group] << "}\n";
+                for (std::size_t bin = 0; bin < kMainGateActivityBins; ++bin) {
+                    const auto& value = table[group][bin];
+                    if (!value.moves)
+                        continue;
+                    out << "    " << MainGateActivityLabel(kind, bin);
+                    PrintPhaseFmLmrValue(out, value);
+                    out << '\n';
+                }
+            }
+        };
+        const std::string signal_name = MainGateActivityName(kind);
+        print_values((signal_name + " LMR move outcomes").c_str(), activity.all);
+        print_conditioned((signal_name + " conditioned by depth").c_str(),
+                          depth_labels, activity.by_depth);
+        print_conditioned((signal_name + " conditioned by moveCount").c_str(),
+                          move_labels, activity.by_move_count);
+        print_conditioned((signal_name + " conditioned by selected bucket").c_str(),
+                          bucket_labels, activity.by_bucket);
+        print_conditioned((signal_name + " conditioned by |staticEval|").c_str(),
+                          magnitude_labels, activity.by_static_eval);
+        print_conditioned((signal_name + " conditioned by router margin").c_str(),
+                          router_group_labels, activity.by_router);
+        print_conditioned((signal_name + " conditioned by LCA high-tail").c_str(),
+                          lca_tail_labels, activity.by_lca_tail);
+        print_conditioned((signal_name + " conditioned by Cross saturation").c_str(),
+                          cross_saturation_labels, activity.by_cross_saturation);
+        print_values((signal_name + " additional coverage (Router/LCA/Cross actual +1=no)").c_str(),
+                     activity.uncovered);
+
+        std::array<double, kMainGateActivityBins> fh_delta{};
+        std::array<double, kMainGateActivityBins> research_delta{};
+        std::array<double, kMainGateActivityBins> cutoff_delta{};
+        std::array<std::size_t, kMainGateActivityBins> qualifying{};
+        for (std::size_t base = 0; base < kMainGateJointBaseStrata; ++base) {
+            PhaseFmLmrBucket total{};
+            for (std::size_t bin = 0; bin < kMainGateActivityBins; ++bin)
+                AddPhaseFmLmr(total,
+                  activity.joint[base * kMainGateActivityBins + bin]);
+            if (!total.moves)
+                continue;
+            const double total_fh = Percent(total.reduced_fail_highs, total.moves);
+            const double total_research = Percent(total.researches, total.moves);
+            const double total_cutoff = Percent(total.final_cutoffs, total.moves);
+            for (std::size_t bin = 0; bin < kMainGateActivityBins; ++bin) {
+                const auto& value = activity.joint[base * kMainGateActivityBins + bin];
+                if (value.moves < 20)
+                    continue;
+                ++qualifying[bin];
+                fh_delta[bin] += Percent(value.reduced_fail_highs, value.moves) - total_fh;
+                research_delta[bin] += Percent(value.researches, value.moves) - total_research;
+                cutoff_delta[bin] += Percent(value.final_cutoffs, value.moves) - total_cutoff;
+            }
+        }
+        out << '[' << signal_name << " jointly controlled LMR outcomes]\n"
+            << "  controls: depth x moveCount x bucket x |staticEval| x router-margin"
+               " x calibrated-LCA-tail x Cross-saturation\n"
+            << "  metric: macro mean within-stratum rate delta; cells require >=20 moves\n";
+        for (std::size_t bin = 0; bin < kMainGateActivityBins; ++bin) {
+            const double divisor = qualifying[bin] ? double(qualifying[bin]) : 1.0;
+            out << "  " << MainGateActivityLabel(kind, bin)
+                << " qualifying=" << qualifying[bin]
+                << " FH-delta=" << fh_delta[bin] / divisor << '%'
+                << " re-search-delta=" << research_delta[bin] / divisor << '%'
+                << " cutoff-delta=" << cutoff_delta[bin] / divisor << "%\n";
+        }
+    }
+
+    out << "[FM activity definition]\n"
+        << "  Diff output: uint8 [0,127], neutral=64, activity=abs(q-64)\n"
+        << "  Diff saturation: q<=1 or q>=126\n"
+        << "  Abs output: uint8 [0,127], activity=q\n"
+        << "  Abs saturation: q>=126\n"
+        << "  mean classification uses exact integer sum / 32\n";
+    for (std::size_t kind = 0; kind < kFmActivitySignalCount; ++kind) {
+        const auto& activity = stats.fm_activity[kind];
+        const auto print_values = [&](const char* title, const auto& values) {
+            out << '[' << title << "]\n";
+            for (std::size_t bin = 0; bin < kFmActivityBins; ++bin) {
+                const auto& value = values[bin];
+                if (!value.moves)
+                    continue;
+                out << "  " << FmActivityLabel(kind, bin)
+                    << " all-LMR=" << Percent(value.moves, stats.lca_lmr_moves) << '%';
+                PrintPhaseFmLmrValue(out, value);
+                out << '\n';
+            }
+        };
+        const auto print_conditioned = [&](const char* title, const auto& labels,
+                                            const auto& table) {
+            out << '[' << title << "]\n";
+            for (std::size_t group = 0; group < labels.size(); ++group) {
+                out << "  {" << labels[group] << "}\n";
+                for (std::size_t bin = 0; bin < kFmActivityBins; ++bin) {
+                    const auto& value = table[group][bin];
+                    if (!value.moves)
+                        continue;
+                    out << "    " << FmActivityLabel(kind, bin);
+                    PrintPhaseFmLmrValue(out, value);
+                    out << '\n';
+                }
+            }
+        };
+        const std::string signal_name = FmActivityName(kind);
+        print_values((signal_name + " LMR move outcomes").c_str(), activity.all);
+        print_conditioned((signal_name + " conditioned by depth").c_str(),
+                          depth_labels, activity.by_depth);
+        print_conditioned((signal_name + " conditioned by moveCount").c_str(),
+                          move_labels, activity.by_move_count);
+        print_conditioned((signal_name + " conditioned by selected bucket").c_str(),
+                          bucket_labels, activity.by_bucket);
+        print_conditioned((signal_name + " conditioned by |staticEval|").c_str(),
+                          magnitude_labels, activity.by_static_eval);
+        print_conditioned((signal_name + " conditioned by router margin").c_str(),
+                          router_group_labels, activity.by_router);
+        print_conditioned((signal_name + " conditioned by LCA high-tail").c_str(),
+                          lca_tail_labels, activity.by_lca_tail);
+        print_conditioned((signal_name + " conditioned by Cross saturation").c_str(),
+                          cross_saturation_labels, activity.by_cross_saturation);
+        print_values((signal_name +
+          " additional coverage (Router/LCA/Cross actual +1=no)").c_str(),
+          activity.uncovered);
+
+        std::array<double, kFmActivityBins> fh_delta{};
+        std::array<double, kFmActivityBins> research_delta{};
+        std::array<double, kFmActivityBins> cutoff_delta{};
+        std::array<std::size_t, kFmActivityBins> qualifying{};
+        for (std::size_t base = 0; base < kMainGateJointBaseStrata; ++base) {
+            PhaseFmLmrBucket total{};
+            for (std::size_t bin = 0; bin < kFmActivityBins; ++bin)
+                AddPhaseFmLmr(total, activity.joint[base * kFmActivityBins + bin]);
+            if (!total.moves)
+                continue;
+            const double total_fh = Percent(total.reduced_fail_highs, total.moves);
+            const double total_research = Percent(total.researches, total.moves);
+            const double total_cutoff = Percent(total.final_cutoffs, total.moves);
+            for (std::size_t bin = 0; bin < kFmActivityBins; ++bin) {
+                const auto& value = activity.joint[base * kFmActivityBins + bin];
+                if (value.moves < 20)
+                    continue;
+                ++qualifying[bin];
+                fh_delta[bin] += Percent(value.reduced_fail_highs, value.moves) - total_fh;
+                research_delta[bin] += Percent(value.researches, value.moves) - total_research;
+                cutoff_delta[bin] += Percent(value.final_cutoffs, value.moves) - total_cutoff;
+            }
+        }
+        out << '[' << signal_name << " jointly controlled LMR outcomes]\n"
+            << "  controls: depth x moveCount x bucket x |staticEval| x router-margin"
+               " x calibrated-LCA-tail x Cross-saturation\n"
+            << "  metric: macro mean within-stratum rate delta; cells require >=20 moves\n";
+        for (std::size_t bin = 0; bin < kFmActivityBins; ++bin) {
+            const double divisor = qualifying[bin] ? double(qualifying[bin]) : 1.0;
+            out << "  " << FmActivityLabel(kind, bin)
+                << " qualifying=" << qualifying[bin]
+                << " FH-delta=" << fh_delta[bin] / divisor << '%'
+                << " re-search-delta=" << research_delta[bin] / divisor << '%'
+                << " cutoff-delta=" << cutoff_delta[bin] / divisor << "%\n";
+        }
+    }
+
 #if defined(ENABLE_NNUE_LCA_LMR_EXPERIMENT)
     const auto& lca_experiment = stats.lca_lmr_experiment;
     out << "[LCA top-tail explicit +1-ply experiment]\n"
@@ -3002,6 +3603,319 @@ inline void Report(std::ostream& out) {
     }
     out << "  note: searched nodes, NPS, and completed depth are reported by the normal bench output.\n";
 #endif
+}
+
+struct CalibrationLcaTail {
+    std::uint32_t basis_points = 0;
+    std::size_t threshold_sum = 0;
+    PhaseFmLmrBucket outcome{};
+};
+
+inline std::array<CalibrationLcaTail, 3> BuildCalibrationLcaTails(
+  const ThreadStats& stats) {
+    static constexpr std::array<std::uint32_t, 3> basis_points = {100, 250, 500};
+    std::array<CalibrationLcaTail, 3> result{};
+    for (std::size_t index = 0; index < result.size(); ++index) {
+        auto& tail = result[index];
+        tail.basis_points = basis_points[index];
+        const auto target =
+          (stats.signal_calibration.lca_calibration_eligible_moves
+             * tail.basis_points + 9999) / 10000;
+        tail.threshold_sum = kLcaDeltaSumMax;
+        if (!target)
+            continue;
+        for (std::size_t sum = kLcaDeltaSumMax + 1; sum-- > 0;) {
+            AddPhaseFmLmr(tail.outcome,
+              stats.signal_calibration.lca_eligible_by_delta_sum[sum]);
+            tail.threshold_sum = sum;
+            if (tail.outcome.moves >= target)
+                break;
+        }
+    }
+    return result;
+}
+
+inline std::size_t CalibrationLcaQuantile(const ThreadStats& stats,
+                                          const std::uint32_t basis_points) {
+    if (!stats.signal_calibration.lca_calibration_eligible_moves)
+        return 0;
+    const auto target =
+      std::max<std::uint64_t>(1,
+        (stats.signal_calibration.lca_calibration_eligible_moves
+           * basis_points + 9999) / 10000);
+    std::uint64_t cumulative = 0;
+    for (std::size_t sum = 0; sum <= kLcaDeltaSumMax; ++sum) {
+        cumulative += stats.signal_calibration.lca_eligible_by_delta_sum[sum].moves;
+        if (cumulative >= target)
+            return sum;
+    }
+    return kLcaDeltaSumMax;
+}
+
+inline std::array<PhaseFmLmrBucket, kCalibrationCrossThresholdCount>
+BuildCalibrationCrossEligible(const ThreadStats& stats,
+                              const std::size_t lca_top1_sum) {
+    std::array<PhaseFmLmrBucket, kCalibrationCrossThresholdCount> result{};
+    for (std::size_t threshold = 0;
+         threshold < kCalibrationCrossThresholdCount; ++threshold)
+        for (std::size_t sum = 0; sum < lca_top1_sum; ++sum)
+            AddPhaseFmLmr(result[threshold],
+              stats.signal_calibration.cross_after_router_by_lca_sum[threshold][sum]);
+    return result;
+}
+
+inline PhaseFmLmrBucket BuildCalibrationCrossEligiblePopulation(
+  const ThreadStats& stats, const std::size_t lca_top1_sum) {
+    PhaseFmLmrBucket result{};
+    for (std::size_t sum = 0; sum < lca_top1_sum; ++sum)
+        AddPhaseFmLmr(result,
+          stats.signal_calibration.cross_after_router_all_by_lca_sum[sum]);
+    return result;
+}
+
+inline std::array<PhaseFmLmrBucket, 8> BuildCalibrationOverlap(
+  const ThreadStats& stats, const std::size_t lca_top1_sum) {
+    std::array<PhaseFmLmrBucket, 8> result{};
+    for (std::size_t sum = 0; sum <= kLcaDeltaSumMax; ++sum)
+        for (std::size_t flags = 0; flags < 4; ++flags) {
+            const bool router = (flags & 1U) != 0;
+            const bool cross = (flags & 2U) != 0;
+            const bool lca = sum >= lca_top1_sum;
+            const auto mask = (router ? 1U : 0U) | (lca ? 2U : 0U)
+                            | (cross ? 4U : 0U);
+            AddPhaseFmLmr(result[mask],
+              stats.signal_calibration.overlap_by_lca_sum[sum * 4 + flags]);
+        }
+    return result;
+}
+
+inline void PrintCalibrationRow(std::ostream& out, const char* label,
+                                const PhaseFmLmrBucket& value,
+                                const std::uint64_t population) {
+    out << "  " << std::left << std::setw(22) << label << std::right
+        << " count=" << std::setw(10) << value.moves
+        << " target=" << std::fixed << std::setprecision(3)
+        << std::setw(8) << Percent(value.moves, population) << '%'
+        << " re-search=" << std::setw(8) << Percent(value.researches, value.moves) << '%'
+        << " fail-high=" << std::setw(8)
+        << Percent(value.reduced_fail_highs, value.moves) << '%'
+        << " cutoff=" << std::setw(8) << Percent(value.final_cutoffs, value.moves) << "%\n";
+}
+
+inline void CalibrationReport(std::ostream& out) {
+    const auto stats_storage = std::make_unique<ThreadStats>();
+    Snapshot(*stats_storage);
+    const auto& stats = *stats_storage;
+    const auto& calibration = stats.signal_calibration;
+    const auto lca_tails = BuildCalibrationLcaTails(stats);
+    const auto overlap = BuildCalibrationOverlap(stats, lca_tails[0].threshold_sum);
+    const auto cross_eligible =
+      BuildCalibrationCrossEligible(stats, lca_tails[0].threshold_sum);
+    const auto cross_eligible_population =
+      BuildCalibrationCrossEligiblePopulation(stats, lca_tails[0].threshold_sum);
+
+    out << "[NNUE signal calibration]\n"
+        << "  scope: completed signal-valid LMR moves; search behavior is unchanged\n"
+        << "  signal-valid LMR moves: " << calibration.signal_valid_lmr_moves << "\n"
+        << "  Router population: non-PV, depth 3..8, moveCount 2..8\n"
+        << "  LCA population: moves not actually deepened by Router-LMR\n"
+        << "  Cross eligible population: depth 3..8, moveCount 2..8, not actually deepened by Router/LCA\n";
+
+    out << "[Router margin distribution]\n";
+    for (std::size_t bin = 0; bin < kCalibrationRouterBins; ++bin)
+        PrintCalibrationRow(out, CalibrationRouterBinLabel(bin),
+                            calibration.router_distribution[bin],
+                            calibration.signal_valid_lmr_moves);
+    out << "[Router threshold cohorts]\n";
+    for (std::size_t index = 0; index < kCalibrationRouterThresholdCount; ++index) {
+        const auto label = std::string("margin <= ")
+                         + std::to_string(kCalibrationRouterThresholds[index]);
+        PrintCalibrationRow(out, label.c_str(), calibration.router_cohorts[index],
+                            calibration.router_structural_moves);
+    }
+
+    static constexpr std::array<std::uint32_t, 9> quantiles = {
+      1, 1000, 2500, 5000, 7500, 9000, 9500, 9900, 10000};
+    static constexpr std::array<const char*, 9> quantile_labels = {
+      "min", "p10", "p25", "p50", "p75", "p90", "p95", "p99", "max"};
+    out << "[LCA abs-delta-sum distribution]\n";
+    for (std::size_t index = 0; index < quantiles.size(); ++index) {
+        const auto sum = CalibrationLcaQuantile(stats, quantiles[index]);
+        out << "  " << std::left << std::setw(5) << quantile_labels[index] << std::right
+            << " sum=" << std::setw(4) << sum << " mean="
+            << std::fixed << std::setprecision(5) << (double(sum) / 32.0) << '\n';
+    }
+    out << "[LCA model-relative high tails]\n"
+        << "  tie policy: include all moves equal to the integer cutoff\n";
+    for (const auto& tail : lca_tails) {
+        const auto label = std::string("top ")
+          + std::to_string(double(tail.basis_points) / 100.0) + "%";
+        out << "  cutoff: " << label << " sum >= " << tail.threshold_sum
+            << " (mean >= " << std::fixed << std::setprecision(5)
+            << (double(tail.threshold_sum) / 32.0) << ")\n";
+        PrintCalibrationRow(out, label.c_str(), tail.outcome,
+                            calibration.lca_calibration_eligible_moves);
+    }
+
+    out << "[Cross max activity thresholds: all signal-valid LMR]\n";
+    for (std::size_t index = 0; index < kCalibrationCrossThresholdCount; ++index) {
+        const auto label = std::string("max_cross >= ")
+                         + std::to_string(kCalibrationCrossThresholds[index]);
+        PrintCalibrationRow(out, label.c_str(), calibration.cross_all_cohorts[index],
+                            calibration.signal_valid_lmr_moves);
+    }
+    out << "[Cross max activity thresholds: production-eligible]\n";
+    for (std::size_t index = 0; index < kCalibrationCrossThresholdCount; ++index) {
+        const auto label = std::string("max_cross >= ")
+                         + std::to_string(kCalibrationCrossThresholds[index]);
+        PrintCalibrationRow(out, label.c_str(), cross_eligible[index],
+                            cross_eligible_population.moves);
+    }
+
+    out << "[Production candidate/application coverage]\n"
+        << "  Router actual +1 ply : " << calibration.router_actual_adjusted_moves
+        << " / " << calibration.signal_valid_lmr_moves << " ("
+        << Percent(calibration.router_actual_adjusted_moves,
+                   calibration.signal_valid_lmr_moves) << "%)\n"
+        << "  LCA calibrated top1 candidate: " << lca_tails[0].outcome.moves
+        << " / " << calibration.signal_valid_lmr_moves << " ("
+        << Percent(lca_tails[0].outcome.moves,
+                   calibration.signal_valid_lmr_moves) << "%)\n"
+        << "  Cross calibrated >=127 candidate: "
+        << cross_eligible[kCalibrationCrossThresholdCount - 1].moves
+        << " / " << calibration.signal_valid_lmr_moves << " ("
+        << Percent(cross_eligible[kCalibrationCrossThresholdCount - 1].moves,
+                   calibration.signal_valid_lmr_moves) << "%)\n"
+        << "  note: LCA/Cross rates above are calibrated counterfactual candidates;"
+           " no LMR decision is changed.\n";
+
+    static constexpr std::array<const char*, 8> overlap_labels = {
+      "none", "Router-only", "LCA-only", "Router+LCA",
+      "Cross-only", "Router+Cross", "LCA+Cross", "Router+LCA+Cross"};
+    out << "[Calibrated signal overlap]\n"
+        << "  Router=production danger predicate; LCA=run-specific top1%; Cross=max>=127 with production depth/moveCount\n";
+    PhaseFmLmrBucket any_overlap{};
+    for (std::size_t mask = 0; mask < overlap.size(); ++mask) {
+        PrintCalibrationRow(out, overlap_labels[mask], overlap[mask],
+                            calibration.signal_valid_lmr_moves);
+        if (mask == 3 || mask == 5 || mask == 6 || mask == 7)
+            AddPhaseFmLmr(any_overlap, overlap[mask]);
+    }
+    PrintCalibrationRow(out, "any overlap", any_overlap,
+                        calibration.signal_valid_lmr_moves);
+}
+
+inline void WriteCalibrationOutcomeJson(std::ostream& out,
+                                        const PhaseFmLmrBucket& value,
+                                        const std::uint64_t population) {
+    out << "{\"count\":" << value.moves
+        << ",\"target_rate_percent\":" << Percent(value.moves, population)
+        << ",\"research_rate_percent\":" << Percent(value.researches, value.moves)
+        << ",\"fail_high_rate_percent\":"
+        << Percent(value.reduced_fail_highs, value.moves)
+        << ",\"cutoff_rate_percent\":" << Percent(value.final_cutoffs, value.moves)
+        << '}';
+}
+
+inline void CalibrationReportJson(std::ostream& out) {
+    const auto stats_storage = std::make_unique<ThreadStats>();
+    Snapshot(*stats_storage);
+    const auto& stats = *stats_storage;
+    const auto& calibration = stats.signal_calibration;
+    const auto lca_tails = BuildCalibrationLcaTails(stats);
+    const auto overlap = BuildCalibrationOverlap(stats, lca_tails[0].threshold_sum);
+    const auto cross_eligible =
+      BuildCalibrationCrossEligible(stats, lca_tails[0].threshold_sum);
+    const auto cross_eligible_population =
+      BuildCalibrationCrossEligiblePopulation(stats, lca_tails[0].threshold_sum);
+    out << std::fixed << std::setprecision(6)
+        << "{\n  \"schema_version\":1,\n  \"population\":{"
+        << "\"signal_valid_lmr\":" << calibration.signal_valid_lmr_moves
+        << ",\"router_structural\":" << calibration.router_structural_moves
+        << ",\"lca_non_router\":" << calibration.lca_calibration_eligible_moves
+        << ",\"cross_eligible\":" << cross_eligible_population.moves
+        << "},\n  \"router\":{\n    \"distribution\":[";
+    for (std::size_t bin = 0; bin < kCalibrationRouterBins; ++bin) {
+        if (bin) out << ',';
+        out << "{\"range\":\"" << CalibrationRouterBinLabel(bin) << "\",\"outcome\":";
+        WriteCalibrationOutcomeJson(out, calibration.router_distribution[bin],
+                                    calibration.signal_valid_lmr_moves);
+        out << '}';
+    }
+    out << "],\n    \"cohorts\":[";
+    for (std::size_t index = 0; index < kCalibrationRouterThresholdCount; ++index) {
+        if (index) out << ',';
+        out << "{\"threshold\":" << kCalibrationRouterThresholds[index]
+            << ",\"outcome\":";
+        WriteCalibrationOutcomeJson(out, calibration.router_cohorts[index],
+                                    calibration.router_structural_moves);
+        out << '}';
+    }
+    out << "]\n  },\n  \"lca\":{\n    \"quantiles\":{";
+    static constexpr std::array<std::uint32_t, 9> quantiles = {
+      1, 1000, 2500, 5000, 7500, 9000, 9500, 9900, 10000};
+    static constexpr std::array<const char*, 9> quantile_labels = {
+      "min", "p10", "p25", "p50", "p75", "p90", "p95", "p99", "max"};
+    for (std::size_t index = 0; index < quantiles.size(); ++index) {
+        if (index) out << ',';
+        out << '\"' << quantile_labels[index] << "\":"
+            << CalibrationLcaQuantile(stats, quantiles[index]);
+    }
+    out << "},\n    \"tails\":[";
+    for (std::size_t index = 0; index < lca_tails.size(); ++index) {
+        if (index) out << ',';
+        const auto& tail = lca_tails[index];
+        out << "{\"top_percent\":" << (double(tail.basis_points) / 100.0)
+            << ",\"threshold_sum\":" << tail.threshold_sum
+            << ",\"threshold_mean\":" << (double(tail.threshold_sum) / 32.0)
+            << ",\"outcome\":";
+        WriteCalibrationOutcomeJson(out, tail.outcome,
+                                    calibration.lca_calibration_eligible_moves);
+        out << '}';
+    }
+    out << "]\n  },\n  \"cross\":{\n    \"all\":[";
+    for (std::size_t index = 0; index < kCalibrationCrossThresholdCount; ++index) {
+        if (index) out << ',';
+        out << "{\"threshold\":" << unsigned(kCalibrationCrossThresholds[index])
+            << ",\"outcome\":";
+        WriteCalibrationOutcomeJson(out, calibration.cross_all_cohorts[index],
+                                    calibration.signal_valid_lmr_moves);
+        out << '}';
+    }
+    out << "],\n    \"eligible\":[";
+    for (std::size_t index = 0; index < kCalibrationCrossThresholdCount; ++index) {
+        if (index) out << ',';
+        out << "{\"threshold\":" << unsigned(kCalibrationCrossThresholds[index])
+            << ",\"outcome\":";
+        WriteCalibrationOutcomeJson(out, cross_eligible[index],
+                                    cross_eligible_population.moves);
+        out << '}';
+    }
+    out << "]\n  },\n  \"deployment\":{"
+        << "\"router_actual_plus_one\":" << calibration.router_actual_adjusted_moves
+        << ",\"router_actual_plus_one_rate_percent\":"
+        << Percent(calibration.router_actual_adjusted_moves,
+                   calibration.signal_valid_lmr_moves)
+        << ",\"lca_calibrated_top1_candidate\":" << lca_tails[0].outcome.moves
+        << ",\"lca_calibrated_top1_candidate_rate_percent\":"
+        << Percent(lca_tails[0].outcome.moves, calibration.signal_valid_lmr_moves)
+        << ",\"cross_calibrated_127_candidate\":"
+        << cross_eligible[kCalibrationCrossThresholdCount - 1].moves
+        << ",\"cross_calibrated_127_candidate_rate_percent\":"
+        << Percent(cross_eligible[kCalibrationCrossThresholdCount - 1].moves,
+                   calibration.signal_valid_lmr_moves)
+        << "},\n  \"overlap\":[";
+    static constexpr std::array<const char*, 8> overlap_labels = {
+      "none", "Router-only", "LCA-only", "Router+LCA",
+      "Cross-only", "Router+Cross", "LCA+Cross", "Router+LCA+Cross"};
+    for (std::size_t mask = 0; mask < overlap.size(); ++mask) {
+        if (mask) out << ',';
+        out << "{\"group\":\"" << overlap_labels[mask] << "\",\"outcome\":";
+        WriteCalibrationOutcomeJson(out, overlap[mask],
+                                    calibration.signal_valid_lmr_moves);
+        out << '}';
+    }
+    out << "]\n}\n";
 }
 
 }  // namespace YaneuraOu::Search::NnueSignalLog

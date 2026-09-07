@@ -597,6 +597,54 @@ constexpr std::uint64_t kNnueBenchWarmupGames = 8;
 constexpr std::uint64_t kNnueBenchMeasuredGames = 64;
 constexpr int kNnueBenchMaxPly = 128;
 
+void ExportNnueCalibrationCorpus(std::istream& stream) {
+  std::string output_file;
+  std::size_t position_count = 64;
+  stream >> std::quoted(output_file) >> position_count;
+  if (output_file.empty() || position_count == 0) {
+    std::cout << "usage: test nnue export_calibration_corpus \"file\" [count]"
+              << std::endl;
+    return;
+  }
+
+  std::ofstream output(output_file);
+  if (!output) {
+    std::cout << "failed to open calibration corpus: " << output_file << std::endl;
+    return;
+  }
+
+  PRNG prng(kNnueBenchSeed);
+  std::set<std::string> unique_positions;
+  std::size_t attempts = 0;
+  while (unique_positions.size() < position_count && attempts < position_count * 16) {
+    Position position;
+    StateInfo root;
+    std::vector<StateInfo> states(kNnueBenchMaxPly);
+    position.set_hirate(&root);
+    const int target_ply = 8 + 16 * static_cast<int>(attempts % 8);
+    for (int ply = 0; ply < target_ply; ++ply) {
+      MoveList<LEGAL_ALL> moves(position);
+      if (moves.size() == 0)
+        break;
+      position.do_move(moves.begin()[prng.rand(moves.size())], states[ply]);
+    }
+    if (MoveList<LEGAL_ALL>(position).size() != 0)
+      unique_positions.insert(position.sfen());
+    ++attempts;
+  }
+
+  if (unique_positions.size() != position_count) {
+    std::cout << "failed to generate requested calibration positions: "
+              << unique_positions.size() << " / " << position_count << std::endl;
+    return;
+  }
+  for (const auto& sfen : unique_positions)
+    output << sfen << '\n';
+  std::cout << "NNUE calibration corpus written: " << output_file
+            << " (" << unique_positions.size() << " positions, seed="
+            << kNnueBenchSeed << ')' << std::endl;
+}
+
 using NnueBenchClock = std::chrono::steady_clock;
 
 struct NnueBenchTiming {
@@ -7427,8 +7475,33 @@ void TestCommand(IEngine& engine, std::istream& stream) {
         std::cout << "NNUE search signal report written: " << output_file << std::endl;
       }
     }
+  } else if (sub_command == "signal_calibration_report") {
+    std::string text_file;
+    std::string json_file;
+    stream >> std::quoted(text_file) >> std::quoted(json_file);
+    Search::NnueSignalLog::CalibrationReport(std::cout);
+    if (!text_file.empty()) {
+      std::ofstream output(text_file);
+      if (!output)
+        std::cout << "Failed to open calibration report: " << text_file << std::endl;
+      else {
+        Search::NnueSignalLog::CalibrationReport(output);
+        std::cout << "NNUE signal calibration report written: " << text_file << std::endl;
+      }
+    }
+    if (!json_file.empty()) {
+      std::ofstream output(json_file);
+      if (!output)
+        std::cout << "Failed to open calibration JSON: " << json_file << std::endl;
+      else {
+        Search::NnueSignalLog::CalibrationReportJson(output);
+        std::cout << "NNUE signal calibration JSON written: " << json_file << std::endl;
+      }
+    }
 #endif
 #if defined(ENABLE_NNUE_BENCH)
+  } else if (sub_command == "export_calibration_corpus") {
+    ExportNnueCalibrationCorpus(stream);
   } else if (sub_command == "bench_ft") {
     std::uint64_t repeat_count;
     if (ReadNnueBenchRepeatCount(stream, repeat_count))
@@ -7523,6 +7596,7 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << " test nnue signal_log_report [output file]" << std::endl;
 #endif
 #if defined(ENABLE_NNUE_BENCH)
+    std::cout << " test nnue export_calibration_corpus \"file\" [count]" << std::endl;
     std::cout << " test nnue bench_ft [repeats]" << std::endl;
 #if defined(USE_FINNY_TABLES)
     std::cout << " test nnue bench_finny_compare [repeats]" << std::endl;
