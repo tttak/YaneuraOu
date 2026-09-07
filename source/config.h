@@ -420,11 +420,10 @@
 	#endif
 #endif
 
-// SFNNwoP1536の通常buildでは、295/epoch20で校正したLCA top-1% signalも
+// SFNNwoP1536の通常buildでは、LCA top-1% signalも
 // Router-LMRと重複しないmoveへ使用する。診断logger側は専用experiment実装を
 // 使用するため、loggerなしのproduction相当buildだけを既定ONにする。
-// 別networkではtop-1%境界が異なるので、比較・再校正時は
-// DISABLE_NNUE_LCA_LMRを定義して無効化する。
+// 境界値は評価関数ごとにNnueLcaLmrThreshold USI optionで設定する。
 #if defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536) \
 	&& !defined(ENABLE_NNUE_SIGNAL_LOG) \
 	&& !defined(DISABLE_NNUE_LCA_LMR)
@@ -434,9 +433,6 @@
 #if defined(USE_NNUE_LCA_LMR)
 	#if !defined(USE_NNUE_ROUTER_LMR)
 		#error "USE_NNUE_LCA_LMR requires USE_NNUE_ROUTER_LMR"
-	#endif
-	#ifndef NNUE_LCA_LMR_SUM_THRESHOLD
-		#define NNUE_LCA_LMR_SUM_THRESHOLD 1897
 	#endif
 #endif
 

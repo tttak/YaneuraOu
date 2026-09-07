@@ -28,6 +28,9 @@ struct SearchOptions
         outout_fail_lh_pv        = true;
         generate_all_legal_moves = false;
         enteringKingRule         = EKR_27_POINT;
+#if defined(USE_NNUE_LCA_LMR)
+        nnue_lca_lmr_threshold   = 1959;
+#endif
         lastPvInfoTime           = 0;
         computed_pv_interval     = 0;
     }
@@ -60,6 +63,12 @@ struct SearchOptions
     // 入玉ルール設定
 	// 📝 options["EnteringKingRule"]の値。
     EnteringKingRule enteringKingRule;
+
+#if defined(USE_NNUE_LCA_LMR)
+    // LCA absolute-delta sum threshold calibrated for the loaded NNUE.
+    // Default: 295/epoch20 fixed-corpus top-1% threshold.
+    int nnue_lca_lmr_threshold;
+#endif
 
 	// 📌 ここ以降は、SearchManagerで用いるメンバ変数 📌
 

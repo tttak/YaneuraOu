@@ -156,6 +156,13 @@ void SearchOptions::add_options(OptionsMap& options) {
                     enteringKingRule = to_entering_king_rule(o);
                     return std::nullopt;
                 }));
+
+#if defined(USE_NNUE_LCA_LMR)
+    options.add("NnueLcaLmrThreshold", Option(1959, 0, 4064, [&](const Option& o) {
+                    nnue_lca_lmr_threshold = int(o);
+                    return std::nullopt;
+                }));
+#endif
 }
 
 
@@ -3879,12 +3886,13 @@ moves_loop:  // When in check, search starts here
 #endif
 
 #if defined(USE_NNUE_LCA_LMR) && !defined(ENABLE_NNUE_SIGNAL_LOG)
-            // 295/epoch20 calibration: top-1% mean delta 59.28125 is the
-            // exact byte-domain sum 1897 over 32 Diff channels.  Router moves
-            // already deepened by one ply are excluded.  Requiring d < newDepth
-            // ensures that a zero reduction can never become an extension.
+            // The default is the 295/epoch20 fixed-corpus top-1% exact
+            // byte-domain sum (1959 over 32 Diff channels). Router moves already
+            // deepened by one ply are excluded. Requiring d < newDepth ensures
+            // that a zero reduction can never become an extension.
             if (!nnueRouterLmrActuallyAdjusted && nnueRouterLmrSignal.valid
-                && nnueRouterLmrSignal.lca_abs_delta_sum >= NNUE_LCA_LMR_SUM_THRESHOLD
+                && nnueRouterLmrSignal.lca_abs_delta_sum
+                     >= search_options.nnue_lca_lmr_threshold
                 && d < newDepth) {
                 ++d;
 #if defined(USE_NNUE_CROSS_LMR)
