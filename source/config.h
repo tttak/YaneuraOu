@@ -380,6 +380,7 @@
 // #define ENABLE_NNUE_CROSS_LMR_EXPERIMENT // Cross maxによるLMR +1 plyの診断A/B
 // #define USE_NNUE_PHASE_FM_LMR   // Router非対象の高評価・低FM relianceを明示的に+1 ply
 // #define USE_NNUE_PHASE_L2_FIXED_C32 // C32 Q15 nearest Phase + Q23 integer L2候補
+#define USE_NNUE_ABS_SQR_REMOVED_160 // FM AbsSqrをL2から除いた160-input architecture
 // #define DISABLE_NNUE_LCA_LMR    // 295/epoch20用LCA top-1% LMRを比較時に無効化
 // #define DISABLE_NNUE_CROSS_LMR  // Cross high-tail LMRを比較時に無効化
 //

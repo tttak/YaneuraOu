@@ -2550,6 +2550,12 @@ std::vector<NetworkStageBenchCase> MakeNnueNetworkStageBenchCorpus() {
         reinterpret_cast<char*>(&network_buffer));
     sample.final_output = output[0];
     sample.intermediate = network_buffer;
+#if defined(USE_NNUE_ABS_SQR_REMOVED_160)
+    // AbsSqr is not a production intermediate in the compact architecture.
+    // Materialize it only for the retained diagnostic stage/checksum.
+    selected_network.BenchmarkAbsSquared(
+        sample.intermediate.abs_ac_out, sample.intermediate.abs_sqr_out);
+#endif
 
     sample.phase_scales = selected_network.BenchmarkPhaseScalesFromOutput(
         sample.intermediate.phase_out);
@@ -2681,7 +2687,7 @@ void ComputeNnueNetworkStageValidationChecksums(
     MixNnueBenchRange(captured_checksums[25], sample.intermediate.cross_feat,
                       32);
     MixNnueBenchRange(captured_checksums[26], sample.intermediate.l2_input,
-                      190);
+                      L2_REAL_SIZE);
     MixNnueBenchRange(captured_checksums[27], sample.intermediate.fc_1_out,
                       kHidden2Dims);
     MixNnueBenchRange(captured_checksums[28], sample.intermediate.ac_1_out,
@@ -2918,12 +2924,13 @@ void ComputeNnueNetworkStageValidationChecksums(
         sample.intermediate.ac_0_out, sample.intermediate.diff_ac_out,
         sample.intermediate.abs_ac_out, sample.intermediate.abs_sqr_out,
         sample.intermediate.cross_feat, sample.phase_scales, work.l2_input);
-    MixNnueBenchRange(recomputed_checksums[26], work.l2_input, 190);
+    MixNnueBenchRange(recomputed_checksums[26], work.l2_input, L2_REAL_SIZE);
     CompareNnueNetworkStageRange(
-        sample.intermediate.l2_input, work.l2_input, 190, sample_index,
+        sample.intermediate.l2_input, work.l2_input, L2_REAL_SIZE, sample_index,
         mismatches[26]);
     CompareNnueNetworkStageRange(
-        sample.intermediate.l2_input + 190, work.l2_input + 190, 2,
+        sample.intermediate.l2_input + L2_REAL_SIZE,
+        work.l2_input + L2_REAL_SIZE, 2,
         sample_index, l2_padding_mismatch);
 
     selected_network.BenchmarkFc1(
@@ -3912,7 +3919,7 @@ NnueBenchTiming MeasurePhaseL2FixedCorpus(
             sample.intermediate.cross_feat, q23, work.l2_input);
       }
       KeepNnueBenchObject(work.l2_input);
-      representative = work.l2_input[timing.calls % 192];
+      representative = work.l2_input[timing.calls % L2_INPUT_SIZE];
     } else if constexpr (Operation == PhaseL2FixedOperation::CombinedPhaseL2) {
       Network::BenchmarkPhaseScales float_scales{};
       std::int32_t q23[6]{};
@@ -3922,7 +3929,7 @@ NnueBenchTiming MeasurePhaseL2FixedCorpus(
           selected_network, sample.intermediate, float_scales, q23,
           work.l2_input);
       KeepNnueBenchObject(work.l2_input);
-      representative = work.l2_input[timing.calls % 192];
+      representative = work.l2_input[timing.calls % L2_INPUT_SIZE];
     } else {
       const std::int32_t output =
           ComputeNnueNetworkPhaseL2Candidate<Candidate>(sample, work);
@@ -4896,8 +4903,10 @@ void TestNetworkStagesBenchmark(const std::uint64_t repeat_count) {
           << "        separate LCA diagnostics below and do not fail this stage."
           << std::endl;
     if (stage == 26) {
-      std::cout << "  L2 real range         : [0, 190)" << std::endl
-                << "  L2 padding range      : [190, 192)" << std::endl
+      std::cout << "  L2 real range         : [0, " << L2_REAL_SIZE << ")"
+                << std::endl
+                << "  L2 padding range      : [" << L2_REAL_SIZE << ", "
+                << L2_INPUT_SIZE << ")" << std::endl
                 << "  L2 padding match      : "
                 << (l2_padding_mismatch.count == 0 ? "yes" : "NO")
                 << std::endl;
@@ -7466,7 +7475,7 @@ constexpr std::size_t kTraceLcaQueryInputDimensions = 31;
 constexpr std::size_t kTraceLcaFmInputDimensions = 64;
 constexpr std::size_t kTracePhaseDimensions = 6;
 constexpr std::size_t kTraceCrossInputDimensions = 16;
-constexpr std::size_t kTraceBucketInputDimensions = 192;
+constexpr std::size_t kTraceBucketInputDimensions = L2_INPUT_SIZE;
 constexpr std::size_t kTraceBucketHiddenDimensions = 96;
 
 static_assert(FeatureTransformer::kOutputDimensions ==
@@ -8000,14 +8009,16 @@ bool MakeNnueTraceSnapshot(const std::string& sfen,
     lca_buffer.l2_input[94 + index] = static_cast<std::uint8_t>(
         std::clamp<int>(lca_buffer.abs_ac_out[index] * channel_scales[3],
                         0, 127));
+#if !defined(USE_NNUE_ABS_SQR_REMOVED_160)
     lca_buffer.l2_input[126 + index] = static_cast<std::uint8_t>(
         std::clamp<int>(lca_buffer.abs_sqr_out[index] * channel_scales[4],
                         0, 127));
-    lca_buffer.l2_input[158 + index] = static_cast<std::uint8_t>(
+#endif
+    lca_buffer.l2_input[L2_CROSS_OFFSET + index] = static_cast<std::uint8_t>(
         std::clamp<int>(lca_buffer.cross_feat[index] * channel_scales[5],
                         0, 127));
   }
-  std::memset(lca_buffer.l2_input + 190, 0, 2);
+  std::memset(lca_buffer.l2_input + L2_REAL_SIZE, 0, 2);
   std::copy_n(lca_buffer.l2_input, kTraceBucketInputDimensions,
               deep_path.fc1_input.begin());
 

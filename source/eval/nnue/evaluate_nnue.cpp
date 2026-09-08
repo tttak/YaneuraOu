@@ -348,9 +348,22 @@ namespace {
     	Tools::Result ReadParameters(std::istream& stream) {
     		std::uint32_t hash_value;
     		std::string architecture;
-    		Tools::Result result = ReadHeader(stream, &hash_value, &architecture, nullptr);
-    		if (result.is_not_ok()) return result;
-    		if (hash_value != kHashValue) {
+		Tools::Result result = ReadHeader(stream, &hash_value, &architecture, nullptr);
+		if (result.is_not_ok()) return result;
+#if defined(USE_NNUE_ABS_SQR_REMOVED_160)
+		if (architecture.find("-L2x160-NoAbsSqr") == std::string::npos) {
+			sync_cout << "info string NNUE architecture mismatch: this binary requires L2x160-NoAbsSqr, got "
+				<< architecture << sync_endl;
+			return Tools::ResultCode::FileMismatch;
+		}
+#else
+		if (architecture.find("-L2x160-NoAbsSqr") != std::string::npos) {
+			sync_cout << "info string NNUE architecture mismatch: the file requires an L2x160-NoAbsSqr binary"
+				<< sync_endl;
+			return Tools::ResultCode::FileMismatch;
+		}
+#endif
+		if (hash_value != kHashValue) {
     			// hash check廃止: 警告のみ出力して続行する
     			sync_cout << "info string Warning: NNUE hash mismatch: expected " << kHashValue
     				<< " got " << hash_value

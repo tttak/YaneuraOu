@@ -36,7 +36,15 @@ constexpr int LayerStacks = 12;
 // 各層の次元数
 constexpr IndexType kInputDims = kTransformedFeatureDimensions;
 constexpr IndexType kHidden1Dims = 31;
+#if defined(USE_NNUE_ABS_SQR_REMOVED_160)
+constexpr IndexType L2_INPUT_SIZE = 160;
+constexpr IndexType L2_REAL_SIZE = 158;
+constexpr IndexType L2_CROSS_OFFSET = 126;
+#else
 constexpr IndexType L2_INPUT_SIZE = 192;
+constexpr IndexType L2_REAL_SIZE = 190;
+constexpr IndexType L2_CROSS_OFFSET = 158;
+#endif
 constexpr IndexType kHidden2Dims = 96;
 
 // --- [追加] Router 層の型定義 ---
@@ -87,11 +95,21 @@ struct Network {
 
 	// Hash値などは適宜実装
 	static constexpr std::uint32_t GetHashValue() {
+#if defined(USE_NNUE_ABS_SQR_REMOVED_160)
+		// Distinguish the 160-input fc_1 serialization from the legacy 192-input
+		// architecture.  The legacy value remains unchanged for compatibility.
+		return 0x63536A36u;
+#else
 		return 0x6333718Au;
+#endif
 	}
 
 	static std::string GetStructureString() {
+#if defined(USE_NNUE_ABS_SQR_REMOVED_160)
+		return "HalfKA-KSDG3_FM-1280-L2x160-NoAbsSqr";
+#else
 		return "HalfKA-KSDG3_FM-1280";
+#endif
 	}
 
 	Tools::Result ReadParameters(std::istream& stream) {
@@ -698,8 +716,12 @@ struct Network {
 			signal->fm_abs_saturated_count = fm_abs_saturated_count;
 		}
 #endif
-		// Abs Sqr Path: 二乗による非線形強調
+		// AbsSqr is not consumed by the compact 160-input architecture.  Keep
+		// its Phase channel in the file/model for minimal format disruption, but
+		// do not spend inference time materializing the removed L2 channel.
+#if !defined(USE_NNUE_ABS_SQR_REMOVED_160)
 		ComputeAbsSquared(buf.abs_ac_out, buf.abs_sqr_out);
+#endif
 
 
 		// --- 3. Main Path: 基本骨格パスと FM による動的フィルタリング ---
@@ -842,25 +864,30 @@ struct Network {
 		}
 #endif
 
-		// --- 6. L2 Input Assembly: 深層評価パスへの入力構築 (192次元) ---
+		// --- 6. L2 Input Assembly: 深層評価パスへの入力構築 ---
 		// 各チャネルを Phase Gate で得たスケールで調整しつつ統合
-		// [0:30] MainSqr, [31:61] MainRaw, [62:93] Diff, [94:125] AbsRaw, [126:157] AbsSqr, [158:189] Cross, [190:191] Pad
+		// 192: MainSqr31, MainRaw31, Diff32, AbsRaw32, AbsSqr32, Cross32, Pad2.
+		// 160: MainSqr31, MainRaw31, Diff32, AbsRaw32, Cross32, Pad2.
 		if constexpr (UseFixedPhaseL2) {
 			AssembleL2ChannelQ23<31>(buf.ac_sqr_0_out_temp, &buf.l2_input[0], phase_scales_q23[0]);
 			AssembleL2ChannelQ23<31>(buf.ac_0_out, &buf.l2_input[31], phase_scales_q23[1]);
 			AssembleL2ChannelQ23<32>(buf.diff_ac_out, &buf.l2_input[62], phase_scales_q23[2]);
 			AssembleL2ChannelQ23<32>(buf.abs_ac_out, &buf.l2_input[94], phase_scales_q23[3]);
+#if !defined(USE_NNUE_ABS_SQR_REMOVED_160)
 			AssembleL2ChannelQ23<32>(buf.abs_sqr_out, &buf.l2_input[126], phase_scales_q23[4]);
-			AssembleL2ChannelQ23<32>(buf.cross_feat, &buf.l2_input[158], phase_scales_q23[5]);
+#endif
+			AssembleL2ChannelQ23<32>(buf.cross_feat, &buf.l2_input[L2_CROSS_OFFSET], phase_scales_q23[5]);
 		} else {
 			AssembleL2Channel<31>(buf.ac_sqr_0_out_temp, &buf.l2_input[0], main_sqr_scale);
 			AssembleL2Channel<31>(buf.ac_0_out, &buf.l2_input[31], main_raw_scale);
 			AssembleL2Channel<32>(buf.diff_ac_out, &buf.l2_input[62], diff_scale);
 			AssembleL2Channel<32>(buf.abs_ac_out, &buf.l2_input[94], abs_raw_scale);
+#if !defined(USE_NNUE_ABS_SQR_REMOVED_160)
 			AssembleL2Channel<32>(buf.abs_sqr_out, &buf.l2_input[126], abs_sqr_scale);
-			AssembleL2Channel<32>(buf.cross_feat, &buf.l2_input[158], cross_scale);
+#endif
+			AssembleL2Channel<32>(buf.cross_feat, &buf.l2_input[L2_CROSS_OFFSET], cross_scale);
 		}
-		std::memset(buf.l2_input + 190, 0, 2);
+		std::memset(buf.l2_input + L2_REAL_SIZE, 0, 2);
 
 
 		// --- 7. Deep Path 推論 ---
@@ -1443,9 +1470,13 @@ struct Network {
 		AssembleL2Channel<31>(main_raw, output + 31, scales.main_raw);
 		AssembleL2Channel<32>(diff_input, output + 62, scales.diff);
 		AssembleL2Channel<32>(abs_input, output + 94, scales.abs_raw);
+#if !defined(USE_NNUE_ABS_SQR_REMOVED_160)
 		AssembleL2Channel<32>(abs_sqr, output + 126, scales.abs_sqr);
-		AssembleL2Channel<32>(cross_input, output + 158, scales.cross);
-		std::memset(output + 190, 0, 2);
+#else
+		(void)abs_sqr;
+#endif
+		AssembleL2Channel<32>(cross_input, output + L2_CROSS_OFFSET, scales.cross);
+		std::memset(output + L2_REAL_SIZE, 0, 2);
 	}
 
 	template<IndexType Dimensions>
@@ -1464,9 +1495,13 @@ struct Network {
 		BenchmarkAssembleL2ChannelQ23<31>(main_raw, output + 31, scales_q23[1]);
 		BenchmarkAssembleL2ChannelQ23<32>(diff_input, output + 62, scales_q23[2]);
 		BenchmarkAssembleL2ChannelQ23<32>(abs_input, output + 94, scales_q23[3]);
+#if !defined(USE_NNUE_ABS_SQR_REMOVED_160)
 		BenchmarkAssembleL2ChannelQ23<32>(abs_sqr, output + 126, scales_q23[4]);
-		BenchmarkAssembleL2ChannelQ23<32>(cross_input, output + 158, scales_q23[5]);
-		std::memset(output + 190, 0, 2);
+#else
+		(void)abs_sqr;
+#endif
+		BenchmarkAssembleL2ChannelQ23<32>(cross_input, output + L2_CROSS_OFFSET, scales_q23[5]);
+		std::memset(output + L2_REAL_SIZE, 0, 2);
 	}
 
 	void BenchmarkFc1Activation(const std::uint8_t* input,
@@ -1483,7 +1518,14 @@ struct Network {
 #if defined(USE_AVX2) && !defined(USE_AVX512)
 	void BenchmarkFc1OutputTiled(const std::uint8_t* input,
 		std::int32_t* output) const {
+#if defined(USE_NNUE_ABS_SQR_REMOVED_160)
+		// The historical output-tiling experiment is specialized for 192 inputs.
+		// Keep benchmark builds source-compatible; compact builds use the normal
+		// 160-input kernel here rather than instantiating that retired candidate.
+		fc_1.Propagate(input, output);
+#else
 		fc_1.BenchmarkPropagateOutputTiled64And32(input, output);
+#endif
 	}
 #endif
 
