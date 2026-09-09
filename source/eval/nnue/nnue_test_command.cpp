@@ -147,7 +147,18 @@ class ScopedMoveAccuracyEngineState {
       original_bestmove_callback_;
 };
 
-void TestMoveAccuracy(IEngine& engine, std::istream& stream) {
+void WriteCsvField(std::ostream& output, std::string_view value) {
+  output.put('"');
+  for (const char character : value) {
+    if (character == '"')
+      output.put('"');
+    output.put(character);
+  }
+  output.put('"');
+}
+
+void TestMoveAccuracy(IEngine& engine, std::istream& stream,
+                      bool write_details) {
   std::string file_name;
   stream >> file_name;
   if (file_name.empty()) {
@@ -155,10 +166,32 @@ void TestMoveAccuracy(IEngine& engine, std::istream& stream) {
     return;
   }
 
+  std::string detail_file_name;
+  if (write_details) {
+    stream >> detail_file_name;
+    if (detail_file_name.empty()) {
+      std::cout << "error: output CSV path is required" << std::endl;
+      return;
+    }
+  }
+
   std::ifstream input(file_name, std::ios::binary);
   if (!input) {
     std::cout << "error: failed to open sfenpack file: " << file_name << std::endl;
     return;
+  }
+
+  std::ofstream detail_output;
+  if (write_details) {
+    detail_output.open(detail_file_name, std::ios::out | std::ios::trunc);
+    if (!detail_output) {
+      std::cout << "error: failed to open output CSV file: "
+                << detail_file_name << std::endl;
+      return;
+    }
+    detail_output
+        << "record_index,tested_index,sfen,teacher_move,predicted_move,"
+           "correct,teacher_score,game_ply,game_result\n";
   }
 
   std::uint64_t total_records = 0;
@@ -219,10 +252,36 @@ void TestMoveAccuracy(IEngine& engine, std::istream& stream) {
 
         ++tested_positions;
         const u16 teacher_move = packed_record.move;
-        if (best_move.to_u16() == teacher_move)
+        const bool correct = best_move.to_u16() == teacher_move;
+        if (correct)
           ++correct_moves;
+
+        if (write_details) {
+          detail_output << total_records << ',' << tested_positions << ',';
+          WriteCsvField(detail_output, decoded_position.sfen());
+          detail_output << ',';
+          WriteCsvField(detail_output, Move16(teacher_move).to_usi_string());
+          detail_output << ',';
+          WriteCsvField(detail_output, best_move_text);
+          detail_output << ',' << (correct ? 1 : 0) << ','
+                        << packed_record.score << ',' << packed_record.game_ply
+                        << ',' << static_cast<int>(packed_record.game_result)
+                        << '\n';
+          if (!detail_output) {
+            error_message = "failed while writing output CSV file: "
+                          + detail_file_name;
+            break;
+          }
+        }
       }
     }
+  }
+
+  if (write_details) {
+    detail_output.flush();
+    if (error_message.empty() && !detail_output)
+      error_message = "failed while writing output CSV file: "
+                    + detail_file_name;
   }
 
   if (error_message.empty() && input.bad())
@@ -252,6 +311,8 @@ void TestMoveAccuracy(IEngine& engine, std::istream& stream) {
   std::cout << "tested positions = " << tested_positions << std::endl;
   std::cout << "correct moves    = " << correct_moves << std::endl;
   std::cout << "accuracy=" << accuracy_text.str() << "%" << std::endl;
+  if (write_details)
+    std::cout << "detail CSV      = " << detail_file_name << std::endl;
 }
 
 // 主に差分計算に関するRawFeaturesのテスト
@@ -8583,7 +8644,9 @@ void TestCommand(IEngine& engine, std::istream& stream) {
   } else if (sub_command == "info") {
     PrintInfo(stream);
   } else if (sub_command == "accuracy") {
-    TestMoveAccuracy(engine, stream);
+    TestMoveAccuracy(engine, stream, false);
+  } else if (sub_command == "accuracy_detail") {
+    TestMoveAccuracy(engine, stream, true);
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
   } else if (sub_command == "signal_log_reset") {
     Search::NnueSignalLog::Reset();
@@ -8724,6 +8787,8 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << " test nnue test_features" << std::endl;
     std::cout << " test nnue test_accumulator" << std::endl;
     std::cout << " test nnue accuracy <sfenpack file>" << std::endl;
+    std::cout << " test nnue accuracy_detail <sfenpack file> <output.csv>"
+              << std::endl;
     std::cout << " test nnue info [path/to/" << kFileName << "...]" << std::endl;
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
     std::cout << " test nnue signal_log_reset" << std::endl;
