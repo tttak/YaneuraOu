@@ -36,14 +36,27 @@ constexpr int LayerStacks = 12;
 // 各層の次元数
 constexpr IndexType kInputDims = kTransformedFeatureDimensions;
 constexpr IndexType kHidden1Dims = 31;
+#if defined(USE_NNUE_ABS_SQR_REMOVED_160) && !defined(USE_NNUE_LEGACY_PHASE6)
+#define NNUE_COMPACT_PHASE5
+#endif
+
 #if defined(USE_NNUE_ABS_SQR_REMOVED_160)
 constexpr IndexType L2_INPUT_SIZE = 160;
 constexpr IndexType L2_REAL_SIZE = 158;
 constexpr IndexType L2_CROSS_OFFSET = 126;
+#if defined(NNUE_COMPACT_PHASE5)
+constexpr IndexType PHASE_OUTPUT_SIZE = 5;
+constexpr IndexType PHASE_CROSS_INDEX = 4;
+#else
+constexpr IndexType PHASE_OUTPUT_SIZE = 6;
+constexpr IndexType PHASE_CROSS_INDEX = 5;
+#endif
 #else
 constexpr IndexType L2_INPUT_SIZE = 192;
 constexpr IndexType L2_REAL_SIZE = 190;
 constexpr IndexType L2_CROSS_OFFSET = 158;
+constexpr IndexType PHASE_OUTPUT_SIZE = 6;
+constexpr IndexType PHASE_CROSS_INDEX = 5;
 #endif
 constexpr IndexType kHidden2Dims = 96;
 
@@ -95,9 +108,12 @@ struct Network {
 
 	// Hash値などは適宜実装
 	static constexpr std::uint32_t GetHashValue() {
-#if defined(USE_NNUE_ABS_SQR_REMOVED_160)
-		// Distinguish the 160-input fc_1 serialization from the legacy 192-input
-		// architecture.  The legacy value remains unchanged for compatibility.
+#if defined(NNUE_COMPACT_PHASE5)
+		// Phase5 additionally distinguishes old 160-input files whose row 4 was
+		// AbsSqr and row 5 was Cross. Loading one as Phase5 would silently use
+		// the wrong scale even though the physical layer is padded to 32 rows.
+		return 0x63566A36u;
+#elif defined(USE_NNUE_ABS_SQR_REMOVED_160)
 		return 0x63536A36u;
 #else
 		return 0x6333718Au;
@@ -105,7 +121,9 @@ struct Network {
 	}
 
 	static std::string GetStructureString() {
-#if defined(USE_NNUE_ABS_SQR_REMOVED_160)
+#if defined(NNUE_COMPACT_PHASE5)
+		return "HalfKA-KSDG3_FM-1280-L2x160-NoAbsSqr-Phase5";
+#elif defined(USE_NNUE_ABS_SQR_REMOVED_160)
 		return "HalfKA-KSDG3_FM-1280-L2x160-NoAbsSqr";
 #else
 		return "HalfKA-KSDG3_FM-1280";
@@ -459,9 +477,14 @@ struct Network {
 		const auto& lut = PhaseFixedC32SigmoidQ15Lut();
 		constexpr std::int32_t kBaseQ15 = 18022;
 		constexpr std::int32_t kGainQ15 = 14746;
-		constexpr std::array<std::int32_t, 6> kFactorQ15 = {
+#if defined(NNUE_COMPACT_PHASE5)
+		constexpr std::array<std::int32_t, PHASE_OUTPUT_SIZE> kFactorQ15 = {
+			42598, 49152, 32768, 22938, 49152};
+#else
+		constexpr std::array<std::int32_t, PHASE_OUTPUT_SIZE> kFactorQ15 = {
 			42598, 49152, 32768, 22938, 28836, 49152};
-		for (int i = 0; i < 6; ++i) {
+#endif
+		for (IndexType i = 0; i < PHASE_OUTPUT_SIZE; ++i) {
 			const std::int32_t raw = phase_output[i];
 			std::uint16_t sigmoid_q15;
 			if (raw <= kPhaseFixedRawMinimum)
@@ -587,10 +610,10 @@ struct Network {
 
 		// Phase Gate 推論と各パスへの係数算出 (0.1 ～ 1.0 の範囲に正規化)
 		if constexpr (UsePhasePrefix)
-			phase_proj.PropagatePrefix<6>(buf.phase_input, buf.phase_out);
+			phase_proj.PropagatePrefix<PHASE_OUTPUT_SIZE>(buf.phase_input, buf.phase_out);
 		else
 			phase_proj.Propagate(buf.phase_input, buf.phase_out);
-		std::int32_t phase_scales_q23[6]{};
+		std::int32_t phase_scales_q23[PHASE_OUTPUT_SIZE]{};
 		float main_sqr_scale = 0.0f;
 		float main_raw_scale = 0.0f;
 		float diff_scale = 0.0f;
@@ -605,12 +628,14 @@ struct Network {
 			main_raw_scale = phase_scales_q23[1] * kInverseQ23;
 			diff_scale = phase_scales_q23[2] * kInverseQ23;
 			abs_raw_scale = phase_scales_q23[3] * kInverseQ23;
+#if !defined(NNUE_COMPACT_PHASE5)
 			abs_sqr_scale = phase_scales_q23[4] * kInverseQ23;
-			cross_scale = phase_scales_q23[5] * kInverseQ23;
+#endif
+			cross_scale = phase_scales_q23[PHASE_CROSS_INDEX] * kInverseQ23;
 #endif
 		} else {
-			float phase_val[6];
-			for (int i = 0; i < 6; ++i) {
+			float phase_val[PHASE_OUTPUT_SIZE];
+			for (IndexType i = 0; i < PHASE_OUTPUT_SIZE; ++i) {
 				const float logit =
 					(static_cast<float>(buf.phase_out[i]) / 8128.0f) * 3.0f + 1.0f;
 				const float sig = 1.0f / (1.0f + std::exp(-logit));
@@ -620,8 +645,10 @@ struct Network {
 			main_raw_scale = (0.5f + 0.5f * phase_val[1]) * 1.5f;
 			diff_scale = (0.5f + 0.5f * phase_val[2]) * 1.0f;
 			abs_raw_scale = (0.5f + 0.5f * phase_val[3]) * 0.7f;
+#if !defined(NNUE_COMPACT_PHASE5)
 			abs_sqr_scale = (0.5f + 0.5f * phase_val[4]) * 0.88f;
-			cross_scale = (0.5f + 0.5f * phase_val[5]) * 1.5f;
+#endif
+			cross_scale = (0.5f + 0.5f * phase_val[PHASE_CROSS_INDEX]) * 1.5f;
 		}
 
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
@@ -633,13 +660,13 @@ struct Network {
 			signal->phase_scale[4] = abs_sqr_scale;
 			signal->phase_scale[5] = cross_scale;
 			signal->main_reliance = main_sqr_scale + main_raw_scale;
-			signal->fm_reliance = diff_scale + abs_raw_scale + abs_sqr_scale;
+			signal->fm_reliance = diff_scale + abs_raw_scale;
 			signal->cross_reliance = cross_scale;
 		}
 #endif
 #if defined(USE_NNUE_PHASE_FM_LMR) && !defined(ENABLE_NNUE_SIGNAL_LOG)
 		if (lmr_signal)
-			lmr_signal->fm_reliance = diff_scale + abs_raw_scale + abs_sqr_scale;
+			lmr_signal->fm_reliance = diff_scale + abs_raw_scale;
 #endif
 
 
@@ -876,7 +903,7 @@ struct Network {
 #if !defined(USE_NNUE_ABS_SQR_REMOVED_160)
 			AssembleL2ChannelQ23<32>(buf.abs_sqr_out, &buf.l2_input[126], phase_scales_q23[4]);
 #endif
-			AssembleL2ChannelQ23<32>(buf.cross_feat, &buf.l2_input[L2_CROSS_OFFSET], phase_scales_q23[5]);
+			AssembleL2ChannelQ23<32>(buf.cross_feat, &buf.l2_input[L2_CROSS_OFFSET], phase_scales_q23[PHASE_CROSS_INDEX]);
 		} else {
 			AssembleL2Channel<31>(buf.ac_sqr_0_out_temp, &buf.l2_input[0], main_sqr_scale);
 			AssembleL2Channel<31>(buf.ac_0_out, &buf.l2_input[31], main_raw_scale);
@@ -1063,12 +1090,12 @@ struct Network {
 
 	void BenchmarkPhaseProjection(const std::uint8_t* phase_input,
 		std::int32_t* phase_output) const {
-		phase_proj.PropagatePrefix<6>(phase_input, phase_output);
+		phase_proj.PropagatePrefix<PHASE_OUTPUT_SIZE>(phase_input, phase_output);
 	}
 
 	void BenchmarkPhaseSigmoid(const std::int32_t* phase_output,
 		float* phase_value) const {
-		for (int i = 0; i < 6; ++i) {
+		for (IndexType i = 0; i < PHASE_OUTPUT_SIZE; ++i) {
 			const float logit =
 				(static_cast<float>(phase_output[i]) / 8128.0f) * 3.0f + 1.0f;
 			const float sigmoid = 1.0f / (1.0f + std::exp(-logit));
@@ -1078,6 +1105,15 @@ struct Network {
 
 	BenchmarkPhaseScales BenchmarkPhaseChannelScales(
 		const float* phase_value) const {
+#if defined(NNUE_COMPACT_PHASE5)
+		return {
+			(0.5f + 0.5f * phase_value[0]) * 1.3f,
+			(0.5f + 0.5f * phase_value[1]) * 1.5f,
+			(0.5f + 0.5f * phase_value[2]) * 1.0f,
+			(0.5f + 0.5f * phase_value[3]) * 0.7f,
+			0.0f,
+			(0.5f + 0.5f * phase_value[4]) * 1.5f};
+#else
 		return {
 			(0.5f + 0.5f * phase_value[0]) * 1.3f,
 			(0.5f + 0.5f * phase_value[1]) * 1.5f,
@@ -1085,25 +1121,20 @@ struct Network {
 			(0.5f + 0.5f * phase_value[3]) * 0.7f,
 			(0.5f + 0.5f * phase_value[4]) * 0.88f,
 			(0.5f + 0.5f * phase_value[5]) * 1.5f};
+#endif
 	}
 
 	BenchmarkPhaseScales BenchmarkPhaseScalesFromOutput(
 		const std::int32_t* phase_output) const {
-		float phase_value[6];
-		for (int i = 0; i < 6; ++i) {
+		float phase_value[PHASE_OUTPUT_SIZE];
+		for (IndexType i = 0; i < PHASE_OUTPUT_SIZE; ++i) {
 			const float logit =
 				(static_cast<float>(phase_output[i]) / 8128.0f) * 3.0f + 1.0f;
 			const float sigmoid = 1.0f / (1.0f + std::exp(-logit));
 			phase_value[i] = 0.1f + 0.9f * sigmoid;
 		}
 
-		return {
-			(0.5f + 0.5f * phase_value[0]) * 1.3f,
-			(0.5f + 0.5f * phase_value[1]) * 1.5f,
-			(0.5f + 0.5f * phase_value[2]) * 1.0f,
-			(0.5f + 0.5f * phase_value[3]) * 0.7f,
-			(0.5f + 0.5f * phase_value[4]) * 0.88f,
-			(0.5f + 0.5f * phase_value[5]) * 1.5f};
+		return BenchmarkPhaseChannelScales(phase_value);
 	}
 
 	BenchmarkPhaseScales BenchmarkPhase(
@@ -1119,7 +1150,7 @@ struct Network {
 			phase_input[j + 256] = transformed_features[j];
 		}
 		phase_input[127] = static_cast<std::uint8_t>((bucket_id * 127) / 11);
-		phase_proj.PropagatePrefix<6>(phase_input, phase_output);
+		phase_proj.PropagatePrefix<PHASE_OUTPUT_SIZE>(phase_input, phase_output);
 
 		return BenchmarkPhaseScalesFromOutput(phase_output);
 	}

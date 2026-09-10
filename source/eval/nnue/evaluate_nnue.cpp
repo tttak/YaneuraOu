@@ -351,11 +351,20 @@ namespace {
 		Tools::Result result = ReadHeader(stream, &hash_value, &architecture, nullptr);
 		if (result.is_not_ok()) return result;
 #if defined(USE_NNUE_ABS_SQR_REMOVED_160)
-		if (architecture.find("-L2x160-NoAbsSqr") == std::string::npos) {
-			sync_cout << "info string NNUE architecture mismatch: this binary requires L2x160-NoAbsSqr, got "
+#if defined(USE_NNUE_LEGACY_PHASE6)
+		if (architecture.find("-L2x160-NoAbsSqr") == std::string::npos
+			|| architecture.find("-Phase5") != std::string::npos) {
+			sync_cout << "info string NNUE architecture mismatch: this diagnostic binary requires legacy L2x160-NoAbsSqr Phase6, got "
 				<< architecture << sync_endl;
 			return Tools::ResultCode::FileMismatch;
 		}
+#else
+		if (architecture.find("-L2x160-NoAbsSqr-Phase5") == std::string::npos) {
+			sync_cout << "info string NNUE architecture mismatch: this binary requires L2x160-NoAbsSqr-Phase5, got "
+				<< architecture << sync_endl;
+			return Tools::ResultCode::FileMismatch;
+		}
+#endif
 #else
 		if (architecture.find("-L2x160-NoAbsSqr") != std::string::npos) {
 			sync_cout << "info string NNUE architecture mismatch: the file requires an L2x160-NoAbsSqr binary"

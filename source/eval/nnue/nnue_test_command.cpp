@@ -2611,7 +2611,7 @@ std::vector<NetworkStageBenchCase> MakeNnueNetworkStageBenchCorpus() {
         reinterpret_cast<char*>(&network_buffer));
     sample.final_output = output[0];
     sample.intermediate = network_buffer;
-#if defined(USE_NNUE_ABS_SQR_REMOVED_160)
+#if defined(NNUE_COMPACT_PHASE5)
     // AbsSqr is not a production intermediate in the compact architecture.
     // Materialize it only for the retained diagnostic stage/checksum.
     selected_network.BenchmarkAbsSquared(
@@ -2693,9 +2693,10 @@ void ComputeNnueNetworkStageValidationChecksums(
 
     MixNnueBenchRange(captured_checksums[0], sample.intermediate.phase_input,
                       384);
-    MixNnueBenchRange(captured_checksums[1], sample.intermediate.phase_out, 6);
-    for (const float value : sample.phase_values)
-      MixNnueBenchFloatBits(captured_checksums[2], value);
+    MixNnueBenchRange(captured_checksums[1], sample.intermediate.phase_out,
+                      PHASE_OUTPUT_SIZE);
+    for (IndexType index = 0; index < PHASE_OUTPUT_SIZE; ++index)
+      MixNnueBenchFloatBits(captured_checksums[2], sample.phase_values[index]);
     MixNnueBenchPhaseScales(captured_checksums[3],
                             sample.phase_split_scales);
     MixNnueBenchRange(captured_checksums[4], sample.intermediate.diff_fc_out,
@@ -2767,18 +2768,20 @@ void ComputeNnueNetworkStageValidationChecksums(
 
     selected_network.BenchmarkPhaseProjection(
         sample.intermediate.phase_input, work.phase_out);
-    MixNnueBenchRange(recomputed_checksums[1], work.phase_out, 6);
+    MixNnueBenchRange(recomputed_checksums[1], work.phase_out,
+                      PHASE_OUTPUT_SIZE);
     CompareNnueNetworkStageRange(
-        sample.intermediate.phase_out, work.phase_out, 6, sample_index,
+        sample.intermediate.phase_out, work.phase_out, PHASE_OUTPUT_SIZE,
+        sample_index,
         mismatches[1]);
 
-    float phase_values[6];
+    float phase_values[PHASE_OUTPUT_SIZE];
     selected_network.BenchmarkPhaseSigmoid(
         sample.intermediate.phase_out, phase_values);
-    for (const float value : phase_values)
-      MixNnueBenchFloatBits(recomputed_checksums[2], value);
+    for (IndexType index = 0; index < PHASE_OUTPUT_SIZE; ++index)
+      MixNnueBenchFloatBits(recomputed_checksums[2], phase_values[index]);
     CompareNnueNetworkFloatRange(
-        sample.phase_values.data(), phase_values, 6, sample_index,
+        sample.phase_values.data(), phase_values, PHASE_OUTPUT_SIZE, sample_index,
         float_mismatches[2]);
 
     const auto phase_split_scales =
@@ -3146,7 +3149,8 @@ void DiagnoseNnueNetworkPhaseAndLca(
         phase_input, sample.intermediate.phase_input, work.phase_input, 384,
         sample_index);
     AddNnueBenchIntegerDiagnostic(
-        phase_output, sample.intermediate.phase_out, work.phase_out, 6,
+        phase_output, sample.intermediate.phase_out, work.phase_out,
+        PHASE_OUTPUT_SIZE,
         sample_index);
     const auto captured_scale_values =
         NnueBenchPhaseScalesToArray(sample.phase_scales);
@@ -3216,7 +3220,10 @@ void DiagnoseNnueNetworkPhaseAndLca(
 
   std::cout << "[Phase intermediate diagnostics]" << std::endl;
   PrintNnueBenchIntegerDiagnostic("phase.input[384]", phase_input);
-  PrintNnueBenchIntegerDiagnostic("phase.proj_output[6]", phase_output);
+  PrintNnueBenchIntegerDiagnostic(
+      PHASE_OUTPUT_SIZE == 5 ? "phase.proj_output[5]"
+                             : "phase.proj_output[6]",
+      phase_output);
   PrintNnueBenchFloatDiagnostic("phase.channel_scales[6]", phase_scales);
 
   std::cout << "[LCA intermediate diagnostics]" << std::endl;
@@ -3412,6 +3419,42 @@ NnueBenchTiming MeasureNnueRouterPhaseAssembly(
   return timing;
 }
 
+#if defined(NNUE_COMPACT_PHASE5)
+template<IndexType OutputCount>
+NnueBenchTiming MeasureNnuePhasePrefix(
+    const std::vector<NetworkStageBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  alignas(kCacheLineSize) std::int32_t output[32];
+  NnueBenchTiming timing;
+  const auto begin = NnueBenchClock::now();
+  for (const auto& sample : corpus) {
+    NnueBenchSelectedNetwork(sample.input.selected_bucket)
+        .phase_proj.PropagatePrefix<OutputCount>(
+            sample.intermediate.phase_input, output);
+    // Compare the five live channels only. Phase6 row 5 is padding in a
+    // Phase5 file and exists here solely as the pre-cleanup timing control.
+    for (IndexType index = 0; index < PHASE_OUTPUT_SIZE; ++index)
+      MixNnueBenchChecksum(checksum, output[index]);
+    KeepNnueBenchObject(output);
+    ++timing.calls;
+  }
+  const auto end = NnueBenchClock::now();
+  timing.nanoseconds =
+      std::chrono::duration<double, std::nano>(end - begin).count();
+  return timing;
+}
+
+template<IndexType OutputCount>
+NnueBenchTiming MeasureNnuePhasePrefixAfterWarmup(
+    const std::vector<NetworkStageBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  std::uint64_t warmup_checksum = UINT64_C(14695981039346656037);
+  MeasureNnuePhasePrefix<OutputCount>(corpus, warmup_checksum);
+  MixNnueBenchChecksum(checksum, warmup_checksum);
+  return MeasureNnuePhasePrefix<OutputCount>(corpus, checksum);
+}
+#endif
+
 template<RouterPhaseInputImplementation Implementation, bool FullNetwork>
 NnueBenchTiming MeasureNnueRouterPhaseCandidate(
     const std::vector<NetworkStageBenchCase>& corpus,
@@ -3438,7 +3481,7 @@ NnueBenchTiming MeasureNnueRouterPhaseCandidate(
       NnueBenchSelectedNetwork(selected_bucket).BenchmarkPhaseProjection(
           phase_input, phase_output);
       const std::size_t index =
-          static_cast<std::size_t>(timing.calls) % 6;
+          static_cast<std::size_t>(timing.calls) % PHASE_OUTPUT_SIZE;
       MixNnueBenchChecksum(checksum, selected_bucket);
       MixNnueBenchChecksum(checksum, router_output[index]);
       MixNnueBenchChecksum(checksum, phase_output[index]);
@@ -3570,6 +3613,11 @@ void TestRouterPhaseInputBenchmarkCompare(const std::uint64_t repeat_count) {
   std::array<NnueBenchSamples, 3> preparation;
   std::array<NnueBenchSamples, 3> combined;
   std::array<NnueBenchSamples, 3> full;
+#if defined(NNUE_COMPACT_PHASE5)
+  std::array<NnueBenchSamples, 2> phase_prefix;
+  std::array<std::uint64_t, 2> phase_prefix_checksums;
+  phase_prefix_checksums.fill(UINT64_C(14695981039346656037));
+#endif
   std::uint64_t assembly_checksum = UINT64_C(14695981039346656037);
   std::array<std::uint64_t, 3> preparation_checksums;
   std::array<std::uint64_t, 3> combined_checksums;
@@ -3589,6 +3637,20 @@ void TestRouterPhaseInputBenchmarkCompare(const std::uint64_t repeat_count) {
     phase_assembly.Add(
         MeasureNnueRouterPhaseAssembly<RouterPhaseAssemblyOperation::Phase>(
             corpus, assembly_checksum));
+
+#if defined(NNUE_COMPACT_PHASE5)
+    if ((repeat & 1) == 0) {
+      phase_prefix[0].Add(MeasureNnuePhasePrefixAfterWarmup<6>(
+          corpus, phase_prefix_checksums[0]));
+      phase_prefix[1].Add(MeasureNnuePhasePrefixAfterWarmup<5>(
+          corpus, phase_prefix_checksums[1]));
+    } else {
+      phase_prefix[1].Add(MeasureNnuePhasePrefixAfterWarmup<5>(
+          corpus, phase_prefix_checksums[1]));
+      phase_prefix[0].Add(MeasureNnuePhasePrefixAfterWarmup<6>(
+          corpus, phase_prefix_checksums[0]));
+    }
+#endif
 
     for (std::size_t offset = 0; offset < 3; ++offset) {
       const std::size_t candidate = (repeat + offset) % 3;
@@ -3628,6 +3690,25 @@ void TestRouterPhaseInputBenchmarkCompare(const std::uint64_t repeat_count) {
 
   PrintNnueBenchSamples("Router input assembly", router_assembly);
   PrintNnueBenchSamples("Phase input assembly", phase_assembly);
+#if defined(NNUE_COMPACT_PHASE5)
+  std::cout << "Phase projection cleanup A/B" << std::endl;
+  PrintNnueBenchSamples("A. legacy Prefix<6>", phase_prefix[0]);
+  PrintNnueBenchSamples("B. Phase5 Prefix<5>", phase_prefix[1]);
+  const auto prefix6_summary = SummarizeNnueBenchSamples(phase_prefix[0]);
+  const auto prefix5_summary = SummarizeNnueBenchSamples(phase_prefix[1]);
+  const double prefix_improvement = prefix6_summary.median == 0.0 ? 0.0
+      : (prefix6_summary.median - prefix5_summary.median) * 100.0
+          / prefix6_summary.median;
+  std::cout << "  improvement ns/call : " << std::fixed
+            << std::setprecision(1)
+            << prefix6_summary.median - prefix5_summary.median << std::endl
+            << "  improvement         : " << std::setprecision(2)
+            << prefix_improvement << "%" << std::endl
+            << "  live-channel checksum match: "
+            << (phase_prefix_checksums[0] == phase_prefix_checksums[1]
+                    ? "yes" : "NO")
+            << std::endl;
+#endif
   PrintNnueRouterPhaseComparison(
       "combined Router + Phase input preparation", preparation);
   PrintNnueRouterPhaseComparison(
@@ -3683,7 +3764,7 @@ void TestRouterPhaseInputBenchmarkCompare(const std::uint64_t repeat_count) {
             router_out[i] != captured_router[i];
       }
 
-      for (int i = 0; i < 6; ++i) {
+      for (IndexType i = 0; i < PHASE_OUTPUT_SIZE; ++i) {
         MixNnueBenchChecksum(phase_checksums[candidate], phase_out[i]);
         phase_mismatches[candidate] +=
             phase_out[i] != sample.intermediate.phase_out[i];
@@ -3773,16 +3854,19 @@ template<std::int32_t RawStep>
 void NnueBenchPhaseFixedSigmoidQ15(const std::int32_t* phase_output,
                                    std::uint16_t* sigmoid_q15) {
   const auto& lut = NnueBenchPhaseSigmoidQ15Lut<RawStep>();
-  for (int i = 0; i < 6; ++i) {
+  std::fill_n(sigmoid_q15, 6, std::uint16_t{});
+  for (IndexType i = 0; i < PHASE_OUTPUT_SIZE; ++i) {
     const std::int32_t raw = phase_output[i];
+    const IndexType semantic_index =
+        PHASE_OUTPUT_SIZE == 5 && i == 4 ? 5 : i;
     if (raw <= kPhaseFixedRawMin)
-      sigmoid_q15[i] = lut.front();
+      sigmoid_q15[semantic_index] = lut.front();
     else if (raw >= kPhaseFixedRawMax)
-      sigmoid_q15[i] = lut.back();
+      sigmoid_q15[semantic_index] = lut.back();
     else {
       const std::int32_t index =
           (raw - kPhaseFixedRawMin + RawStep / 2) / RawStep;
-      sigmoid_q15[i] = lut[static_cast<std::size_t>(index)];
+      sigmoid_q15[semantic_index] = lut[static_cast<std::size_t>(index)];
     }
   }
 }
@@ -4468,17 +4552,19 @@ NnueBenchTiming MeasureNnueNetworkStageCorpus(
                          NetworkStageBenchOperation::PhaseProjection) {
       selected_network.BenchmarkPhaseProjection(
           sample.intermediate.phase_input, work.phase_out);
-      representative = static_cast<std::uint32_t>(work.phase_out[index % 6])
+      representative = static_cast<std::uint32_t>(
+                           work.phase_out[index % PHASE_OUTPUT_SIZE])
           ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(
-                 work.phase_out[(index + 3) % 6])) << 32);
+                 work.phase_out[(index + 3) % PHASE_OUTPUT_SIZE])) << 32);
     } else if constexpr (Operation ==
                          NetworkStageBenchOperation::PhaseSigmoid) {
-      float phase_values[6];
+      float phase_values[PHASE_OUTPUT_SIZE];
       selected_network.BenchmarkPhaseSigmoid(
           sample.intermediate.phase_out, phase_values);
-      representative = NnueBenchFloatBits(phase_values[index % 6])
+      representative = NnueBenchFloatBits(
+                           phase_values[index % PHASE_OUTPUT_SIZE])
           ^ (static_cast<std::uint64_t>(NnueBenchFloatBits(
-                 phase_values[(index + 3) % 6])) << 32);
+                 phase_values[(index + 3) % PHASE_OUTPUT_SIZE])) << 32);
     } else if constexpr (Operation ==
                          NetworkStageBenchOperation::PhaseChannelScales) {
       const auto scales = selected_network.BenchmarkPhaseChannelScales(
@@ -7991,12 +8077,20 @@ bool MakeNnueTraceSnapshot(const std::string& sfen,
   std::copy_n(lca_buffer.phase_input, kTraceRouterInputDimensions,
               deep_path.phase_input.begin());
 
-  selected_network->phase_proj.PropagatePrefix<6>(lca_buffer.phase_input,
-                                                  lca_buffer.phase_out);
+  selected_network->phase_proj.PropagatePrefix<PHASE_OUTPUT_SIZE>(
+      lca_buffer.phase_input, lca_buffer.phase_out);
   float channel_scales[kTracePhaseDimensions];
+#if defined(NNUE_COMPACT_PHASE5)
+  constexpr float scale_multipliers[PHASE_OUTPUT_SIZE] = {
+      1.3f, 1.5f, 1.0f, 0.7f, 1.5f};
+  constexpr std::size_t semantic_channels[PHASE_OUTPUT_SIZE] = {
+      0, 1, 2, 3, 5};
+#else
   constexpr float scale_multipliers[kTracePhaseDimensions] = {
       1.3f, 1.5f, 1.0f, 0.7f, 0.88f, 1.5f};
-  for (std::size_t index = 0; index < kTracePhaseDimensions; ++index) {
+#endif
+  std::fill_n(channel_scales, kTracePhaseDimensions, 0.0f);
+  for (std::size_t index = 0; index < PHASE_OUTPUT_SIZE; ++index) {
     const float phase_logit =
         (static_cast<float>(lca_buffer.phase_out[index]) / 8128.0f)
         * 3.0f + 1.0f;
@@ -8006,12 +8100,17 @@ bool MakeNnueTraceSnapshot(const std::string& sfen,
     const float channel_scale =
         (0.5f + 0.5f * phase_value) * scale_multipliers[index];
 
-    deep_path.phase_preact[index] = lca_buffer.phase_out[index];
-    deep_path.phase_logit_f32_bits[index] = TraceFloatBits(phase_logit);
-    deep_path.phase_sigmoid_f32_bits[index] = TraceFloatBits(phase_sigmoid);
-    deep_path.phase_value_f32_bits[index] = TraceFloatBits(phase_value);
-    deep_path.channel_scale_f32_bits[index] = TraceFloatBits(channel_scale);
-    channel_scales[index] = channel_scale;
+#if defined(NNUE_COMPACT_PHASE5)
+    const std::size_t semantic_index = semantic_channels[index];
+#else
+    const std::size_t semantic_index = index;
+#endif
+    deep_path.phase_preact[semantic_index] = lca_buffer.phase_out[index];
+    deep_path.phase_logit_f32_bits[semantic_index] = TraceFloatBits(phase_logit);
+    deep_path.phase_sigmoid_f32_bits[semantic_index] = TraceFloatBits(phase_sigmoid);
+    deep_path.phase_value_f32_bits[semantic_index] = TraceFloatBits(phase_value);
+    deep_path.channel_scale_f32_bits[semantic_index] = TraceFloatBits(channel_scale);
+    channel_scales[semantic_index] = channel_scale;
   }
 
   selected_network->ac_sqr_0.Propagate(lca_buffer.fc_0_out,
