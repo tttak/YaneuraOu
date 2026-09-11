@@ -1531,7 +1531,8 @@ struct Network {
 #else
 		(void)abs_sqr;
 #endif
-		BenchmarkAssembleL2ChannelQ23<32>(cross_input, output + L2_CROSS_OFFSET, scales_q23[5]);
+		BenchmarkAssembleL2ChannelQ23<32>(cross_input, output + L2_CROSS_OFFSET,
+			scales_q23[PHASE_CROSS_INDEX]);
 		std::memset(output + L2_REAL_SIZE, 0, 2);
 	}
 

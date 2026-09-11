@@ -379,8 +379,8 @@
 // #define ENABLE_NNUE_RFP_SHADOW  // 成立したreverse futilityの一部をshadow探索
 // #define ENABLE_NNUE_CROSS_LMR_EXPERIMENT // Cross maxによるLMR +1 plyの診断A/B
 // #define USE_NNUE_PHASE_FM_LMR   // Router非対象の高評価・低FM relianceを明示的に+1 ply
-// #define USE_NNUE_PHASE_L2_FIXED_C32 // C32 Q15 nearest Phase + Q23 integer L2候補
 #define USE_NNUE_ABS_SQR_REMOVED_160 // FM AbsSqrをL2から除いた160-input architecture
+// #define DISABLE_NNUE_PHASE_L2_FIXED_C32 // production既定のC32 Phase/L2を比較時に無効化
 // #define DISABLE_NNUE_LCA_LMR    // 295/epoch20用LCA top-1% LMRを比較時に無効化
 // #define DISABLE_NNUE_CROSS_LMR  // Cross high-tail LMRを比較時に無効化
 //
@@ -406,6 +406,13 @@
 #if defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536) \
 	&& !defined(DISABLE_NNUE_APPROX_SIGMOID_LUT)
 	#define USE_NNUE_APPROX_SIGMOID_LUT
+#endif
+
+// SFNNwoP1536ではPhase5 C32 Q15 nearest LUTとQ23 integer L2を標準使用する。
+// 比較・検証用buildではDISABLE_NNUE_PHASE_L2_FIXED_C32を定義して無効化できる。
+#if defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536) \
+	&& !defined(DISABLE_NNUE_PHASE_L2_FIXED_C32)
+	#define USE_NNUE_PHASE_L2_FIXED_C32
 #endif
 
 // SFNNwoP1536ではRouter marginによるLMR variant 3を標準使用する。
