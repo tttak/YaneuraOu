@@ -39,6 +39,9 @@ constexpr IndexType kHidden1Dims = 31;
 #if defined(USE_NNUE_ABS_SQR_REMOVED_160) && !defined(USE_NNUE_LEGACY_PHASE6)
 #define NNUE_COMPACT_PHASE5
 #endif
+#if defined(USE_NNUE_FC1_WIDTH_64) && !defined(NNUE_COMPACT_PHASE5)
+#error USE_NNUE_FC1_WIDTH_64 requires the 160-input Phase5 architecture
+#endif
 
 #if defined(USE_NNUE_ABS_SQR_REMOVED_160)
 constexpr IndexType L2_INPUT_SIZE = 160;
@@ -58,7 +61,11 @@ constexpr IndexType L2_CROSS_OFFSET = 158;
 constexpr IndexType PHASE_OUTPUT_SIZE = 6;
 constexpr IndexType PHASE_CROSS_INDEX = 5;
 #endif
+#if defined(USE_NNUE_FC1_WIDTH_64)
+constexpr IndexType kHidden2Dims = 64;
+#else
 constexpr IndexType kHidden2Dims = 96;
+#endif
 
 // --- [追加] Router 層の型定義 ---
 using Router = Layers::AffineTransformExplicit<384, 32>;
@@ -109,10 +116,17 @@ struct Network {
 	// Hash値などは適宜実装
 	static constexpr std::uint32_t GetHashValue() {
 #if defined(NNUE_COMPACT_PHASE5)
+	#if defined(USE_NNUE_FC1_WIDTH_64)
+		// Same serialized hash derivation as the Python writer, with fc_1
+		// output width 64 instead of 96.  This prevents a 96-wide network
+		// from being accepted silently by the optional 64-wide build.
+		return 0x63566A46u;
+	#else
 		// Phase5 additionally distinguishes old 160-input files whose row 4 was
 		// AbsSqr and row 5 was Cross. Loading one as Phase5 would silently use
 		// the wrong scale even though the physical layer is padded to 32 rows.
 		return 0x63566A36u;
+	#endif
 #elif defined(USE_NNUE_ABS_SQR_REMOVED_160)
 		return 0x63536A36u;
 #else
@@ -122,7 +136,11 @@ struct Network {
 
 	static std::string GetStructureString() {
 #if defined(NNUE_COMPACT_PHASE5)
+	#if defined(USE_NNUE_FC1_WIDTH_64)
+		return "HalfKA-KSDG3_FM-1280-L2x160-NoAbsSqr-Phase5-FC1x64";
+	#else
 		return "HalfKA-KSDG3_FM-1280-L2x160-NoAbsSqr-Phase5";
+	#endif
 #elif defined(USE_NNUE_ABS_SQR_REMOVED_160)
 		return "HalfKA-KSDG3_FM-1280-L2x160-NoAbsSqr";
 #else

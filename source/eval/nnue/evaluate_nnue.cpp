@@ -364,6 +364,19 @@ namespace {
 				<< architecture << sync_endl;
 			return Tools::ResultCode::FileMismatch;
 		}
+#if defined(USE_NNUE_FC1_WIDTH_64)
+		if (architecture.find("-Phase5-FC1x64") == std::string::npos) {
+			sync_cout << "info string NNUE architecture mismatch: this binary requires FC1x64, got "
+				<< architecture << sync_endl;
+			return Tools::ResultCode::FileMismatch;
+		}
+#else
+		if (architecture.find("-Phase5-FC1x64") != std::string::npos) {
+			sync_cout << "info string NNUE architecture mismatch: this binary requires FC1x96, got "
+				<< architecture << sync_endl;
+			return Tools::ResultCode::FileMismatch;
+		}
+#endif
 #endif
 #else
 		if (architecture.find("-L2x160-NoAbsSqr") != std::string::npos) {

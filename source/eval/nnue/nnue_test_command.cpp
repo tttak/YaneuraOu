@@ -197,6 +197,8 @@ void TestMoveAccuracy(IEngine& engine, std::istream& stream,
   std::uint64_t total_records = 0;
   std::uint64_t tested_positions = 0;
   std::uint64_t correct_moves = 0;
+  std::uint64_t skipped_terminal_positions = 0;
+  std::uint64_t skipped_declaration_wins = 0;
   std::string error_message;
   std::string best_move_text;
 
@@ -224,8 +226,8 @@ void TestMoveAccuracy(IEngine& engine, std::istream& stream,
           continue;
 
         if (MoveList<LEGAL>(decoded_position).size() == 0) {
-          error_message = "no legal move in a tested sfenpack position";
-          break;
+          ++skipped_terminal_positions;
+          continue;
         }
 
         engine.set_position(decoded_position.sfen(), {});
@@ -243,8 +245,16 @@ void TestMoveAccuracy(IEngine& engine, std::istream& stream,
         }
 
         const Move16 best_move = Move16::from_string(best_move_text);
-        if (best_move == Move16::none() || best_move == Move16::resign()
-            || best_move == Move16::win()) {
+        // A declaration win has no comparable ordinary Move16 in the teacher
+        // record.  It is not a network move-accuracy error, so omit it from
+        // both numerator and denominator instead of aborting the whole corpus.
+        // Move16::from_string() maps some non-move USI tokens to none(), so
+        // test the callback text as well as the typed sentinel.
+        if (best_move_text == "win" || best_move == Move16::win()) {
+          ++skipped_declaration_wins;
+          continue;
+        }
+        if (best_move == Move16::none() || best_move == Move16::resign()) {
           error_message = "depth=1 search returned no comparable best move: "
                         + best_move_text;
           break;
@@ -310,6 +320,10 @@ void TestMoveAccuracy(IEngine& engine, std::istream& stream,
 
   std::cout << "tested positions = " << tested_positions << std::endl;
   std::cout << "correct moves    = " << correct_moves << std::endl;
+  std::cout << "skipped terminal positions = "
+            << skipped_terminal_positions << std::endl;
+  std::cout << "skipped declaration wins = " << skipped_declaration_wins
+            << std::endl;
   std::cout << "accuracy=" << accuracy_text.str() << "%" << std::endl;
   if (write_details)
     std::cout << "detail CSV      = " << detail_file_name << std::endl;
@@ -7668,7 +7682,7 @@ constexpr std::size_t kTraceLcaFmInputDimensions = 64;
 constexpr std::size_t kTracePhaseDimensions = 6;
 constexpr std::size_t kTraceCrossInputDimensions = 16;
 constexpr std::size_t kTraceBucketInputDimensions = L2_INPUT_SIZE;
-constexpr std::size_t kTraceBucketHiddenDimensions = 96;
+constexpr std::size_t kTraceBucketHiddenDimensions = kHidden2Dims;
 
 static_assert(FeatureTransformer::kOutputDimensions ==
                   2 * kTracePairDimensions,
