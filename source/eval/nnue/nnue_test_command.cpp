@@ -3005,11 +3005,23 @@ void ComputeNnueNetworkStageValidationChecksums(
         sample.intermediate.cross_feat, work.cross_feat,
         CROSS_OUTPUT_SIZE, sample_index, mismatches[25]);
 
+#if defined(USE_NNUE_PHASE_L2_FIXED_C32)
+    std::int32_t production_scales_q23[PHASE_OUTPUT_SIZE];
+    selected_network.BenchmarkPhaseFixedScalesQ23(
+        sample.intermediate.phase_out, production_scales_q23);
+    selected_network.BenchmarkL2AssemblyQ23(
+        sample.intermediate.ac_sqr_0_out_temp,
+        sample.intermediate.ac_0_out, sample.intermediate.diff_ac_out,
+        sample.intermediate.abs_ac_out, sample.intermediate.abs_sqr_out,
+        sample.intermediate.cross_feat, production_scales_q23,
+        work.l2_input);
+#else
     selected_network.BenchmarkL2Assembly(
         sample.intermediate.ac_sqr_0_out_temp,
         sample.intermediate.ac_0_out, sample.intermediate.diff_ac_out,
         sample.intermediate.abs_ac_out, sample.intermediate.abs_sqr_out,
         sample.intermediate.cross_feat, sample.phase_scales, work.l2_input);
+#endif
     MixNnueBenchRange(recomputed_checksums[26], work.l2_input, L2_REAL_SIZE);
     CompareNnueNetworkStageRange(
         sample.intermediate.l2_input, work.l2_input, L2_REAL_SIZE, sample_index,
@@ -3278,8 +3290,10 @@ std::int32_t ComputeNnueNetworkStagedOutputFromPhaseInput(
   const Network& selected_network =
       NnueBenchSelectedNetwork(selected_bucket);
   selected_network.BenchmarkPhaseProjection(phase_input, work.phase_out);
+#if !defined(USE_NNUE_PHASE_L2_FIXED_C32)
   const auto scales =
       selected_network.BenchmarkPhaseScalesFromOutput(work.phase_out);
+#endif
   selected_network.BenchmarkFmAffine(
       sample.input.diff_transformed.data(),
       sample.input.abs_transformed.data(), work.diff_fc_out,
@@ -3296,10 +3310,20 @@ std::int32_t ComputeNnueNetworkStagedOutputFromPhaseInput(
   selected_network.BenchmarkCross(
       work.ac_sqr_0_out_temp, work.ac_0_out, work.diff_ac_out,
       work.abs_ac_out, work.cross_cat, work.cross_fc_out, work.cross_feat);
+#if defined(USE_NNUE_PHASE_L2_FIXED_C32)
+  std::int32_t production_scales_q23[PHASE_OUTPUT_SIZE];
+  selected_network.BenchmarkPhaseFixedScalesQ23(
+      work.phase_out, production_scales_q23);
+  selected_network.BenchmarkL2AssemblyQ23(
+      work.ac_sqr_0_out_temp, work.ac_0_out, work.diff_ac_out,
+      work.abs_ac_out, work.abs_sqr_out, work.cross_feat,
+      production_scales_q23, work.l2_input);
+#else
   selected_network.BenchmarkL2Assembly(
       work.ac_sqr_0_out_temp, work.ac_0_out, work.diff_ac_out,
       work.abs_ac_out, work.abs_sqr_out, work.cross_feat, scales,
       work.l2_input);
+#endif
 #if defined(USE_AVX2) && !defined(USE_AVX512)
   if constexpr (UseTiledFc1)
     selected_network.BenchmarkFc1OutputTiled(work.l2_input, work.fc_1_out);
@@ -4801,12 +4825,24 @@ NnueBenchTiming MeasureNnueNetworkStageCorpus(
                  work.cross_feat[index % CROSS_OUTPUT_SIZE]) << 48);
     } else if constexpr (Operation ==
                          NetworkStageBenchOperation::L2Assembly) {
+#if defined(USE_NNUE_PHASE_L2_FIXED_C32)
+      std::int32_t production_scales_q23[PHASE_OUTPUT_SIZE];
+      selected_network.BenchmarkPhaseFixedScalesQ23(
+          sample.intermediate.phase_out, production_scales_q23);
+      selected_network.BenchmarkL2AssemblyQ23(
+          sample.intermediate.ac_sqr_0_out_temp,
+          sample.intermediate.ac_0_out, sample.intermediate.diff_ac_out,
+          sample.intermediate.abs_ac_out, sample.intermediate.abs_sqr_out,
+          sample.intermediate.cross_feat, production_scales_q23,
+          work.l2_input);
+#else
       selected_network.BenchmarkL2Assembly(
           sample.intermediate.ac_sqr_0_out_temp,
           sample.intermediate.ac_0_out, sample.intermediate.diff_ac_out,
           sample.intermediate.abs_ac_out, sample.intermediate.abs_sqr_out,
           sample.intermediate.cross_feat, sample.phase_scales,
           work.l2_input);
+#endif
       representative = work.l2_input[index % L2_INPUT_SIZE];
     } else if constexpr (Operation == NetworkStageBenchOperation::Fc1) {
       selected_network.BenchmarkFc1(
@@ -7796,6 +7832,7 @@ struct TraceDeepPath {
   std::array<std::uint32_t, kTracePhaseDimensions> phase_sigmoid_f32_bits;
   std::array<std::uint32_t, kTracePhaseDimensions> phase_value_f32_bits;
   std::array<std::uint32_t, kTracePhaseDimensions> channel_scale_f32_bits;
+  std::array<std::int32_t, kTracePhaseDimensions> channel_scale_q23;
   std::array<std::uint8_t, kTraceLcaQueryInputDimensions> main_raw;
   std::array<std::uint8_t, kTraceLcaQueryInputDimensions> main_squared;
   std::array<std::uint8_t, kTraceCrossInputDimensions> cross_main_squared;
@@ -8221,6 +8258,26 @@ bool MakeNnueTraceSnapshot(const std::string& sfen,
   std::copy_n(lca_buffer.cross_feat, CROSS_OUTPUT_SIZE,
               deep_path.cross_output.begin());
 
+#if defined(USE_NNUE_PHASE_L2_FIXED_C32)
+  std::int32_t phase_scales_q23[PHASE_OUTPUT_SIZE];
+  selected_network->BenchmarkPhaseFixedScalesQ23(
+      lca_buffer.phase_out, phase_scales_q23);
+  std::fill(deep_path.channel_scale_q23.begin(),
+            deep_path.channel_scale_q23.end(), 0);
+  for (std::size_t index = 0; index < PHASE_OUTPUT_SIZE; ++index) {
+#if defined(NNUE_COMPACT_PHASE5)
+    const std::size_t semantic_index = semantic_channels[index];
+#else
+    const std::size_t semantic_index = index;
+#endif
+    deep_path.channel_scale_q23[semantic_index] = phase_scales_q23[index];
+  }
+  selected_network->BenchmarkL2AssemblyQ23(
+      lca_buffer.ac_sqr_0_out_temp, lca_buffer.ac_0_out,
+      lca_buffer.diff_ac_out, lca_buffer.abs_ac_out,
+      lca_buffer.abs_sqr_out, lca_buffer.cross_feat,
+      phase_scales_q23, lca_buffer.l2_input);
+#else
   for (std::size_t index = 0; index < kTraceLcaQueryInputDimensions; ++index) {
     lca_buffer.l2_input[index] = static_cast<std::uint8_t>(
         std::clamp<int>(lca_buffer.ac_sqr_0_out_temp[index]
@@ -8250,6 +8307,7 @@ bool MakeNnueTraceSnapshot(const std::string& sfen,
         std::clamp<int>(lca_buffer.cross_feat[index] * channel_scales[5],
                         0, 127));
   std::memset(lca_buffer.l2_input + L2_REAL_SIZE, 0, L2_PADDING_SIZE);
+#endif
   std::copy_n(lca_buffer.l2_input, kTraceBucketInputDimensions,
               deep_path.fc1_input.begin());
 
@@ -8600,6 +8658,8 @@ bool WriteNnueTrace(const NnueTraceSnapshot& snapshot,
                   snapshot.deep_path.phase_value_f32_bits);
   WriteTraceArray(output, "deep.phase.channel_scale_f32_bits", "u32",
                   snapshot.deep_path.channel_scale_f32_bits);
+  WriteTraceArray(output, "deep.phase.channel_scale_q23", "i32",
+                  snapshot.deep_path.channel_scale_q23);
   WriteTraceArray(output, "deep.main.raw", "u8",
                   snapshot.deep_path.main_raw);
   WriteTraceArray(output, "deep.main.squared", "u8",

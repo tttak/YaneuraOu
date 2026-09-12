@@ -46,15 +46,49 @@ constexpr IndexType kHidden1Dims = 31;
 	&& (!defined(NNUE_COMPACT_PHASE5) || !defined(USE_NNUE_FC1_WIDTH_64))
 #error USE_NNUE_CROSS_WIDTH_24 requires the Phase5, L2x160, FC1x64 architecture
 #endif
+#if defined(USE_NNUE_L2_PHYSICAL_128) \
+	&& (!defined(NNUE_COMPACT_PHASE5) || !defined(USE_NNUE_FC1_WIDTH_64))
+#error USE_NNUE_L2_PHYSICAL_128 requires the Phase5, NoAbsSqr, FC1x64 architecture
+#endif
+#if defined(USE_NNUE_L2_PHYSICAL_128) && defined(USE_NNUE_CROSS_WIDTH_24)
+#error USE_NNUE_L2_PHYSICAL_128 and USE_NNUE_CROSS_WIDTH_24 are mutually exclusive
+#endif
 
-#if defined(USE_NNUE_CROSS_WIDTH_24)
+#if defined(USE_NNUE_L2_PHYSICAL_128)
+constexpr IndexType CROSS_OUTPUT_SIZE = 16;
+#elif defined(USE_NNUE_CROSS_WIDTH_24)
 constexpr IndexType CROSS_OUTPUT_SIZE = 24;
 #else
 constexpr IndexType CROSS_OUTPUT_SIZE = 32;
 #endif
 
-#if defined(USE_NNUE_ABS_SQR_REMOVED_160)
+#if defined(USE_NNUE_L2_PHYSICAL_128)
+constexpr IndexType L2_INPUT_SIZE = 128;
+constexpr IndexType L2_DIFF_OFFSET = 62;
+constexpr IndexType L2_DIFF_SIZE = 24;
+constexpr IndexType L2_ABS_RAW_OFFSET = 86;
+constexpr IndexType L2_ABS_RAW_SIZE = 24;
+constexpr IndexType L2_CROSS_OFFSET = 110;
+constexpr IndexType L2_REAL_SIZE = 126;
+constexpr IndexType L2_LOGICAL_SIZE = 128;
+constexpr IndexType L2_PADDING_SIZE = 2;
+constexpr IndexType PHASE_OUTPUT_SIZE = 5;
+constexpr IndexType PHASE_CROSS_INDEX = 4;
+
+// Fixed by the Python zero-mask contribution ranking.  FM remains 32-wide
+// for LCA; only these ordered units are consumed by the compact L2 input.
+constexpr std::array<IndexType, L2_DIFF_SIZE> L2_DIFF_SOURCE_UNITS = {
+	2, 10, 14, 13, 8, 6, 5, 28, 11, 3, 1, 15,
+	7, 9, 12, 4, 0, 23, 27, 24, 20, 16, 22, 17};
+constexpr std::array<IndexType, L2_ABS_RAW_SIZE> L2_ABS_RAW_SOURCE_UNITS = {
+	10, 20, 28, 21, 8, 15, 4, 9, 19, 13, 17, 18,
+	3, 1, 6, 25, 24, 0, 14, 12, 2, 22, 5, 31};
+#elif defined(USE_NNUE_ABS_SQR_REMOVED_160)
 constexpr IndexType L2_INPUT_SIZE = 160;
+constexpr IndexType L2_DIFF_OFFSET = 62;
+constexpr IndexType L2_DIFF_SIZE = 32;
+constexpr IndexType L2_ABS_RAW_OFFSET = 94;
+constexpr IndexType L2_ABS_RAW_SIZE = 32;
 constexpr IndexType L2_CROSS_OFFSET = 126;
 constexpr IndexType L2_REAL_SIZE = L2_CROSS_OFFSET + CROSS_OUTPUT_SIZE;
 constexpr IndexType L2_LOGICAL_SIZE = L2_REAL_SIZE + 2;
@@ -68,6 +102,10 @@ constexpr IndexType PHASE_CROSS_INDEX = 5;
 #endif
 #else
 constexpr IndexType L2_INPUT_SIZE = 192;
+constexpr IndexType L2_DIFF_OFFSET = 62;
+constexpr IndexType L2_DIFF_SIZE = 32;
+constexpr IndexType L2_ABS_RAW_OFFSET = 94;
+constexpr IndexType L2_ABS_RAW_SIZE = 32;
 constexpr IndexType L2_REAL_SIZE = 190;
 constexpr IndexType L2_LOGICAL_SIZE = 192;
 constexpr IndexType L2_PADDING_SIZE = L2_INPUT_SIZE - L2_REAL_SIZE;
@@ -134,7 +172,9 @@ struct Network {
 		// Same serialized hash derivation as the Python writer, with fc_1
 		// output width 64 instead of 96.  This prevents a 96-wide network
 		// from being accepted silently by the optional 64-wide build.
-		#if defined(USE_NNUE_CROSS_WIDTH_24)
+		#if defined(USE_NNUE_L2_PHYSICAL_128)
+			return 0x6344EA56u;
+		#elif defined(USE_NNUE_CROSS_WIDTH_24)
 			// Cross24 files use logical 24-output Cross and 152-input L2,
 			// padded to 32 output rows and 160 input columns on disk.
 			return 0x63726A46u;
@@ -157,7 +197,9 @@ struct Network {
 	static std::string GetStructureString() {
 #if defined(NNUE_COMPACT_PHASE5)
 	#if defined(USE_NNUE_FC1_WIDTH_64)
-		#if defined(USE_NNUE_CROSS_WIDTH_24)
+		#if defined(USE_NNUE_L2_PHYSICAL_128)
+			return "HalfKA-KSDG3_FM-1280-L2x128-NoAbsSqr-Phase5-FC1x64-Cross16-FMDiff24-FMAbsRaw24";
+		#elif defined(USE_NNUE_CROSS_WIDTH_24)
 			return "HalfKA-KSDG3_FM-1280-L2x160-NoAbsSqr-Phase5-FC1x64-Cross24";
 		#else
 			return "HalfKA-KSDG3_FM-1280-L2x160-NoAbsSqr-Phase5-FC1x64";
@@ -619,9 +661,10 @@ struct Network {
 
 	static inline void PropagateCrossActivation(
 		const std::int32_t* input, std::uint8_t* output) {
-#if defined(USE_NNUE_CROSS_WIDTH_24) && defined(USE_AVX2)
-		// ClippedReLUExplicit<24> cannot use its 32-element AVX2 kernel.
-		// Convert three independent groups of eight with the same operation
+#if (defined(USE_NNUE_CROSS_WIDTH_24) || defined(USE_NNUE_L2_PHYSICAL_128)) \
+	&& defined(USE_AVX2)
+		// Non-32 Cross widths cannot use the 32-element AVX2 kernel.
+		// Convert independent groups of eight with the same operation
 		// order as the generic layer: saturating int32->int16 pack, signed
 		// >> kWeightScaleBits, saturating int16->int8 pack, max with zero.
 		// Keeping only two XMM input registers per group limits register use.
@@ -642,6 +685,103 @@ struct Network {
 		activation.Propagate(input, output);
 #endif
 	}
+
+#if defined(USE_NNUE_L2_PHYSICAL_128)
+	static inline void GatherCompactDiff24(
+		const std::uint8_t* input, std::uint8_t* output) {
+#if defined(USE_AVX2)
+		const __m128i lo = _mm_loadu_si128(
+			reinterpret_cast<const __m128i*>(input));
+		const __m128i hi = _mm_loadu_si128(
+			reinterpret_cast<const __m128i*>(input + 16));
+		const __m128i first = _mm_or_si128(
+			_mm_shuffle_epi8(lo, _mm_setr_epi8(
+				2, 10, 14, 13, 8, 6, 5, char(0x80), 11, 3, 1, 15, 7, 9, 12, 4)),
+			_mm_shuffle_epi8(hi, _mm_setr_epi8(
+				char(0x80), char(0x80), char(0x80), char(0x80),
+				char(0x80), char(0x80), char(0x80), 12,
+				char(0x80), char(0x80), char(0x80), char(0x80),
+				char(0x80), char(0x80), char(0x80), char(0x80))));
+		const __m128i second = _mm_or_si128(
+			_mm_shuffle_epi8(lo, _mm_setr_epi8(
+				0, char(0x80), char(0x80), char(0x80), char(0x80),
+				char(0x80), char(0x80), char(0x80),
+				char(0x80), char(0x80), char(0x80), char(0x80),
+				char(0x80), char(0x80), char(0x80), char(0x80))),
+			_mm_shuffle_epi8(hi, _mm_setr_epi8(
+				char(0x80), 7, 11, 8, 4, 0, 6, 1,
+				char(0x80), char(0x80), char(0x80), char(0x80),
+				char(0x80), char(0x80), char(0x80), char(0x80))));
+		_mm_storeu_si128(reinterpret_cast<__m128i*>(output), first);
+		_mm_storel_epi64(reinterpret_cast<__m128i*>(output + 16), second);
+#else
+		for (std::size_t i = 0; i < L2_DIFF_SOURCE_UNITS.size(); ++i)
+			output[i] = input[L2_DIFF_SOURCE_UNITS[i]];
+#endif
+	}
+
+	static inline void GatherCompactAbs24(
+		const std::uint8_t* input, std::uint8_t* output) {
+#if defined(USE_AVX2)
+		const __m128i lo = _mm_loadu_si128(
+			reinterpret_cast<const __m128i*>(input));
+		const __m128i hi = _mm_loadu_si128(
+			reinterpret_cast<const __m128i*>(input + 16));
+		const __m128i first = _mm_or_si128(
+			_mm_shuffle_epi8(lo, _mm_setr_epi8(
+				10, char(0x80), char(0x80), char(0x80), 8, 15, 4, 9,
+				char(0x80), 13, char(0x80), char(0x80), 3, 1, 6, char(0x80))),
+			_mm_shuffle_epi8(hi, _mm_setr_epi8(
+				char(0x80), 4, 12, 5, char(0x80), char(0x80),
+				char(0x80), char(0x80), 3, char(0x80), 1, 2,
+				char(0x80), char(0x80), char(0x80), 9)));
+		const __m128i second = _mm_or_si128(
+			_mm_shuffle_epi8(lo, _mm_setr_epi8(
+				char(0x80), 0, 14, 12, 2, char(0x80), 5, char(0x80),
+				char(0x80), char(0x80), char(0x80), char(0x80),
+				char(0x80), char(0x80), char(0x80), char(0x80))),
+			_mm_shuffle_epi8(hi, _mm_setr_epi8(
+				8, char(0x80), char(0x80), char(0x80), char(0x80), 6,
+				char(0x80), 15, char(0x80), char(0x80), char(0x80),
+				char(0x80), char(0x80), char(0x80), char(0x80), char(0x80))));
+		_mm_storeu_si128(reinterpret_cast<__m128i*>(output), first);
+		_mm_storel_epi64(reinterpret_cast<__m128i*>(output + 16), second);
+#else
+		for (std::size_t i = 0; i < L2_ABS_RAW_SOURCE_UNITS.size(); ++i)
+			output[i] = input[L2_ABS_RAW_SOURCE_UNITS[i]];
+#endif
+	}
+
+	static inline void AssembleCompactDiffL2ChannelQ23(
+		const std::uint8_t* input, std::uint8_t* output,
+		const std::int32_t scale_q23) {
+		alignas(kCacheLineSize) std::uint8_t scaled[32];
+		AssembleL2ChannelQ23<32>(input, scaled, scale_q23);
+		GatherCompactDiff24(scaled, output);
+	}
+
+	static inline void AssembleCompactAbsL2ChannelQ23(
+		const std::uint8_t* input, std::uint8_t* output,
+		const std::int32_t scale_q23) {
+		alignas(kCacheLineSize) std::uint8_t scaled[32];
+		AssembleL2ChannelQ23<32>(input, scaled, scale_q23);
+		GatherCompactAbs24(scaled, output);
+	}
+
+	static inline void AssembleCompactDiffL2Channel(
+		const std::uint8_t* input, std::uint8_t* output, const float scale) {
+		alignas(kCacheLineSize) std::uint8_t scaled[32];
+		AssembleL2Channel<32>(input, scaled, scale);
+		GatherCompactDiff24(scaled, output);
+	}
+
+	static inline void AssembleCompactAbsL2Channel(
+		const std::uint8_t* input, std::uint8_t* output, const float scale) {
+		alignas(kCacheLineSize) std::uint8_t scaled[32];
+		AssembleL2Channel<32>(input, scaled, scale);
+		GatherCompactAbs24(scaled, output);
+	}
+#endif
 
 	template<bool UsePhasePrefix = true, bool PhaseInputPrepared = false,
 #if defined(USE_NNUE_PHASE_L2_FIXED_C32)
@@ -907,7 +1047,10 @@ struct Network {
 			// the exact sum is at most 32*127=4064 (fits uint16_t).
 			__m256i values = _mm256_load_si256(
 				reinterpret_cast<const __m256i*>(buf.cross_feat));
-#if defined(USE_NNUE_CROSS_WIDTH_24)
+#if defined(USE_NNUE_L2_PHYSICAL_128)
+			// Ignore the unused high 16 bytes of the padded output buffer.
+			values = _mm256_and_si256(values, _mm256_set_epi64x(0, 0, -1, -1));
+#elif defined(USE_NNUE_CROSS_WIDTH_24)
 			// Ignore the unused high eight bytes of the padded output buffer.
 			values = _mm256_and_si256(values, _mm256_set_epi64x(0, -1, -1, -1));
 #endif
@@ -946,7 +1089,9 @@ struct Network {
 #if defined(USE_AVX2)
 			__m256i values = _mm256_load_si256(
 				reinterpret_cast<const __m256i*>(buf.cross_feat));
-#if defined(USE_NNUE_CROSS_WIDTH_24)
+#if defined(USE_NNUE_L2_PHYSICAL_128)
+			values = _mm256_and_si256(values, _mm256_set_epi64x(0, 0, -1, -1));
+#elif defined(USE_NNUE_CROSS_WIDTH_24)
 			values = _mm256_and_si256(values, _mm256_set_epi64x(0, -1, -1, -1));
 #endif
 			__m128i maximum = _mm_max_epu8(
@@ -973,8 +1118,15 @@ struct Network {
 		if constexpr (UseFixedPhaseL2) {
 			AssembleL2ChannelQ23<31>(buf.ac_sqr_0_out_temp, &buf.l2_input[0], phase_scales_q23[0]);
 			AssembleL2ChannelQ23<31>(buf.ac_0_out, &buf.l2_input[31], phase_scales_q23[1]);
-			AssembleL2ChannelQ23<32>(buf.diff_ac_out, &buf.l2_input[62], phase_scales_q23[2]);
-			AssembleL2ChannelQ23<32>(buf.abs_ac_out, &buf.l2_input[94], phase_scales_q23[3]);
+#if defined(USE_NNUE_L2_PHYSICAL_128)
+			AssembleCompactDiffL2ChannelQ23(buf.diff_ac_out,
+				&buf.l2_input[L2_DIFF_OFFSET], phase_scales_q23[2]);
+			AssembleCompactAbsL2ChannelQ23(buf.abs_ac_out,
+				&buf.l2_input[L2_ABS_RAW_OFFSET], phase_scales_q23[3]);
+#else
+			AssembleL2ChannelQ23<32>(buf.diff_ac_out, &buf.l2_input[L2_DIFF_OFFSET], phase_scales_q23[2]);
+			AssembleL2ChannelQ23<32>(buf.abs_ac_out, &buf.l2_input[L2_ABS_RAW_OFFSET], phase_scales_q23[3]);
+#endif
 #if !defined(USE_NNUE_ABS_SQR_REMOVED_160)
 			AssembleL2ChannelQ23<32>(buf.abs_sqr_out, &buf.l2_input[126], phase_scales_q23[4]);
 #endif
@@ -982,8 +1134,15 @@ struct Network {
 		} else {
 			AssembleL2Channel<31>(buf.ac_sqr_0_out_temp, &buf.l2_input[0], main_sqr_scale);
 			AssembleL2Channel<31>(buf.ac_0_out, &buf.l2_input[31], main_raw_scale);
-			AssembleL2Channel<32>(buf.diff_ac_out, &buf.l2_input[62], diff_scale);
-			AssembleL2Channel<32>(buf.abs_ac_out, &buf.l2_input[94], abs_raw_scale);
+#if defined(USE_NNUE_L2_PHYSICAL_128)
+			AssembleCompactDiffL2Channel(buf.diff_ac_out,
+				&buf.l2_input[L2_DIFF_OFFSET], diff_scale);
+			AssembleCompactAbsL2Channel(buf.abs_ac_out,
+				&buf.l2_input[L2_ABS_RAW_OFFSET], abs_raw_scale);
+#else
+			AssembleL2Channel<32>(buf.diff_ac_out, &buf.l2_input[L2_DIFF_OFFSET], diff_scale);
+			AssembleL2Channel<32>(buf.abs_ac_out, &buf.l2_input[L2_ABS_RAW_OFFSET], abs_raw_scale);
+#endif
 #if !defined(USE_NNUE_ABS_SQR_REMOVED_160)
 			AssembleL2Channel<32>(buf.abs_sqr_out, &buf.l2_input[126], abs_sqr_scale);
 #endif
@@ -1166,6 +1325,11 @@ struct Network {
 	void BenchmarkPhaseProjection(const std::uint8_t* phase_input,
 		std::int32_t* phase_output) const {
 		phase_proj.PropagatePrefix<PHASE_OUTPUT_SIZE>(phase_input, phase_output);
+	}
+
+	void BenchmarkPhaseFixedScalesQ23(const std::int32_t* phase_output,
+		std::int32_t* scales_q23) const {
+		ComputePhaseFixedC32ScalesQ23(phase_output, scales_q23);
 	}
 
 	void BenchmarkPhaseSigmoid(const std::int32_t* phase_output,
@@ -1574,8 +1738,15 @@ struct Network {
 		std::uint8_t* output) const {
 		AssembleL2Channel<31>(main_sqr, output, scales.main_sqr);
 		AssembleL2Channel<31>(main_raw, output + 31, scales.main_raw);
-		AssembleL2Channel<32>(diff_input, output + 62, scales.diff);
-		AssembleL2Channel<32>(abs_input, output + 94, scales.abs_raw);
+#if defined(USE_NNUE_L2_PHYSICAL_128)
+		AssembleCompactDiffL2Channel(diff_input, output + L2_DIFF_OFFSET,
+			scales.diff);
+		AssembleCompactAbsL2Channel(abs_input, output + L2_ABS_RAW_OFFSET,
+			scales.abs_raw);
+#else
+		AssembleL2Channel<32>(diff_input, output + L2_DIFF_OFFSET, scales.diff);
+		AssembleL2Channel<32>(abs_input, output + L2_ABS_RAW_OFFSET, scales.abs_raw);
+#endif
 #if !defined(USE_NNUE_ABS_SQR_REMOVED_160)
 		AssembleL2Channel<32>(abs_sqr, output + 126, scales.abs_sqr);
 #else
@@ -1599,8 +1770,15 @@ struct Network {
 		std::uint8_t* output) const {
 		BenchmarkAssembleL2ChannelQ23<31>(main_sqr, output, scales_q23[0]);
 		BenchmarkAssembleL2ChannelQ23<31>(main_raw, output + 31, scales_q23[1]);
-		BenchmarkAssembleL2ChannelQ23<32>(diff_input, output + 62, scales_q23[2]);
-		BenchmarkAssembleL2ChannelQ23<32>(abs_input, output + 94, scales_q23[3]);
+#if defined(USE_NNUE_L2_PHYSICAL_128)
+		AssembleCompactDiffL2ChannelQ23(diff_input, output + L2_DIFF_OFFSET,
+			scales_q23[2]);
+		AssembleCompactAbsL2ChannelQ23(abs_input, output + L2_ABS_RAW_OFFSET,
+			scales_q23[3]);
+#else
+		BenchmarkAssembleL2ChannelQ23<32>(diff_input, output + L2_DIFF_OFFSET, scales_q23[2]);
+		BenchmarkAssembleL2ChannelQ23<32>(abs_input, output + L2_ABS_RAW_OFFSET, scales_q23[3]);
+#endif
 #if !defined(USE_NNUE_ABS_SQR_REMOVED_160)
 		BenchmarkAssembleL2ChannelQ23<32>(abs_sqr, output + 126, scales_q23[4]);
 #else

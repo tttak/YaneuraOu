@@ -359,25 +359,37 @@ namespace {
 			return Tools::ResultCode::FileMismatch;
 		}
 #else
+#if defined(USE_NNUE_L2_PHYSICAL_128)
+		if (architecture.find("-L2x128-NoAbsSqr-Phase5-FC1x64-Cross16-FMDiff24-FMAbsRaw24")
+			== std::string::npos) {
+			sync_cout << "info string NNUE architecture mismatch: this binary requires the L2x128/Cross16/FMDiff24/FMAbsRaw24 architecture, got "
+				<< architecture << sync_endl;
+			return Tools::ResultCode::FileMismatch;
+		}
+#else
 		if (architecture.find("-L2x160-NoAbsSqr-Phase5") == std::string::npos) {
 			sync_cout << "info string NNUE architecture mismatch: this binary requires L2x160-NoAbsSqr-Phase5, got "
 				<< architecture << sync_endl;
 			return Tools::ResultCode::FileMismatch;
 		}
+#endif
 #if defined(USE_NNUE_FC1_WIDTH_64)
 		if (architecture.find("-Phase5-FC1x64") == std::string::npos) {
 			sync_cout << "info string NNUE architecture mismatch: this binary requires FC1x64, got "
 				<< architecture << sync_endl;
 			return Tools::ResultCode::FileMismatch;
 		}
-#if defined(USE_NNUE_CROSS_WIDTH_24)
+#if defined(USE_NNUE_L2_PHYSICAL_128)
+		// Full compact128 marker was checked above.
+#elif defined(USE_NNUE_CROSS_WIDTH_24)
 		if (architecture.find("-FC1x64-Cross24") == std::string::npos) {
 			sync_cout << "info string NNUE architecture mismatch: this binary requires Cross24, got "
 				<< architecture << sync_endl;
 			return Tools::ResultCode::FileMismatch;
 		}
 #else
-		if (architecture.find("-Cross24") != std::string::npos) {
+		if (architecture.find("-Cross24") != std::string::npos
+			|| architecture.find("-L2x128-") != std::string::npos) {
 			sync_cout << "info string NNUE architecture mismatch: this binary requires Cross32, got "
 				<< architecture << sync_endl;
 			return Tools::ResultCode::FileMismatch;

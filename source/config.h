@@ -380,6 +380,7 @@
 // #define ENABLE_NNUE_CROSS_LMR_EXPERIMENT // Cross maxによるLMR +1 plyの診断A/B
 // #define USE_NNUE_PHASE_FM_LMR   // Router非対象の高評価・低FM relianceを明示的に+1 ply
 #define USE_NNUE_ABS_SQR_REMOVED_160 // FM AbsSqrをL2から除いた160-input architecture
+// #define DISABLE_NNUE_L2_PHYSICAL_128 // production既定のcompact128を従来のphysical160へ戻す
 // #define DISABLE_NNUE_FC1_WIDTH_64 // production既定のfc_1幅64を従来の幅96へ戻す
 // #define DISABLE_NNUE_PHASE_L2_FIXED_C32 // production既定のC32 Phase/L2を比較時に無効化
 // #define DISABLE_NNUE_LCA_LMR    // 295/epoch20用LCA top-1% LMRを比較時に無効化
@@ -418,7 +419,17 @@
 
 // Cross出力幅24のoptional architecture。既定は従来どおりCross32。
 // 有効時は専用のCross24 nn.binが必要で、Phase5/L2x160/FC1x64を前提とする。
+// compact128既定ON後に使用する場合はDISABLE_NNUE_L2_PHYSICAL_128も定義する。
 // #define USE_NNUE_CROSS_WIDTH_24
+
+// SFNNwoP1536ではL2 physical 128を標準使用する。
+// Cross16、FM Diff24、FM AbsRaw24の専用nn.binが必要。
+// 比較・検証用buildではDISABLE_NNUE_L2_PHYSICAL_128を定義して
+// 従来のphysical 160へ戻せる。
+#if defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536) \
+	&& !defined(DISABLE_NNUE_L2_PHYSICAL_128)
+	#define USE_NNUE_L2_PHYSICAL_128
+#endif
 
 // SFNNwoP1536ではPhase5 C32 Q15 nearest LUTとQ23 integer L2を標準使用する。
 // 比較・検証用buildではDISABLE_NNUE_PHASE_L2_FIXED_C32を定義して無効化できる。
