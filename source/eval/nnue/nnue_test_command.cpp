@@ -3469,7 +3469,7 @@ NnueBenchLcaDerivedDiagnostics MakeNnueBenchLcaDerivedDiagnostics(
     const std::int32_t* query_output, const std::int32_t* key_output,
     const std::int32_t* value_output) {
   NnueBenchLcaDerivedDiagnostics result;
-  for (int j = 0; j < 32; ++j)
+  for (IndexType j = 0; j < LCA_QK_SIZE; ++j)
     result.dot_product +=
         (static_cast<float>(query_output[j]) / 8128.0f)
         * (static_cast<float>(key_output[j]) / 8128.0f);
@@ -3480,7 +3480,8 @@ NnueBenchLcaDerivedDiagnostics MakeNnueBenchLcaDerivedDiagnostics(
 
   for (int j = 0; j < 32; ++j) {
     const float current_diff = static_cast<float>(diff_input[j]) / 127.0f;
-    const float value = static_cast<float>(value_output[j]) / 8128.0f;
+    const float value = static_cast<float>(Network::LcaValueForDiffChannel(
+        value_output, j)) / 8128.0f;
     result.value_clamped[j] =
         std::max(0.0f, std::min(1.0f, value * 0.4f + 0.5f));
     const float final_diff =
@@ -3628,11 +3629,11 @@ void ComputeNnueNetworkStageValidationChecksums(
     MixNnueBenchRange(captured_checksums[17], sample.intermediate.fm_cat_uint8,
                       64);
     MixNnueBenchRange(captured_checksums[18], sample.intermediate.lca_q_out,
-                      32);
+                      LCA_QK_SIZE);
     MixNnueBenchRange(captured_checksums[19], sample.intermediate.lca_k_out,
-                      32);
+                      LCA_QK_SIZE);
     MixNnueBenchRange(captured_checksums[20], sample.intermediate.lca_v_out,
-                      32);
+                      LCA_VALUE_SIZE);
     MixNnueBenchFloatBits(captured_checksums[21], sample.lca_dot_product);
     MixNnueBenchFloatBits(captured_checksums[21], sample.lca_attention_logit);
     MixNnueBenchFloatBits(captured_checksums[22], sample.lca_attention_score);
@@ -3803,23 +3804,23 @@ void ComputeNnueNetworkStageValidationChecksums(
 
     selected_network.BenchmarkLcaQuery(
         sample.intermediate.ac_0_out, work.lca_q_out);
-    MixNnueBenchRange(recomputed_checksums[18], work.lca_q_out, 32);
+    MixNnueBenchRange(recomputed_checksums[18], work.lca_q_out, LCA_QK_SIZE);
     CompareNnueNetworkStageRange(
-        sample.intermediate.lca_q_out, work.lca_q_out, 32, sample_index,
+        sample.intermediate.lca_q_out, work.lca_q_out, LCA_QK_SIZE, sample_index,
         mismatches[18]);
 
     selected_network.BenchmarkLcaKey(
         sample.intermediate.fm_cat_uint8, work.lca_k_out);
-    MixNnueBenchRange(recomputed_checksums[19], work.lca_k_out, 32);
+    MixNnueBenchRange(recomputed_checksums[19], work.lca_k_out, LCA_QK_SIZE);
     CompareNnueNetworkStageRange(
-        sample.intermediate.lca_k_out, work.lca_k_out, 32, sample_index,
+        sample.intermediate.lca_k_out, work.lca_k_out, LCA_QK_SIZE, sample_index,
         mismatches[19]);
 
     selected_network.BenchmarkLcaValue(
         sample.intermediate.fm_cat_uint8, work.lca_v_out);
-    MixNnueBenchRange(recomputed_checksums[20], work.lca_v_out, 32);
+    MixNnueBenchRange(recomputed_checksums[20], work.lca_v_out, LCA_VALUE_SIZE);
     CompareNnueNetworkStageRange(
-        sample.intermediate.lca_v_out, work.lca_v_out, 32, sample_index,
+        sample.intermediate.lca_v_out, work.lca_v_out, LCA_VALUE_SIZE, sample_index,
         mismatches[20]);
 
     float lca_dot_product = 0.0f;
@@ -4094,13 +4095,13 @@ void DiagnoseNnueNetworkPhaseAndLca(
         lca_fm_cat, sample.intermediate.fm_cat_uint8, work.fm_cat_uint8, 64,
         sample_index);
     AddNnueBenchIntegerDiagnostic(
-        lca_query, sample.intermediate.lca_q_out, work.lca_q_out, 32,
+        lca_query, sample.intermediate.lca_q_out, work.lca_q_out, LCA_QK_SIZE,
         sample_index);
     AddNnueBenchIntegerDiagnostic(
-        lca_key, sample.intermediate.lca_k_out, work.lca_k_out, 32,
+        lca_key, sample.intermediate.lca_k_out, work.lca_k_out, LCA_QK_SIZE,
         sample_index);
     AddNnueBenchIntegerDiagnostic(
-        lca_value, sample.intermediate.lca_v_out, work.lca_v_out, 32,
+        lca_value, sample.intermediate.lca_v_out, work.lca_v_out, LCA_VALUE_SIZE,
         sample_index);
     AddNnueBenchIntegerDiagnostic(
         lca_diff_before_correction, sample.intermediate.fm_cat_uint8,
@@ -5586,7 +5587,8 @@ NnueBenchTiming MeasureNnueNetworkStageCorpus(
                          NetworkStageBenchOperation::AbsSigmoidGate) {
       selected_network.BenchmarkAbsSigmoidGate(
           sample.intermediate.abs_fc_out, work.lca_q_out);
-      representative = static_cast<std::uint32_t>(work.lca_q_out[index % 32]);
+      representative = static_cast<std::uint32_t>(
+          work.lca_q_out[index % LCA_QK_SIZE]);
     } else if constexpr (Operation ==
                          NetworkStageBenchOperation::AbsGateQuantize) {
       selected_network.BenchmarkAbsGateQuantize(
@@ -5608,9 +5610,10 @@ NnueBenchTiming MeasureNnueNetworkStageCorpus(
                          NetworkStageBenchOperation::MainGateSigmoid) {
       selected_network.BenchmarkMainGateSigmoid(
           sample.intermediate.diff_fc_out, work.lca_q_out);
-      representative = static_cast<std::uint32_t>(work.lca_q_out[index % 32])
+      representative = static_cast<std::uint32_t>(
+          work.lca_q_out[index % LCA_QK_SIZE])
           ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(
-                 work.lca_q_out[(index + 17) % 32])) << 32);
+                 work.lca_q_out[(index + 17) % LCA_QK_SIZE])) << 32);
     } else if constexpr (Operation ==
                          NetworkStageBenchOperation::MainGateApply) {
       selected_network.BenchmarkMainGateApply(
@@ -5651,19 +5654,19 @@ NnueBenchTiming MeasureNnueNetworkStageCorpus(
       selected_network.BenchmarkLcaQuery(
           sample.intermediate.ac_0_out, work.lca_q_out);
       representative = static_cast<std::uint32_t>(
-          work.lca_q_out[index % 32]);
+          work.lca_q_out[index % LCA_QK_SIZE]);
     } else if constexpr (Operation ==
                          NetworkStageBenchOperation::LcaKey) {
       selected_network.BenchmarkLcaKey(
           sample.intermediate.fm_cat_uint8, work.lca_k_out);
       representative = static_cast<std::uint32_t>(
-          work.lca_k_out[index % 32]);
+          work.lca_k_out[index % LCA_QK_SIZE]);
     } else if constexpr (Operation ==
                          NetworkStageBenchOperation::LcaValue) {
       selected_network.BenchmarkLcaValue(
           sample.intermediate.fm_cat_uint8, work.lca_v_out);
       representative = static_cast<std::uint32_t>(
-          work.lca_v_out[index % 32]);
+          work.lca_v_out[index % LCA_VALUE_SIZE]);
     } else if constexpr (Operation ==
                          NetworkStageBenchOperation::LcaDotAndLogit) {
       float dot_product = 0.0f;
@@ -9011,15 +9014,15 @@ bool MakeNnueTraceSnapshot(const std::string& sfen,
                                     lca_buffer.lca_k_out);
   selected_network->lca_v.Propagate(lca_buffer.fm_cat_uint8,
                                     lca_buffer.lca_v_out);
-  std::copy_n(lca_buffer.lca_q_out, kTraceFmHiddenDimensions,
+  std::copy_n(lca_buffer.lca_q_out, LCA_QK_SIZE,
               lca.query_preact.begin());
-  std::copy_n(lca_buffer.lca_k_out, kTraceFmHiddenDimensions,
+  std::copy_n(lca_buffer.lca_k_out, LCA_QK_SIZE,
               lca.key_preact.begin());
-  std::copy_n(lca_buffer.lca_v_out, kTraceFmHiddenDimensions,
+  std::copy_n(lca_buffer.lca_v_out, LCA_VALUE_SIZE,
               lca.value_preact.begin());
 
   float lca_dot_product = 0.0f;
-  for (std::size_t index = 0; index < kTraceFmHiddenDimensions; ++index) {
+  for (std::size_t index = 0; index < LCA_QK_SIZE; ++index) {
     lca_dot_product +=
         (static_cast<float>(lca_buffer.lca_q_out[index]) / 8128.0f)
         * (static_cast<float>(lca_buffer.lca_k_out[index]) / 8128.0f);
@@ -9036,8 +9039,8 @@ bool MakeNnueTraceSnapshot(const std::string& sfen,
   for (std::size_t index = 0; index < kTraceFmHiddenDimensions; ++index) {
     const float current_diff =
         static_cast<float>(fm_path.diff_output_pre_lca[index]) / 127.0f;
-    const float value =
-        static_cast<float>(lca_buffer.lca_v_out[index]) / 8128.0f;
+    const float value = static_cast<float>(Network::LcaValueForDiffChannel(
+        lca_buffer.lca_v_out, static_cast<IndexType>(index))) / 8128.0f;
     const float value_clamped =
         std::clamp(value * 0.4f + 0.5f, 0.0f, 1.0f);
     const float output_post_lca =

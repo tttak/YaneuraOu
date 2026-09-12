@@ -291,7 +291,14 @@ namespace LongEffect
 
 #if defined(ENABLE_NNUE_BENCH) && defined(USE_BOARD_EFFECT_PREV)
   namespace {
-  thread_local bool effect_touched_mask_enabled = false;
+  // A diagnostic build may also carry the production-default KSDG3 path.
+  // Keep that path valid unless a benchmark explicitly selects mask-off.
+  thread_local bool effect_touched_mask_enabled =
+#if defined(USE_NNUE_KSDG3_EFFECT_TOUCHED_MASK)
+      true;
+#else
+      false;
+#endif
   thread_local EffectTouchedBenchmarkStats* effect_touched_stats = nullptr;
 
   class EffectTouchedCollector {

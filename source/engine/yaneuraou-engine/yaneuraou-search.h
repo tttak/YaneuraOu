@@ -29,7 +29,11 @@ struct SearchOptions
         generate_all_legal_moves = false;
         enteringKingRule         = EKR_27_POINT;
 #if defined(USE_NNUE_LCA_LMR)
+#if defined(NNUE_LCA_LMR_FIXED_THRESHOLD)
+        nnue_lca_lmr_threshold   = NNUE_LCA_LMR_FIXED_THRESHOLD;
+#else
         nnue_lca_lmr_threshold   = 1959;
+#endif
 #endif
         lastPvInfoTime           = 0;
         computed_pv_interval     = 0;

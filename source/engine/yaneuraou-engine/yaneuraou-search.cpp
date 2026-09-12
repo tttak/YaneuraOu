@@ -158,7 +158,12 @@ void SearchOptions::add_options(OptionsMap& options) {
                 }));
 
 #if defined(USE_NNUE_LCA_LMR)
-    options.add("NnueLcaLmrThreshold", Option(1959, 0, 4064, [&](const Option& o) {
+#if defined(NNUE_LCA_LMR_FIXED_THRESHOLD)
+    constexpr int NnueLcaLmrOptionDefault = NNUE_LCA_LMR_FIXED_THRESHOLD;
+#else
+    constexpr int NnueLcaLmrOptionDefault = 1959;
+#endif
+    options.add("NnueLcaLmrThreshold", Option(NnueLcaLmrOptionDefault, 0, 4064, [&](const Option& o) {
                     nnue_lca_lmr_threshold = int(o);
                     return std::nullopt;
                 }));
@@ -3892,7 +3897,11 @@ moves_loop:  // When in check, search starts here
             // that a zero reduction can never become an extension.
             if (!nnueRouterLmrActuallyAdjusted && nnueRouterLmrSignal.valid
                 && nnueRouterLmrSignal.lca_abs_delta_sum
+#if defined(NNUE_LCA_LMR_FIXED_THRESHOLD)
+                     >= NNUE_LCA_LMR_FIXED_THRESHOLD
+#else
                      >= search_options.nnue_lca_lmr_threshold
+#endif
                 && d < newDepth) {
                 ++d;
 #if defined(USE_NNUE_CROSS_LMR)

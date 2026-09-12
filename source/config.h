@@ -379,6 +379,8 @@
 // #define ENABLE_NNUE_RFP_SHADOW  // 成立したreverse futilityの一部をshadow探索
 // #define ENABLE_NNUE_CROSS_LMR_EXPERIMENT // Cross maxによるLMR +1 plyの診断A/B
 // #define USE_NNUE_PHASE_FM_LMR   // Router非対象の高評価・低FM relianceを明示的に+1 ply
+// #define USE_NNUE_LCA_WIDTH_24   // optional LCA 24d architecture（32d既定）
+// #define USE_NNUE_LCA_WIDTH_16   // optional LCA 16d architecture（32d既定）
 #define USE_NNUE_ABS_SQR_REMOVED_160 // FM AbsSqrをL2から除いた160-input architecture
 // #define DISABLE_NNUE_L2_PHYSICAL_128 // production既定のcompact128を従来のphysical160へ戻す
 // #define DISABLE_NNUE_FC1_WIDTH_64 // production既定のfc_1幅64を従来の幅96へ戻す
@@ -466,6 +468,14 @@
 // Router-LMRと重複しないmoveへ使用する。診断logger側は専用experiment実装を
 // 使用するため、loggerなしのproduction相当buildだけを既定ONにする。
 // 境界値は評価関数ごとにNnueLcaLmrThreshold USI optionで設定する。
+// 再現測定用binaryでは、例えば
+//   -DNNUE_LCA_LMR_FIXED_THRESHOLD=1968
+// とするとUSI optionではなくcompile-time固定値を探索判定に使用する。
+// production既定buildでは未定義のままとし、従来どおりUSI optionを使用する。
+#if defined(NNUE_LCA_LMR_FIXED_THRESHOLD) \
+	&& (NNUE_LCA_LMR_FIXED_THRESHOLD < 0 || NNUE_LCA_LMR_FIXED_THRESHOLD > 4064)
+	#error "NNUE_LCA_LMR_FIXED_THRESHOLD must be in [0, 4064]"
+#endif
 #if defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536) \
 	&& !defined(ENABLE_NNUE_SIGNAL_LOG) \
 	&& !defined(DISABLE_NNUE_LCA_LMR)

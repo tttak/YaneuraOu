@@ -53,6 +53,39 @@ constexpr IndexType kHidden1Dims = 31;
 #if defined(USE_NNUE_L2_PHYSICAL_128) && defined(USE_NNUE_CROSS_WIDTH_24)
 #error USE_NNUE_L2_PHYSICAL_128 and USE_NNUE_CROSS_WIDTH_24 are mutually exclusive
 #endif
+#if defined(USE_NNUE_LCA_WIDTH_24) && defined(USE_NNUE_LCA_WIDTH_16)
+#error USE_NNUE_LCA_WIDTH_24 and USE_NNUE_LCA_WIDTH_16 are mutually exclusive
+#endif
+#if (defined(USE_NNUE_LCA_WIDTH_24) || defined(USE_NNUE_LCA_WIDTH_16)) \
+	&& !defined(USE_NNUE_L2_PHYSICAL_128)
+#error Compact LCA architectures require the production compact128 architecture
+#endif
+
+#if defined(USE_NNUE_LCA_WIDTH_24)
+constexpr IndexType LCA_QK_SIZE = 24;
+constexpr IndexType LCA_VALUE_SIZE = 24;
+constexpr std::array<IndexType, 24> LCA_VALUE_SOURCE_UNITS = {
+	15, 9, 1, 2, 7, 5, 8, 14, 3, 11, 28, 6,
+	4, 24, 20, 31, 0, 16, 23, 29, 13, 17, 27, 22};
+constexpr std::array<IndexType, 8> LCA_VALUE_OMITTED_UNITS = {
+	10, 12, 18, 19, 21, 25, 26, 30};
+constexpr std::array<std::int8_t, 32> LCA_VALUE_COMPACT_INDEX = {
+	16, 2, 3, 8, 12, 5, 11, 4, 6, 1, -1, 9, -1, 20, 7, 0,
+	17, 21, -1, -1, 14, -1, 23, 18, 13, -1, -1, 22, 10, 19, -1, 15};
+#elif defined(USE_NNUE_LCA_WIDTH_16)
+constexpr IndexType LCA_QK_SIZE = 16;
+constexpr IndexType LCA_VALUE_SIZE = 16;
+constexpr std::array<IndexType, 16> LCA_VALUE_SOURCE_UNITS = {
+	15, 9, 1, 2, 7, 5, 8, 14, 3, 11, 28, 6, 4, 24, 20, 31};
+constexpr std::array<IndexType, 16> LCA_VALUE_OMITTED_UNITS = {
+	0, 10, 12, 13, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 29, 30};
+constexpr std::array<std::int8_t, 32> LCA_VALUE_COMPACT_INDEX = {
+	-1, 2, 3, 8, 12, 5, 11, 4, 6, 1, -1, 9, -1, -1, 7, 0,
+	-1, -1, -1, -1, 14, -1, -1, -1, 13, -1, -1, -1, 10, -1, -1, 15};
+#else
+constexpr IndexType LCA_QK_SIZE = 32;
+constexpr IndexType LCA_VALUE_SIZE = 32;
+#endif
 
 #if defined(USE_NNUE_L2_PHYSICAL_128)
 constexpr IndexType CROSS_OUTPUT_SIZE = 16;
@@ -150,9 +183,9 @@ struct Network {
 
 	// --- LCA (Lightweight Cross-Attention): コンテキストの動的統合 ---
 	// Query = MainPath(31), Key/Value = FM(64)
-	Layers::AffineTransformExplicit<31, 32> lca_q;
-	Layers::AffineTransformExplicit<64, 32> lca_k;
-	Layers::AffineTransformExplicit<64, 32> lca_v;
+	Layers::AffineTransformExplicit<31, LCA_QK_SIZE> lca_q;
+	Layers::AffineTransformExplicit<64, LCA_QK_SIZE> lca_k;
+	Layers::AffineTransformExplicit<64, LCA_VALUE_SIZE> lca_v;
 	float lca_temp; // Attention temperature (learned)
 
 	// --- Phase Gate: 局面の進行度・激しさに基づく信号強度の動的制御 ---
@@ -173,7 +206,13 @@ struct Network {
 		// output width 64 instead of 96.  This prevents a 96-wide network
 		// from being accepted silently by the optional 64-wide build.
 		#if defined(USE_NNUE_L2_PHYSICAL_128)
-			return 0x6344EA56u;
+			#if defined(USE_NNUE_LCA_WIDTH_24)
+				return 0x638ECE56u;
+			#elif defined(USE_NNUE_LCA_WIDTH_16)
+				return 0x638EFC56u;
+			#else
+				return 0x6344EA56u;
+			#endif
 		#elif defined(USE_NNUE_CROSS_WIDTH_24)
 			// Cross24 files use logical 24-output Cross and 152-input L2,
 			// padded to 32 output rows and 160 input columns on disk.
@@ -198,7 +237,13 @@ struct Network {
 #if defined(NNUE_COMPACT_PHASE5)
 	#if defined(USE_NNUE_FC1_WIDTH_64)
 		#if defined(USE_NNUE_L2_PHYSICAL_128)
-			return "HalfKA-KSDG3_FM-1280-L2x128-NoAbsSqr-Phase5-FC1x64-Cross16-FMDiff24-FMAbsRaw24";
+			#if defined(USE_NNUE_LCA_WIDTH_24)
+				return "HalfKA-KSDG3_FM-1280-L2x128-NoAbsSqr-Phase5-FC1x64-Cross16-FMDiff24-FMAbsRaw24-LCAx24";
+			#elif defined(USE_NNUE_LCA_WIDTH_16)
+				return "HalfKA-KSDG3_FM-1280-L2x128-NoAbsSqr-Phase5-FC1x64-Cross16-FMDiff24-FMAbsRaw24-LCAx16";
+			#else
+				return "HalfKA-KSDG3_FM-1280-L2x128-NoAbsSqr-Phase5-FC1x64-Cross16-FMDiff24-FMAbsRaw24";
+			#endif
 		#elif defined(USE_NNUE_CROSS_WIDTH_24)
 			return "HalfKA-KSDG3_FM-1280-L2x160-NoAbsSqr-Phase5-FC1x64-Cross24";
 		#else
@@ -636,9 +681,9 @@ struct Network {
 		alignas(kCacheLineSize) std::uint8_t abs_sqr_out[32];
 
 		// LCA (Attention) 用
-		alignas(kCacheLineSize) std::int32_t lca_q_out[32];
-		alignas(kCacheLineSize) std::int32_t lca_k_out[32];
-		alignas(kCacheLineSize) std::int32_t lca_v_out[32];
+		alignas(kCacheLineSize) typename decltype(lca_q)::OutputBuffer lca_q_out;
+		alignas(kCacheLineSize) typename decltype(lca_k)::OutputBuffer lca_k_out;
+		alignas(kCacheLineSize) typename decltype(lca_v)::OutputBuffer lca_v_out;
 		alignas(kCacheLineSize) std::uint8_t fm_cat_uint8[64];
 
 		// Cross Feature (相互作用) 用
@@ -658,6 +703,30 @@ struct Network {
 	};
 
 	static constexpr std::size_t kBufferSize = sizeof(Buffer);
+
+	static inline std::int32_t LcaValueForDiffChannel(
+		const std::int32_t* compact_value, const IndexType channel) {
+#if defined(USE_NNUE_LCA_WIDTH_24) || defined(USE_NNUE_LCA_WIDTH_16)
+		const int compact_index = LCA_VALUE_COMPACT_INDEX[channel];
+		return compact_index >= 0 ? compact_value[compact_index] : 0;
+#else
+		return compact_value[channel];
+#endif
+	}
+
+	template <typename Function>
+	static inline void ForEachLcaValueChannel(
+		const std::int32_t* compact_value, Function&& function) {
+#if defined(USE_NNUE_LCA_WIDTH_24) || defined(USE_NNUE_LCA_WIDTH_16)
+		for (IndexType compact = 0; compact < LCA_VALUE_SIZE; ++compact)
+			function(LCA_VALUE_SOURCE_UNITS[compact], compact_value[compact]);
+		for (const IndexType channel : LCA_VALUE_OMITTED_UNITS)
+			function(channel, 0);
+#else
+		for (IndexType channel = 0; channel < 32; ++channel)
+			function(channel, compact_value[channel]);
+#endif
+	}
 
 	static inline void PropagateCrossActivation(
 		const std::int32_t* input, std::uint8_t* output) {
@@ -985,7 +1054,7 @@ struct Network {
 
 		// 内積による Attention Score 算出
 		float dot_product = 0.0f;
-		for (int j = 0; j < 32; ++j) {
+		for (IndexType j = 0; j < LCA_QK_SIZE; ++j) {
 			dot_product += (static_cast<float>(buf.lca_q_out[j]) / 8128.0f) * (static_cast<float>(buf.lca_k_out[j]) / 8128.0f);
 		}
 
@@ -1000,12 +1069,13 @@ struct Network {
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
 		int lca_abs_delta_max = 0;
 #endif
-		for (int j = 0; j < 32; ++j) {
+		ForEachLcaValueChannel(buf.lca_v_out,
+			[&](const IndexType j, const std::int32_t value_output) {
 #if defined(ENABLE_NNUE_SIGNAL_LOG) || defined(USE_NNUE_LCA_LMR)
 			const int diff_before_lca = buf.diff_ac_out[j];
 #endif
 			float current_diff = static_cast<float>(buf.diff_ac_out[j]) / 127.0f;
-			float v_val = static_cast<float>(buf.lca_v_out[j]) / 8128.0f;
+			float v_val = static_cast<float>(value_output) / 8128.0f;
 			float v_clamped = std::max(0.0f, std::min(1.0f, v_val * 0.4f + 0.5f));
 			float final_diff_f = current_diff * (1.0f - att_score) + v_clamped * att_score;
 			buf.diff_ac_out[j] = static_cast<uint8_t>(final_diff_f * 127.0f);
@@ -1017,7 +1087,7 @@ struct Network {
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
 			lca_abs_delta_max = std::max(lca_abs_delta_max, lca_abs_delta);
 #endif
-		}
+		});
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
 		if (signal) {
 			signal->lca_mean_abs_delta = static_cast<float>(lca_abs_delta_sum) / 32.0f;
@@ -1631,22 +1701,23 @@ struct Network {
 		lca_v.Propagate(fm_input, value_output);
 
 		float dot_product = 0.0f;
-		for (int j = 0; j < 32; ++j)
+		for (IndexType j = 0; j < LCA_QK_SIZE; ++j)
 			dot_product += (static_cast<float>(query_output[j]) / 8128.0f)
 				* (static_cast<float>(key_output[j]) / 8128.0f);
 		const float attention_logit = (dot_product * 0.17677f) / lca_temp;
 		const float attention_score =
 			1.0f / (1.0f + std::exp(-attention_logit));
 
-		for (int j = 0; j < 32; ++j) {
+		ForEachLcaValueChannel(value_output,
+			[&](const IndexType j, const std::int32_t compact_value) {
 			const float current_diff = static_cast<float>(diff_input[j]) / 127.0f;
-			const float value = static_cast<float>(value_output[j]) / 8128.0f;
+			const float value = static_cast<float>(compact_value) / 8128.0f;
 			const float clamped_value =
 				std::max(0.0f, std::min(1.0f, value * 0.4f + 0.5f));
 			const float final_diff = current_diff * (1.0f - attention_score)
 				+ clamped_value * attention_score;
 			diff_output[j] = static_cast<std::uint8_t>(final_diff * 127.0f);
-		}
+		});
 	}
 
 	void BenchmarkLcaAssembleFmInput(const std::uint8_t* diff_input,
@@ -1676,7 +1747,7 @@ struct Network {
 		const std::int32_t* key_output, float* dot_product,
 		float* attention_logit) const {
 		*dot_product = 0.0f;
-		for (int j = 0; j < 32; ++j)
+		for (IndexType j = 0; j < LCA_QK_SIZE; ++j)
 			*dot_product +=
 				(static_cast<float>(query_output[j]) / 8128.0f)
 				* (static_cast<float>(key_output[j]) / 8128.0f);
@@ -1692,13 +1763,13 @@ struct Network {
 	void BenchmarkLcaValueClampAndCorrection(
 		const std::int32_t* value_output, const float attention_score,
 		float* value_clamped, float* value_correction) const {
-		for (int j = 0; j < 32; ++j) {
-			const float value =
-				static_cast<float>(value_output[j]) / 8128.0f;
+		ForEachLcaValueChannel(value_output,
+			[&](const IndexType j, const std::int32_t compact_value) {
+			const float value = static_cast<float>(compact_value) / 8128.0f;
 			value_clamped[j] =
 				std::max(0.0f, std::min(1.0f, value * 0.4f + 0.5f));
 			value_correction[j] = value_clamped[j] * attention_score;
-		}
+		});
 	}
 
 	void BenchmarkLcaFinalAddAndQuantize(
