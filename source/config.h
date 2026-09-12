@@ -416,6 +416,10 @@
 	#define USE_NNUE_FC1_WIDTH_64
 #endif
 
+// Cross出力幅24のoptional architecture。既定は従来どおりCross32。
+// 有効時は専用のCross24 nn.binが必要で、Phase5/L2x160/FC1x64を前提とする。
+// #define USE_NNUE_CROSS_WIDTH_24
+
 // SFNNwoP1536ではPhase5 C32 Q15 nearest LUTとQ23 integer L2を標準使用する。
 // 比較・検証用buildではDISABLE_NNUE_PHASE_L2_FIXED_C32を定義して無効化できる。
 #if defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536) \

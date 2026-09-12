@@ -370,6 +370,19 @@ namespace {
 				<< architecture << sync_endl;
 			return Tools::ResultCode::FileMismatch;
 		}
+#if defined(USE_NNUE_CROSS_WIDTH_24)
+		if (architecture.find("-FC1x64-Cross24") == std::string::npos) {
+			sync_cout << "info string NNUE architecture mismatch: this binary requires Cross24, got "
+				<< architecture << sync_endl;
+			return Tools::ResultCode::FileMismatch;
+		}
+#else
+		if (architecture.find("-Cross24") != std::string::npos) {
+			sync_cout << "info string NNUE architecture mismatch: this binary requires Cross32, got "
+				<< architecture << sync_endl;
+			return Tools::ResultCode::FileMismatch;
+		}
+#endif
 #else
 		if (architecture.find("-Phase5-FC1x64") != std::string::npos) {
 			sync_cout << "info string NNUE architecture mismatch: this binary requires FC1x96, got "

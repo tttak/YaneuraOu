@@ -42,11 +42,23 @@ constexpr IndexType kHidden1Dims = 31;
 #if defined(USE_NNUE_FC1_WIDTH_64) && !defined(NNUE_COMPACT_PHASE5)
 #error USE_NNUE_FC1_WIDTH_64 requires the 160-input Phase5 architecture
 #endif
+#if defined(USE_NNUE_CROSS_WIDTH_24) \
+	&& (!defined(NNUE_COMPACT_PHASE5) || !defined(USE_NNUE_FC1_WIDTH_64))
+#error USE_NNUE_CROSS_WIDTH_24 requires the Phase5, L2x160, FC1x64 architecture
+#endif
+
+#if defined(USE_NNUE_CROSS_WIDTH_24)
+constexpr IndexType CROSS_OUTPUT_SIZE = 24;
+#else
+constexpr IndexType CROSS_OUTPUT_SIZE = 32;
+#endif
 
 #if defined(USE_NNUE_ABS_SQR_REMOVED_160)
 constexpr IndexType L2_INPUT_SIZE = 160;
-constexpr IndexType L2_REAL_SIZE = 158;
 constexpr IndexType L2_CROSS_OFFSET = 126;
+constexpr IndexType L2_REAL_SIZE = L2_CROSS_OFFSET + CROSS_OUTPUT_SIZE;
+constexpr IndexType L2_LOGICAL_SIZE = L2_REAL_SIZE + 2;
+constexpr IndexType L2_PADDING_SIZE = L2_INPUT_SIZE - L2_REAL_SIZE;
 #if defined(NNUE_COMPACT_PHASE5)
 constexpr IndexType PHASE_OUTPUT_SIZE = 5;
 constexpr IndexType PHASE_CROSS_INDEX = 4;
@@ -57,6 +69,8 @@ constexpr IndexType PHASE_CROSS_INDEX = 5;
 #else
 constexpr IndexType L2_INPUT_SIZE = 192;
 constexpr IndexType L2_REAL_SIZE = 190;
+constexpr IndexType L2_LOGICAL_SIZE = 192;
+constexpr IndexType L2_PADDING_SIZE = L2_INPUT_SIZE - L2_REAL_SIZE;
 constexpr IndexType L2_CROSS_OFFSET = 158;
 constexpr IndexType PHASE_OUTPUT_SIZE = 6;
 constexpr IndexType PHASE_CROSS_INDEX = 5;
@@ -93,8 +107,8 @@ struct Network {
 	Layers::AffineTransformExplicit<kHidden2Dims, 1> fc_2;
 
 	// --- Interaction Layers: パス間の相関特徴 (Cross-product) ---
-	Layers::AffineTransformExplicit<32, 32> fc_cross;
-	Layers::ClippedReLUExplicit<32> ac_cross;
+	Layers::AffineTransformExplicit<32, CROSS_OUTPUT_SIZE> fc_cross;
+	Layers::ClippedReLUExplicit<CROSS_OUTPUT_SIZE> ac_cross;
 
 	// --- LCA (Lightweight Cross-Attention): コンテキストの動的統合 ---
 	// Query = MainPath(31), Key/Value = FM(64)
@@ -120,7 +134,13 @@ struct Network {
 		// Same serialized hash derivation as the Python writer, with fc_1
 		// output width 64 instead of 96.  This prevents a 96-wide network
 		// from being accepted silently by the optional 64-wide build.
-		return 0x63566A46u;
+		#if defined(USE_NNUE_CROSS_WIDTH_24)
+			// Cross24 files use logical 24-output Cross and 152-input L2,
+			// padded to 32 output rows and 160 input columns on disk.
+			return 0x63726A46u;
+		#else
+			return 0x63566A46u;
+		#endif
 	#else
 		// Phase5 additionally distinguishes old 160-input files whose row 4 was
 		// AbsSqr and row 5 was Cross. Loading one as Phase5 would silently use
@@ -137,7 +157,11 @@ struct Network {
 	static std::string GetStructureString() {
 #if defined(NNUE_COMPACT_PHASE5)
 	#if defined(USE_NNUE_FC1_WIDTH_64)
-		return "HalfKA-KSDG3_FM-1280-L2x160-NoAbsSqr-Phase5-FC1x64";
+		#if defined(USE_NNUE_CROSS_WIDTH_24)
+			return "HalfKA-KSDG3_FM-1280-L2x160-NoAbsSqr-Phase5-FC1x64-Cross24";
+		#else
+			return "HalfKA-KSDG3_FM-1280-L2x160-NoAbsSqr-Phase5-FC1x64";
+		#endif
 	#else
 		return "HalfKA-KSDG3_FM-1280-L2x160-NoAbsSqr-Phase5";
 	#endif
@@ -593,6 +617,32 @@ struct Network {
 
 	static constexpr std::size_t kBufferSize = sizeof(Buffer);
 
+	static inline void PropagateCrossActivation(
+		const std::int32_t* input, std::uint8_t* output) {
+#if defined(USE_NNUE_CROSS_WIDTH_24) && defined(USE_AVX2)
+		// ClippedReLUExplicit<24> cannot use its 32-element AVX2 kernel.
+		// Convert three independent groups of eight with the same operation
+		// order as the generic layer: saturating int32->int16 pack, signed
+		// >> kWeightScaleBits, saturating int16->int8 pack, max with zero.
+		// Keeping only two XMM input registers per group limits register use.
+		const __m128i zero = _mm_setzero_si128();
+		for (IndexType base = 0; base < CROSS_OUTPUT_SIZE; base += 8) {
+			const __m128i lo = _mm_load_si128(
+				reinterpret_cast<const __m128i*>(input + base));
+			const __m128i hi = _mm_load_si128(
+				reinterpret_cast<const __m128i*>(input + base + 4));
+			const __m128i words = _mm_srai_epi16(
+				_mm_packs_epi32(lo, hi), kWeightScaleBits);
+			const __m128i bytes = _mm_max_epi8(
+				_mm_packs_epi16(words, zero), zero);
+			_mm_storel_epi64(reinterpret_cast<__m128i*>(output + base), bytes);
+		}
+#else
+		Layers::ClippedReLUExplicit<CROSS_OUTPUT_SIZE> activation;
+		activation.Propagate(input, output);
+#endif
+	}
+
 	template<bool UsePhasePrefix = true, bool PhaseInputPrepared = false,
 #if defined(USE_NNUE_PHASE_L2_FIXED_C32)
 		bool UseFixedPhaseL2 = true>
@@ -847,16 +897,20 @@ struct Network {
 			buf.cross_cat[j + 16] = (uint8_t)((buf.ac_0_out[j] * buf.abs_ac_out[j]) / 127);
 		}
 
-		fc_cross.Propagate(buf.cross_cat, buf.cross_fc_out);
-		ac_cross.Propagate(buf.cross_fc_out, buf.cross_feat);
+		fc_cross.PropagatePrefix<CROSS_OUTPUT_SIZE>(buf.cross_cat, buf.cross_fc_out);
+		PropagateCrossActivation(buf.cross_fc_out, buf.cross_feat);
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
 		if (signal) {
 #if defined(USE_AVX2)
 			// One 32-byte load replaces a diagnostic 32-element reduction loop.
 			// cross_feat is uint8_t in [0,127], hence abs(value) == value and
 			// the exact sum is at most 32*127=4064 (fits uint16_t).
-			const __m256i values = _mm256_load_si256(
+			__m256i values = _mm256_load_si256(
 				reinterpret_cast<const __m256i*>(buf.cross_feat));
+#if defined(USE_NNUE_CROSS_WIDTH_24)
+			// Ignore the unused high eight bytes of the padded output buffer.
+			values = _mm256_and_si256(values, _mm256_set_epi64x(0, -1, -1, -1));
+#endif
 			const __m256i sums = _mm256_sad_epu8(values, _mm256_setzero_si256());
 			const std::uint64_t sum =
 				static_cast<std::uint64_t>(_mm256_extract_epi64(sums, 0))
@@ -875,7 +929,7 @@ struct Network {
 #else
 			std::uint16_t sum = 0;
 			std::uint8_t maximum = 0;
-			for (int j = 0; j < 32; ++j) {
+			for (IndexType j = 0; j < CROSS_OUTPUT_SIZE; ++j) {
 				sum = static_cast<std::uint16_t>(sum + buf.cross_feat[j]);
 				maximum = std::max(maximum, buf.cross_feat[j]);
 			}
@@ -890,8 +944,11 @@ struct Network {
 #if defined(USE_NNUE_CROSS_LMR) && !defined(ENABLE_NNUE_SIGNAL_LOG)
 		if (lmr_signal) {
 #if defined(USE_AVX2)
-			const __m256i values = _mm256_load_si256(
+			__m256i values = _mm256_load_si256(
 				reinterpret_cast<const __m256i*>(buf.cross_feat));
+#if defined(USE_NNUE_CROSS_WIDTH_24)
+			values = _mm256_and_si256(values, _mm256_set_epi64x(0, -1, -1, -1));
+#endif
 			__m128i maximum = _mm_max_epu8(
 				_mm256_castsi256_si128(values), _mm256_extracti128_si256(values, 1));
 			maximum = _mm_max_epu8(maximum, _mm_srli_si128(maximum, 8));
@@ -902,7 +959,7 @@ struct Network {
 				_mm_cvtsi128_si32(maximum) & 0xff);
 #else
 			std::uint8_t maximum = 0;
-			for (int j = 0; j < 32; ++j)
+			for (IndexType j = 0; j < CROSS_OUTPUT_SIZE; ++j)
 				maximum = std::max(maximum, buf.cross_feat[j]);
 			lmr_signal->cross_abs_max = maximum;
 #endif
@@ -921,7 +978,7 @@ struct Network {
 #if !defined(USE_NNUE_ABS_SQR_REMOVED_160)
 			AssembleL2ChannelQ23<32>(buf.abs_sqr_out, &buf.l2_input[126], phase_scales_q23[4]);
 #endif
-			AssembleL2ChannelQ23<32>(buf.cross_feat, &buf.l2_input[L2_CROSS_OFFSET], phase_scales_q23[PHASE_CROSS_INDEX]);
+			AssembleL2ChannelQ23<CROSS_OUTPUT_SIZE>(buf.cross_feat, &buf.l2_input[L2_CROSS_OFFSET], phase_scales_q23[PHASE_CROSS_INDEX]);
 		} else {
 			AssembleL2Channel<31>(buf.ac_sqr_0_out_temp, &buf.l2_input[0], main_sqr_scale);
 			AssembleL2Channel<31>(buf.ac_0_out, &buf.l2_input[31], main_raw_scale);
@@ -930,9 +987,9 @@ struct Network {
 #if !defined(USE_NNUE_ABS_SQR_REMOVED_160)
 			AssembleL2Channel<32>(buf.abs_sqr_out, &buf.l2_input[126], abs_sqr_scale);
 #endif
-			AssembleL2Channel<32>(buf.cross_feat, &buf.l2_input[L2_CROSS_OFFSET], cross_scale);
+			AssembleL2Channel<CROSS_OUTPUT_SIZE>(buf.cross_feat, &buf.l2_input[L2_CROSS_OFFSET], cross_scale);
 		}
-		std::memset(buf.l2_input + L2_REAL_SIZE, 0, 2);
+		std::memset(buf.l2_input + L2_REAL_SIZE, 0, L2_PADDING_SIZE);
 
 
 		// --- 7. Deep Path 推論 ---
@@ -1506,8 +1563,8 @@ struct Network {
 			cross_input[j + 16] = static_cast<std::uint8_t>(
 				(main_raw[j] * abs_input[j]) / 127);
 		}
-		fc_cross.Propagate(cross_input, cross_fc_output);
-		ac_cross.Propagate(cross_fc_output, cross_output);
+		fc_cross.PropagatePrefix<CROSS_OUTPUT_SIZE>(cross_input, cross_fc_output);
+		PropagateCrossActivation(cross_fc_output, cross_output);
 	}
 
 	void BenchmarkL2Assembly(const std::uint8_t* main_sqr,
@@ -1524,8 +1581,8 @@ struct Network {
 #else
 		(void)abs_sqr;
 #endif
-		AssembleL2Channel<32>(cross_input, output + L2_CROSS_OFFSET, scales.cross);
-		std::memset(output + L2_REAL_SIZE, 0, 2);
+		AssembleL2Channel<CROSS_OUTPUT_SIZE>(cross_input, output + L2_CROSS_OFFSET, scales.cross);
+		std::memset(output + L2_REAL_SIZE, 0, L2_PADDING_SIZE);
 	}
 
 	template<IndexType Dimensions>
@@ -1549,9 +1606,9 @@ struct Network {
 #else
 		(void)abs_sqr;
 #endif
-		BenchmarkAssembleL2ChannelQ23<32>(cross_input, output + L2_CROSS_OFFSET,
+		BenchmarkAssembleL2ChannelQ23<CROSS_OUTPUT_SIZE>(cross_input, output + L2_CROSS_OFFSET,
 			scales_q23[PHASE_CROSS_INDEX]);
-		std::memset(output + L2_REAL_SIZE, 0, 2);
+		std::memset(output + L2_REAL_SIZE, 0, L2_PADDING_SIZE);
 	}
 
 	void BenchmarkFc1Activation(const std::uint8_t* input,

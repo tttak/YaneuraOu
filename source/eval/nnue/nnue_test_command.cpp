@@ -2759,9 +2759,9 @@ void ComputeNnueNetworkStageValidationChecksums(
     MixNnueBenchRange(captured_checksums[25], sample.intermediate.cross_cat,
                       32);
     MixNnueBenchRange(captured_checksums[25], sample.intermediate.cross_fc_out,
-                      32);
+                      CROSS_OUTPUT_SIZE);
     MixNnueBenchRange(captured_checksums[25], sample.intermediate.cross_feat,
-                      32);
+                      CROSS_OUTPUT_SIZE);
     MixNnueBenchRange(captured_checksums[26], sample.intermediate.l2_input,
                       L2_REAL_SIZE);
     MixNnueBenchRange(captured_checksums[27], sample.intermediate.fc_1_out,
@@ -2994,8 +2994,16 @@ void ComputeNnueNetworkStageValidationChecksums(
         sample.intermediate.abs_ac_out, work.cross_cat, work.cross_fc_out,
         work.cross_feat);
     MixNnueBenchRange(recomputed_checksums[25], work.cross_cat, 32);
-    MixNnueBenchRange(recomputed_checksums[25], work.cross_fc_out, 32);
-    MixNnueBenchRange(recomputed_checksums[25], work.cross_feat, 32);
+    MixNnueBenchRange(recomputed_checksums[25], work.cross_fc_out,
+                      CROSS_OUTPUT_SIZE);
+    MixNnueBenchRange(recomputed_checksums[25], work.cross_feat,
+                      CROSS_OUTPUT_SIZE);
+    CompareNnueNetworkStageRange(
+        sample.intermediate.cross_fc_out, work.cross_fc_out,
+        CROSS_OUTPUT_SIZE, sample_index, mismatches[25]);
+    CompareNnueNetworkStageRange(
+        sample.intermediate.cross_feat, work.cross_feat,
+        CROSS_OUTPUT_SIZE, sample_index, mismatches[25]);
 
     selected_network.BenchmarkL2Assembly(
         sample.intermediate.ac_sqr_0_out_temp,
@@ -3008,7 +3016,7 @@ void ComputeNnueNetworkStageValidationChecksums(
         mismatches[26]);
     CompareNnueNetworkStageRange(
         sample.intermediate.l2_input + L2_REAL_SIZE,
-        work.l2_input + L2_REAL_SIZE, 2,
+        work.l2_input + L2_REAL_SIZE, L2_PADDING_SIZE,
         sample_index, l2_padding_mismatch);
 
     selected_network.BenchmarkFc1(
@@ -4788,8 +4796,9 @@ NnueBenchTiming MeasureNnueNetworkStageCorpus(
           work.cross_fc_out, work.cross_feat);
       representative = work.cross_cat[index % 32]
           ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(
-                 work.cross_fc_out[index % 32])) << 8)
-          ^ (static_cast<std::uint64_t>(work.cross_feat[index % 32]) << 48);
+                 work.cross_fc_out[index % CROSS_OUTPUT_SIZE])) << 8)
+          ^ (static_cast<std::uint64_t>(
+                 work.cross_feat[index % CROSS_OUTPUT_SIZE]) << 48);
     } else if constexpr (Operation ==
                          NetworkStageBenchOperation::L2Assembly) {
       selected_network.BenchmarkL2Assembly(
@@ -8201,13 +8210,15 @@ bool MakeNnueTraceSnapshot(const std::string& sfen,
   }
   std::copy_n(lca_buffer.cross_cat, 2 * kTraceCrossInputDimensions,
               deep_path.cross_input.begin());
-  selected_network->fc_cross.Propagate(lca_buffer.cross_cat,
-                                       lca_buffer.cross_fc_out);
-  selected_network->ac_cross.Propagate(lca_buffer.cross_fc_out,
-                                       lca_buffer.cross_feat);
-  std::copy_n(lca_buffer.cross_fc_out, kTraceFmHiddenDimensions,
+  selected_network->fc_cross.PropagatePrefix<CROSS_OUTPUT_SIZE>(
+      lca_buffer.cross_cat, lca_buffer.cross_fc_out);
+  selected_network->PropagateCrossActivation(lca_buffer.cross_fc_out,
+                                              lca_buffer.cross_feat);
+  std::fill(deep_path.cross_preact.begin(), deep_path.cross_preact.end(), 0);
+  std::fill(deep_path.cross_output.begin(), deep_path.cross_output.end(), 0);
+  std::copy_n(lca_buffer.cross_fc_out, CROSS_OUTPUT_SIZE,
               deep_path.cross_preact.begin());
-  std::copy_n(lca_buffer.cross_feat, kTraceFmHiddenDimensions,
+  std::copy_n(lca_buffer.cross_feat, CROSS_OUTPUT_SIZE,
               deep_path.cross_output.begin());
 
   for (std::size_t index = 0; index < kTraceLcaQueryInputDimensions; ++index) {
@@ -8233,11 +8244,12 @@ bool MakeNnueTraceSnapshot(const std::string& sfen,
         std::clamp<int>(lca_buffer.abs_sqr_out[index] * channel_scales[4],
                         0, 127));
 #endif
+  }
+  for (IndexType index = 0; index < CROSS_OUTPUT_SIZE; ++index)
     lca_buffer.l2_input[L2_CROSS_OFFSET + index] = static_cast<std::uint8_t>(
         std::clamp<int>(lca_buffer.cross_feat[index] * channel_scales[5],
                         0, 127));
-  }
-  std::memset(lca_buffer.l2_input + L2_REAL_SIZE, 0, 2);
+  std::memset(lca_buffer.l2_input + L2_REAL_SIZE, 0, L2_PADDING_SIZE);
   std::copy_n(lca_buffer.l2_input, kTraceBucketInputDimensions,
               deep_path.fc1_input.begin());
 
