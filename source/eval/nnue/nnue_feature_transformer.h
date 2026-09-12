@@ -1145,6 +1145,77 @@ class FeatureTransformer {
 		refresh_accumulator_from_scratch(pos);
 	}
 
+#if defined(USE_NNUE_MULTI_DELTA_ONE_PASS) || defined(ENABLE_NNUE_BENCH)
+	// Apply a non-reset Main accumulator update tile by tile. Every int16 lane
+	// sees all removals in their original order, followed by all additions in
+	// their original order, so SIMD add/sub preserves the legacy modulo-2^16
+	// wrap semantics. The caller keeps the one-remove/one-add fused path and
+	// reset path separate.
+	void apply_main_multi_delta_one_pass(
+		const BiasType* const previous, BiasType* const destination,
+		const Features::IndexList& removed_indices,
+		const Features::IndexList& added_indices) const {
+#if defined(VECTOR)
+#if defined(USE_AVX512)
+		constexpr IndexType kNumChunks = kHalfDimensions / kSimdWidth;
+		constexpr IndexType kOnePassTileChunks = 4;
+#else
+		constexpr IndexType kNumChunks = kHalfDimensions / (kSimdWidth / 2);
+		constexpr IndexType kOnePassTileChunks = 8;
+#endif
+		static_assert(kNumChunks % kOnePassTileChunks == 0,
+		              "Main accumulator tile must divide the SIMD chunks");
+		const auto* previous_chunks = reinterpret_cast<const vec_t*>(previous);
+		auto* destination_chunks = reinterpret_cast<vec_t*>(destination);
+		for (IndexType base = 0; base < kNumChunks;
+		     base += kOnePassTileChunks) {
+			vec_t values[kOnePassTileChunks];
+#if defined(__clang__)
+#pragma clang loop unroll(full)
+#endif
+			for (IndexType lane = 0; lane < kOnePassTileChunks; ++lane)
+				values[lane] = previous_chunks[base + lane];
+			for (const auto index : removed_indices) {
+				const auto* column = reinterpret_cast<const vec_t*>(
+					&weights_[kHalfDimensions * index]);
+#if defined(__clang__)
+#pragma clang loop unroll(full)
+#endif
+				for (IndexType lane = 0; lane < kOnePassTileChunks; ++lane)
+					values[lane] =
+						vec_sub_16(values[lane], column[base + lane]);
+			}
+			for (const auto index : added_indices) {
+				const auto* column = reinterpret_cast<const vec_t*>(
+					&weights_[kHalfDimensions * index]);
+#if defined(__clang__)
+#pragma clang loop unroll(full)
+#endif
+				for (IndexType lane = 0; lane < kOnePassTileChunks; ++lane)
+					values[lane] =
+						vec_add_16(values[lane], column[base + lane]);
+			}
+#if defined(__clang__)
+#pragma clang loop unroll(full)
+#endif
+			for (IndexType lane = 0; lane < kOnePassTileChunks; ++lane)
+				destination_chunks[base + lane] = values[lane];
+		}
+#else
+		for (IndexType lane = 0; lane < kHalfDimensions; ++lane) {
+			BiasType value = previous[lane];
+			for (const auto index : removed_indices)
+				value = static_cast<BiasType>(
+					value - weights_[kHalfDimensions * index + lane]);
+			for (const auto index : added_indices)
+				value = static_cast<BiasType>(
+					value + weights_[kHalfDimensions * index + lane]);
+			destination[lane] = value;
+		}
+#endif
+	}
+#endif
+
 	// Calculate cumulative value using difference calculation
 	// 差分計算を用いて累積値を計算する
 	void update_accumulator(const Position& pos) const {
@@ -1179,7 +1250,21 @@ class FeatureTransformer {
 						removed_indices[perspective].size() == 1
 						&& added_indices[perspective].size() == 1;
 
-					if (!direct_fused_main_update) {
+#if defined(USE_NNUE_MULTI_DELTA_ONE_PASS)
+					const std::size_t delta_count =
+						removed_indices[perspective].size()
+						+ added_indices[perspective].size();
+					if (!direct_fused_main_update && delta_count >= 2) {
+						apply_main_multi_delta_one_pass(
+							prev_accumulator.accumulation[perspective][i],
+							accumulator.accumulation[perspective][i],
+							removed_indices[perspective],
+							added_indices[perspective]);
+						fused_main_update = true;
+					}
+#endif
+
+					if (!direct_fused_main_update && !fused_main_update) {
 						std::memcpy(accumulator.accumulation[perspective][i],
 						            prev_accumulator.accumulation[perspective][i],
 						            kHalfDimensions * sizeof(BiasType));
@@ -1283,6 +1368,190 @@ class FeatureTransformer {
 		accumulator.computed_score = false;
 	}
 
+#if defined(ENABLE_NNUE_BENCH)
+	// Diagnostic-only implementation of the proposed multi-delta Main update.
+	// d is removed.size() + added.size() for one trigger/perspective.  The
+	// existing one-remove/one-add path is deliberately left byte-for-byte
+	// equivalent.  For all other non-reset cases, each int16 lane applies every
+	// subtraction in removed order and every addition in added order.  AVX2
+	// add/sub therefore retains the existing modulo-2^16 wrap semantics.
+	void benchmark_apply_main_delta(
+		const BiasType* const previous, BiasType* const destination,
+		const Features::IndexList& removed_indices,
+		const Features::IndexList& added_indices,
+		const bool chunk_local_one_pass) const {
+		const bool direct_fused_main_update =
+			removed_indices.size() == 1 && added_indices.size() == 1;
+
+#if defined(VECTOR)
+#if defined(USE_AVX512)
+		constexpr IndexType kNumChunks = kHalfDimensions / kSimdWidth;
+#else
+		constexpr IndexType kNumChunks = kHalfDimensions / (kSimdWidth / 2);
+#endif
+		auto previous_chunks = reinterpret_cast<const vec_t*>(previous);
+		auto destination_chunks = reinterpret_cast<vec_t*>(destination);
+#endif
+
+		if (direct_fused_main_update) {
+			const IndexType removed_offset =
+				kHalfDimensions * removed_indices[0];
+			const IndexType added_offset =
+				kHalfDimensions * added_indices[0];
+#if defined(VECTOR)
+			auto removed_column =
+				reinterpret_cast<const vec_t*>(&weights_[removed_offset]);
+			auto added_column =
+				reinterpret_cast<const vec_t*>(&weights_[added_offset]);
+			for (IndexType chunk = 0; chunk < kNumChunks; ++chunk) {
+				const vec_t after_remove =
+					vec_sub_16(previous_chunks[chunk], removed_column[chunk]);
+				destination_chunks[chunk] =
+					vec_add_16(after_remove, added_column[chunk]);
+			}
+#else
+			for (IndexType lane = 0; lane < kHalfDimensions; ++lane) {
+				const BiasType after_remove = static_cast<BiasType>(
+					previous[lane] - weights_[removed_offset + lane]);
+				destination[lane] = static_cast<BiasType>(
+					after_remove + weights_[added_offset + lane]);
+			}
+#endif
+			return;
+		}
+
+		const std::size_t delta_count =
+			removed_indices.size() + added_indices.size();
+		const bool use_chunk_local_one_pass =
+			chunk_local_one_pass && delta_count >= 2;
+		if (!use_chunk_local_one_pass) {
+			std::memcpy(destination, previous,
+			            kHalfDimensions * sizeof(BiasType));
+			for (const auto index : removed_indices) {
+				const IndexType offset = kHalfDimensions * index;
+#if defined(VECTOR)
+				auto column =
+					reinterpret_cast<const vec_t*>(&weights_[offset]);
+				for (IndexType chunk = 0; chunk < kNumChunks; ++chunk)
+					destination_chunks[chunk] = vec_sub_16(
+						destination_chunks[chunk], column[chunk]);
+#else
+				for (IndexType lane = 0; lane < kHalfDimensions; ++lane)
+					destination[lane] = static_cast<BiasType>(
+						destination[lane] - weights_[offset + lane]);
+#endif
+			}
+			for (const auto index : added_indices) {
+				const IndexType offset = kHalfDimensions * index;
+#if defined(VECTOR)
+				auto column =
+					reinterpret_cast<const vec_t*>(&weights_[offset]);
+				for (IndexType chunk = 0; chunk < kNumChunks; ++chunk)
+					destination_chunks[chunk] = vec_add_16(
+						destination_chunks[chunk], column[chunk]);
+#else
+				for (IndexType lane = 0; lane < kHalfDimensions; ++lane)
+					destination[lane] = static_cast<BiasType>(
+						destination[lane] + weights_[offset + lane]);
+#endif
+			}
+			return;
+		}
+
+		apply_main_multi_delta_one_pass(
+			previous, destination, removed_indices, added_indices);
+	}
+
+	void benchmark_update_accumulator(
+		const Position& pos, const bool chunk_local_one_pass) const {
+		const auto& prev_accumulator = pos.state()->previous->accumulator;
+		auto& accumulator = pos.state()->accumulator;
+		for (IndexType trigger = 0; trigger < kRefreshTriggers.size(); ++trigger) {
+			Features::IndexList removed_indices[2], added_indices[2];
+			bool reset[2];
+			RawFeatures::AppendChangedIndices(
+				pos, kRefreshTriggers[trigger], removed_indices, added_indices,
+				reset);
+			for (const Color perspective : {BLACK, WHITE}) {
+				if (reset[perspective]) {
+					if (trigger == 0) {
+						std::memcpy(
+							accumulator.accumulation[perspective][trigger], biases_,
+							kHalfDimensions * sizeof(BiasType));
+						std::memset(&accumulator.factors[perspective], 0,
+						            sizeof(accumulator.factors[perspective]));
+					} else {
+						std::memset(
+							accumulator.accumulation[perspective][trigger], 0,
+							kHalfDimensions * sizeof(BiasType));
+					}
+					// Keep the legacy reset path unchanged: its added list is the
+					// complete active set and is accumulated from the bias/zero base.
+					for (const auto index : added_indices[perspective]) {
+						const IndexType offset = kHalfDimensions * index;
+#if defined(VECTOR)
+#if defined(USE_AVX512)
+						constexpr IndexType kResetNumChunks =
+							kHalfDimensions / kSimdWidth;
+#else
+						constexpr IndexType kResetNumChunks =
+							kHalfDimensions / (kSimdWidth / 2);
+#endif
+						auto destination = reinterpret_cast<vec_t*>(
+							accumulator.accumulation[perspective][trigger]);
+						auto column =
+							reinterpret_cast<const vec_t*>(&weights_[offset]);
+						for (IndexType chunk = 0; chunk < kResetNumChunks; ++chunk)
+							destination[chunk] =
+								vec_add_16(destination[chunk], column[chunk]);
+#else
+						for (IndexType lane = 0; lane < kHalfDimensions; ++lane)
+							accumulator.accumulation[perspective][trigger][lane]
+								= static_cast<BiasType>(
+									accumulator.accumulation[perspective][trigger][lane]
+									+ weights_[offset + lane]);
+#endif
+					}
+				} else {
+					benchmark_apply_main_delta(
+						prev_accumulator.accumulation[perspective][trigger],
+						accumulator.accumulation[perspective][trigger],
+						removed_indices[perspective], added_indices[perspective],
+						chunk_local_one_pass);
+					if (trigger == 0)
+						std::memcpy(&accumulator.factors[perspective],
+						            &prev_accumulator.factors[perspective],
+						            sizeof(accumulator.factors[perspective]));
+				}
+
+				if (!reset[perspective]) {
+					for (const auto index : removed_indices[perspective]) {
+						if (trigger == 0) {
+							const IndexType v_offset = index * kFactorDimensions;
+							auto& group = index < SPLIT_IDX
+								? accumulator.factors[perspective].ksdg
+								: accumulator.factors[perspective].halfka;
+							update_fm_factor_group<false>(
+								group, &v_weights_[v_offset]);
+						}
+					}
+				}
+				for (const auto index : added_indices[perspective]) {
+					if (trigger == 0) {
+						const IndexType v_offset = index * kFactorDimensions;
+						auto& group = index < SPLIT_IDX
+							? accumulator.factors[perspective].ksdg
+							: accumulator.factors[perspective].halfka;
+						update_fm_factor_group<true>(group, &v_weights_[v_offset]);
+					}
+				}
+			}
+		}
+		accumulator.computed_accumulation = true;
+		accumulator.computed_score = false;
+	}
+#endif
+
 #if defined(ENABLE_TEST_CMD)
 	public:
 	void TestRefreshAccumulatorFromScratch(const Position& pos) const {
@@ -1303,6 +1572,27 @@ class FeatureTransformer {
 #if defined(ENABLE_NNUE_BENCH)
 	public:
 	// Benchmark-only entry points. These are not compiled into normal builds.
+	static constexpr IndexType BenchmarkMainDimensions() {
+		return kHalfDimensions;
+	}
+
+	void BenchmarkApplyMainDelta(
+		const BiasType* const previous, BiasType* const destination,
+		const Features::IndexList& removed_indices,
+		const Features::IndexList& added_indices,
+		const bool chunk_local_one_pass) const {
+		benchmark_apply_main_delta(previous, destination, removed_indices,
+		                           added_indices, chunk_local_one_pass);
+	}
+
+	void BenchmarkUpdateAccumulatorMultiDelta(const Position& pos) const {
+		benchmark_update_accumulator(pos, true);
+	}
+
+	void BenchmarkUpdateAccumulatorLegacy(const Position& pos) const {
+		benchmark_update_accumulator(pos, false);
+	}
+
 	void BenchmarkRefreshAccumulator(const Position& pos) const {
 		refresh_accumulator(pos);
 	}

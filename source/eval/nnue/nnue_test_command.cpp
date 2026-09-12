@@ -859,6 +859,9 @@ enum class FtBenchOperation {
   IncrementalUpdate,
   ForcedRefresh,
   TransformOnly,
+  FreshEvaluate,
+  CachedEvaluate,
+  TimerFloor,
 };
 
 void MixNnueBenchChecksum(std::uint64_t& checksum, const std::int64_t value) {
@@ -988,6 +991,9 @@ NnueBenchTiming RunFtBenchmarkPass(const FtBenchOperation operation,
         }
       }
 
+      if (operation == FtBenchOperation::CachedEvaluate)
+        (void)::YaneuraOu::Eval::evaluate(pos);
+
       const auto begin = NnueBenchClock::now();
       if (operation == FtBenchOperation::IncrementalUpdate) {
         if (!feature_transformer->UpdateAccumulatorIfPossible(pos)) {
@@ -997,10 +1003,16 @@ NnueBenchTiming RunFtBenchmarkPass(const FtBenchOperation operation,
         }
       } else if (operation == FtBenchOperation::ForcedRefresh) {
         feature_transformer->BenchmarkRefreshAccumulator(pos);
-      } else {
+      } else if (operation == FtBenchOperation::TransformOnly) {
         feature_transformer->Transform(
             pos, transformed.data(), diff_transformed.data(),
             abs_transformed.data(), false, NnueBenchMaterialBucket(pos));
+      } else if (operation == FtBenchOperation::FreshEvaluate
+                 || operation == FtBenchOperation::CachedEvaluate) {
+        const Value value = ::YaneuraOu::Eval::evaluate(pos);
+        KeepNnueBenchObject(value);
+      } else {
+        KeepNnueBenchObject(pos.state());
       }
       const auto end = NnueBenchClock::now();
 
@@ -1060,6 +1072,9 @@ void TestFeatureTransformerBenchmark(const std::uint64_t repeat_count) {
   NnueBenchSamples incremental;
   NnueBenchSamples refresh;
   NnueBenchSamples transform;
+  NnueBenchSamples fresh_evaluate;
+  NnueBenchSamples cached_evaluate;
+  NnueBenchSamples timer_floor;
 
   for (std::uint64_t repeat = 0; repeat < repeat_count; ++repeat) {
     RunFtBenchmarkPass(FtBenchOperation::IncrementalUpdate,
@@ -1079,11 +1094,32 @@ void TestFeatureTransformerBenchmark(const std::uint64_t repeat_count) {
     transform.Add(RunFtBenchmarkPass(
         FtBenchOperation::TransformOnly, kNnueBenchMeasuredGames, nullptr,
         checksum));
+
+    RunFtBenchmarkPass(FtBenchOperation::FreshEvaluate,
+                       kNnueBenchWarmupGames, nullptr, checksum);
+    fresh_evaluate.Add(RunFtBenchmarkPass(
+        FtBenchOperation::FreshEvaluate, kNnueBenchMeasuredGames, nullptr,
+        checksum));
+
+    RunFtBenchmarkPass(FtBenchOperation::CachedEvaluate,
+                       kNnueBenchWarmupGames, nullptr, checksum);
+    cached_evaluate.Add(RunFtBenchmarkPass(
+        FtBenchOperation::CachedEvaluate, kNnueBenchMeasuredGames, nullptr,
+        checksum));
+
+    RunFtBenchmarkPass(FtBenchOperation::TimerFloor,
+                       kNnueBenchWarmupGames, nullptr, checksum);
+    timer_floor.Add(RunFtBenchmarkPass(
+        FtBenchOperation::TimerFloor, kNnueBenchMeasuredGames, nullptr,
+        checksum));
   }
 
   PrintNnueBenchSamples("incremental accumulator update", incremental);
   PrintNnueBenchSamples("forced full refresh", refresh);
   PrintNnueBenchSamples("Transform (precomputed accumulator)", transform);
+  PrintNnueBenchSamples("fresh Eval::evaluate pipeline", fresh_evaluate);
+  PrintNnueBenchSamples("cached-score Eval::evaluate", cached_evaluate);
+  PrintNnueBenchSamples("per-position timer floor", timer_floor);
 
   const auto percentage = [](const std::uint64_t numerator,
                              const std::uint64_t denominator) {
@@ -1125,6 +1161,346 @@ void TestFeatureTransformerBenchmark(const std::uint64_t repeat_count) {
             << statistics.ksdg_removed << " / " << statistics.ksdg_added
             << std::endl
             << "  checksum                    : 0x" << std::hex << checksum
+            << std::dec << std::endl;
+}
+
+enum class MultiDeltaBin : std::size_t {
+  OneRemoveOneAdd,
+  Delta2Other,
+  Delta3,
+  Delta4,
+  Delta5Plus,
+  Count,
+};
+
+constexpr std::size_t kMultiDeltaBinCount =
+    static_cast<std::size_t>(MultiDeltaBin::Count);
+constexpr std::array<const char*, kMultiDeltaBinCount> kMultiDeltaBinNames = {
+    "1-remove/1-add (existing fused)",
+    "d=2 (other)",
+    "d=3",
+    "d=4",
+    "d=5+",
+};
+
+int ClassifyMultiDeltaBin(const Features::IndexList& removed,
+                          const Features::IndexList& added) {
+  if (removed.size() == 1 && added.size() == 1)
+    return static_cast<int>(MultiDeltaBin::OneRemoveOneAdd);
+  const std::size_t delta_count = removed.size() + added.size();
+  if (delta_count == 2)
+    return static_cast<int>(MultiDeltaBin::Delta2Other);
+  if (delta_count == 3)
+    return static_cast<int>(MultiDeltaBin::Delta3);
+  if (delta_count == 4)
+    return static_cast<int>(MultiDeltaBin::Delta4);
+  if (delta_count >= 5)
+    return static_cast<int>(MultiDeltaBin::Delta5Plus);
+  return -1;
+}
+
+struct MultiDeltaMainPass {
+  std::array<NnueBenchTiming, kMultiDeltaBinCount> bins{};
+  NnueBenchTiming multi_delta_copy;
+  std::array<std::uint64_t, 6> delta_histogram{};
+  std::uint64_t reset_samples = 0;
+  std::uint64_t checksum = UINT64_C(14695981039346656037);
+};
+
+MultiDeltaMainPass RunMultiDeltaMainPass(const bool candidate,
+                                         const std::uint64_t num_games,
+                                         const bool collect_statistics) {
+  Position pos;
+  StateInfo root_state;
+  std::vector<StateInfo> states(kNnueBenchMaxPly);
+  PRNG prng(kNnueBenchSeed);
+  MultiDeltaMainPass result;
+
+  for (std::uint64_t game = 0; game < num_games; ++game) {
+    pos.set_hirate(&root_state);
+    feature_transformer->BenchmarkRefreshAccumulatorFromScratch(pos);
+    for (int ply = 0; ply < kNnueBenchMaxPly; ++ply) {
+      MoveList<LEGAL_ALL> moves(pos);
+      if (moves.size() == 0)
+        break;
+      pos.do_move(moves.begin()[prng.rand(moves.size())], states[ply]);
+
+      for (IndexType trigger = 0; trigger < kRefreshTriggers.size(); ++trigger) {
+        Features::IndexList removed[2], added[2];
+        bool reset[2];
+        RawFeatures::AppendChangedIndices(pos, kRefreshTriggers[trigger],
+                                          removed, added, reset);
+        for (const Color perspective : {BLACK, WHITE}) {
+          if (reset[perspective]) {
+            if (collect_statistics)
+              ++result.reset_samples;
+            continue;
+          }
+
+          const std::size_t d =
+              removed[perspective].size() + added[perspective].size();
+          if (collect_statistics)
+            ++result.delta_histogram[std::min<std::size_t>(d, 5)];
+          const int bin =
+              ClassifyMultiDeltaBin(removed[perspective], added[perspective]);
+          if (bin < 0)
+            continue;
+
+          auto* const destination =
+              pos.state()->accumulator.accumulation[perspective][trigger];
+          const auto* const previous = pos.state()->previous->accumulator
+              .accumulation[perspective][trigger];
+
+          if (d >= 2
+              && !(removed[perspective].size() == 1
+                   && added[perspective].size() == 1)) {
+            const auto copy_begin = NnueBenchClock::now();
+            std::memcpy(destination, previous,
+                        FeatureTransformer::BenchmarkMainDimensions()
+                            * sizeof(FeatureTransformer::BiasType));
+            KeepNnueBenchObject(
+                pos.state()->accumulator.accumulation[perspective][trigger]);
+            const auto copy_end = NnueBenchClock::now();
+            result.multi_delta_copy.nanoseconds +=
+                std::chrono::duration<double, std::nano>(copy_end - copy_begin)
+                    .count();
+            ++result.multi_delta_copy.calls;
+          }
+
+          const auto begin = NnueBenchClock::now();
+          feature_transformer->BenchmarkApplyMainDelta(
+              previous, destination, removed[perspective], added[perspective],
+              candidate);
+          const auto end = NnueBenchClock::now();
+          auto& timing = result.bins[static_cast<std::size_t>(bin)];
+          timing.nanoseconds +=
+              std::chrono::duration<double, std::nano>(end - begin).count();
+          ++timing.calls;
+          MixNnueBenchChecksum(result.checksum, destination[0]);
+          MixNnueBenchChecksum(
+              result.checksum,
+              destination[FeatureTransformer::BenchmarkMainDimensions() - 1]);
+        }
+      }
+
+      // Prepare an exact predecessor for the next move outside the timed body.
+      feature_transformer->BenchmarkRefreshAccumulatorFromScratch(pos);
+    }
+  }
+  return result;
+}
+
+enum class MultiDeltaWholeOperation { FullUpdate, FreshEvaluate };
+
+NnueBenchTiming RunMultiDeltaWholePass(
+    const bool candidate, const MultiDeltaWholeOperation operation,
+    const std::uint64_t num_games, std::uint64_t& checksum) {
+  Position pos;
+  StateInfo root_state;
+  std::vector<StateInfo> states(kNnueBenchMaxPly);
+  PRNG prng(kNnueBenchSeed);
+  NnueBenchTiming timing;
+
+  for (std::uint64_t game = 0; game < num_games; ++game) {
+    pos.set_hirate(&root_state);
+    feature_transformer->BenchmarkRefreshAccumulatorFromScratch(pos);
+    for (int ply = 0; ply < kNnueBenchMaxPly; ++ply) {
+      MoveList<LEGAL_ALL> moves(pos);
+      if (moves.size() == 0)
+        break;
+      pos.do_move(moves.begin()[prng.rand(moves.size())], states[ply]);
+
+      const auto begin = NnueBenchClock::now();
+      if (candidate)
+        feature_transformer->BenchmarkUpdateAccumulatorMultiDelta(pos);
+      else
+        feature_transformer->BenchmarkUpdateAccumulatorLegacy(pos);
+      if (operation == MultiDeltaWholeOperation::FreshEvaluate) {
+        const Value value = ::YaneuraOu::Eval::evaluate(pos);
+        KeepNnueBenchObject(value);
+      }
+      const auto end = NnueBenchClock::now();
+      timing.nanoseconds +=
+          std::chrono::duration<double, std::nano>(end - begin).count();
+      ++timing.calls;
+      ChecksumAccumulator(pos, checksum);
+    }
+  }
+  return timing;
+}
+
+struct MultiDeltaCorrectness {
+  std::uint64_t positions = 0;
+  std::uint64_t mismatch_count = 0;
+  std::uint64_t legacy_checksum = UINT64_C(14695981039346656037);
+  std::uint64_t candidate_checksum = UINT64_C(14695981039346656037);
+  int first_game = -1;
+  int first_ply = -1;
+};
+
+MultiDeltaCorrectness CheckMultiDeltaCorrectness() {
+  Position pos;
+  StateInfo root_state;
+  std::vector<StateInfo> states(kNnueBenchMaxPly);
+  PRNG prng(kNnueBenchSeed);
+  MultiDeltaCorrectness result;
+
+  for (std::uint64_t game = 0; game < kNnueBenchMeasuredGames; ++game) {
+    pos.set_hirate(&root_state);
+    feature_transformer->BenchmarkRefreshAccumulatorFromScratch(pos);
+    for (int ply = 0; ply < kNnueBenchMaxPly; ++ply) {
+      MoveList<LEGAL_ALL> moves(pos);
+      if (moves.size() == 0)
+        break;
+      pos.do_move(moves.begin()[prng.rand(moves.size())], states[ply]);
+
+      feature_transformer->BenchmarkUpdateAccumulatorLegacy(pos);
+      const Accumulator legacy = pos.state()->accumulator;
+      ChecksumAccumulator(pos, result.legacy_checksum);
+
+      feature_transformer->BenchmarkUpdateAccumulatorMultiDelta(pos);
+      ChecksumAccumulator(pos, result.candidate_checksum);
+      const auto& candidate = pos.state()->accumulator;
+      const bool equal =
+          std::memcmp(legacy.accumulation, candidate.accumulation,
+                      sizeof(legacy.accumulation)) == 0
+          && std::memcmp(legacy.factors, candidate.factors,
+                         sizeof(legacy.factors)) == 0;
+      if (!equal) {
+        ++result.mismatch_count;
+        if (result.first_game < 0) {
+          result.first_game = static_cast<int>(game);
+          result.first_ply = ply;
+        }
+      }
+      ++result.positions;
+    }
+  }
+  return result;
+}
+
+void PrintMultiDeltaBinSamples(
+    const char* const heading,
+    const std::array<NnueBenchSamples, kMultiDeltaBinCount>& samples) {
+  std::cout << heading << std::endl;
+  for (std::size_t bin = 0; bin < kMultiDeltaBinCount; ++bin)
+    PrintNnueBenchSamples(kMultiDeltaBinNames[bin], samples[bin]);
+}
+
+void TestMultiDeltaAccumulatorBenchmark(const std::uint64_t repeat_count) {
+  std::cout << "[NNUE benchmark: multi-delta Main accumulator]" << std::endl
+            << "  seed         : " << kNnueBenchSeed << std::endl
+            << "  corpus games : " << kNnueBenchMeasuredGames << std::endl
+            << "  max ply/game : " << kNnueBenchMaxPly << std::endl
+            << "  repeats      : " << repeat_count << std::endl
+            << "  d definition : removed.size + added.size per "
+               "trigger/perspective" << std::endl
+            << "  order        : even=A,B odd=B,A" << std::endl;
+
+  std::array<NnueBenchSamples, kMultiDeltaBinCount> legacy_main;
+  std::array<NnueBenchSamples, kMultiDeltaBinCount> candidate_main;
+  NnueBenchSamples copy_samples;
+  NnueBenchSamples legacy_full;
+  NnueBenchSamples candidate_full;
+  NnueBenchSamples legacy_fresh;
+  NnueBenchSamples candidate_fresh;
+  MultiDeltaMainPass corpus_statistics;
+  std::uint64_t legacy_checksum = UINT64_C(14695981039346656037);
+  std::uint64_t candidate_checksum = UINT64_C(14695981039346656037);
+
+  for (std::uint64_t repeat = 0; repeat < repeat_count; ++repeat) {
+    const auto run_main = [&](const bool candidate) {
+      RunMultiDeltaMainPass(candidate, kNnueBenchWarmupGames, false);
+      const MultiDeltaMainPass pass = RunMultiDeltaMainPass(
+          candidate, kNnueBenchMeasuredGames, repeat == 0 && !candidate);
+      auto& destination = candidate ? candidate_main : legacy_main;
+      for (std::size_t bin = 0; bin < kMultiDeltaBinCount; ++bin)
+        destination[bin].Add(pass.bins[bin]);
+      if (!candidate)
+        copy_samples.Add(pass.multi_delta_copy);
+      if (repeat == 0 && !candidate)
+        corpus_statistics = pass;
+    };
+    const auto run_whole = [&](const bool candidate) {
+      std::uint64_t& checksum = candidate
+          ? candidate_checksum : legacy_checksum;
+      RunMultiDeltaWholePass(candidate, MultiDeltaWholeOperation::FullUpdate,
+                             kNnueBenchWarmupGames, checksum);
+      (candidate ? candidate_full : legacy_full).Add(
+          RunMultiDeltaWholePass(
+              candidate, MultiDeltaWholeOperation::FullUpdate,
+              kNnueBenchMeasuredGames, checksum));
+      RunMultiDeltaWholePass(candidate,
+                             MultiDeltaWholeOperation::FreshEvaluate,
+                             kNnueBenchWarmupGames, checksum);
+      (candidate ? candidate_fresh : legacy_fresh).Add(
+          RunMultiDeltaWholePass(
+              candidate, MultiDeltaWholeOperation::FreshEvaluate,
+              kNnueBenchMeasuredGames, checksum));
+    };
+
+    if ((repeat & 1) == 0) {
+      run_main(false);
+      run_main(true);
+      run_whole(false);
+      run_whole(true);
+    } else {
+      run_main(true);
+      run_main(false);
+      run_whole(true);
+      run_whole(false);
+    }
+  }
+
+  PrintMultiDeltaBinSamples("A. legacy Main update", legacy_main);
+  PrintMultiDeltaBinSamples("B. chunk-local Main update", candidate_main);
+  PrintNnueBenchSamples("memcpy 2560-byte equivalent (multi-delta)",
+                        copy_samples);
+  PrintNnueBenchSamples("A. full update_accumulator", legacy_full);
+  PrintNnueBenchSamples("B. full update_accumulator", candidate_full);
+  PrintNnueBenchSamples("A. fresh Eval::evaluate", legacy_fresh);
+  PrintNnueBenchSamples("B. fresh Eval::evaluate", candidate_fresh);
+
+  const MultiDeltaCorrectness correctness = CheckMultiDeltaCorrectness();
+  const std::uint64_t non_reset =
+      corpus_statistics.delta_histogram[0]
+      + corpus_statistics.delta_histogram[1]
+      + corpus_statistics.delta_histogram[2]
+      + corpus_statistics.delta_histogram[3]
+      + corpus_statistics.delta_histogram[4]
+      + corpus_statistics.delta_histogram[5];
+  std::cout << "[delta frequency: one trigger/perspective sample]" << std::endl;
+  for (std::size_t d = 0; d < corpus_statistics.delta_histogram.size(); ++d) {
+    const auto count = corpus_statistics.delta_histogram[d];
+    const double percent = non_reset == 0
+        ? 0.0
+        : 100.0 * static_cast<double>(count)
+              / static_cast<double>(non_reset);
+    std::cout << "  d=" << (d == 5 ? "5+" : std::to_string(d))
+              << " : " << count << " (" << std::fixed
+              << std::setprecision(3) << percent << "%)" << std::endl;
+  }
+  std::cout << "  reset : " << corpus_statistics.reset_samples << std::endl
+            << "[correctness]" << std::endl
+            << "  positions          : " << correctness.positions << std::endl
+            << "  accumulator mismatch count : "
+            << correctness.mismatch_count << std::endl
+            << "  first mismatch     : game=" << correctness.first_game
+            << " ply=" << correctness.first_ply << std::endl
+            << "  legacy checksum    : 0x" << std::hex
+            << correctness.legacy_checksum << std::endl
+            << "  candidate checksum : 0x"
+            << correctness.candidate_checksum << std::endl
+            << "  checksum match     : "
+            << (correctness.legacy_checksum
+                        == correctness.candidate_checksum
+                    ? "yes" : "no")
+            << std::dec << std::endl
+            << "[timing checksums]" << std::endl
+            << "  legacy    : 0x" << std::hex << legacy_checksum << std::endl
+            << "  candidate : 0x" << candidate_checksum << std::endl
+            << "  match     : "
+            << (legacy_checksum == candidate_checksum ? "yes" : "no")
             << std::dec << std::endl;
 }
 
@@ -9820,6 +10196,10 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::uint64_t repeat_count;
     if (ReadNnueBenchRepeatCount(stream, repeat_count))
       TestFeatureTransformerBenchmark(repeat_count);
+  } else if (sub_command == "bench_multi_delta_accumulator") {
+    std::uint64_t repeat_count;
+    if (ReadNnueBenchRepeatCount(stream, repeat_count))
+      TestMultiDeltaAccumulatorBenchmark(repeat_count);
   } else if (sub_command == "bench_ksdg3_features") {
     std::uint64_t repeat_count;
     if (ReadNnueBenchRepeatCount(stream, repeat_count))
@@ -9935,6 +10315,8 @@ void TestCommand(IEngine& engine, std::istream& stream) {
 #if defined(ENABLE_NNUE_BENCH)
     std::cout << " test nnue export_calibration_corpus \"file\" [count]" << std::endl;
     std::cout << " test nnue bench_ft [repeats]" << std::endl;
+    std::cout << " test nnue bench_multi_delta_accumulator [repeats]"
+              << std::endl;
     std::cout << " test nnue bench_ksdg3_features [repeats]" << std::endl;
     std::cout << " test nnue bench_long_effect_changed_mask [repeats]"
               << std::endl;

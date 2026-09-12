@@ -388,6 +388,7 @@
 // #define DISABLE_NNUE_LCA_LMR    // 295/epoch20用LCA top-1% LMRを比較時に無効化
 // #define DISABLE_NNUE_CROSS_LMR  // Cross high-tail LMRを比較時に無効化
 // #define DISABLE_NNUE_KSDG3_EFFECT_TOUCHED_MASK // production既定のchanged-maskを従来24近傍全走査へ戻す
+// #define DISABLE_NNUE_MULTI_DELTA_ONE_PASS // production既定のMain multi-delta 1-passを従来RMWへ戻す
 //
 // ENABLE_NNUE_ROUTER_LMR_EXPERIMENTはENABLE_NNUE_SIGNAL_LOGを必要とするため、
 // 下の既定設定でsignal log有効時に自動定義する。ここでは直接定義しない。
@@ -420,6 +421,16 @@
 #if defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536) \
 	&& !defined(DISABLE_NNUE_KSDG3_EFFECT_TOUCHED_MASK)
 	#define USE_NNUE_KSDG3_EFFECT_TOUCHED_MASK
+#endif
+
+// SFNNwoP1536ではMain accumulatorのmulti-delta non-reset更新を、
+// 256-byte tileごとにpreviousを1回loadし、removed/addedを既存順で適用して
+// 1回storeする。1 remove + 1 add fused、reset、FM updateは従来pathのまま。
+// 比較・検証用buildではDISABLE_NNUE_MULTI_DELTA_ONE_PASSを定義して、
+// 従来のcopy + featureごとのRMWへ戻せる。
+#if defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536) \
+	&& !defined(DISABLE_NNUE_MULTI_DELTA_ONE_PASS)
+	#define USE_NNUE_MULTI_DELTA_ONE_PASS
 #endif
 
 // SFNNwoP1536ではfc_1の出力幅64を標準使用する。
