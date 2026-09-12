@@ -39,6 +39,10 @@
 #include <system_error>
 #endif
 
+#if defined(ENABLE_NNUE_BENCH)
+#include "features/king_safety3_distinguishgolds.h"
+#endif
+
 namespace YaneuraOu {
 namespace Eval::NNUE {
 
@@ -1083,6 +1087,466 @@ void TestFeatureTransformerBenchmark(const std::uint64_t repeat_count) {
             << std::endl
             << "  checksum                    : 0x" << std::hex << checksum
             << std::dec << std::endl;
+}
+
+using Ksdg3Feature =
+    Features::KingSafety3_DistinguishGolds<Features::Side::kFriend>;
+using Ksdg3Variant = Features::Ksdg3BenchmarkVariant;
+
+constexpr std::array<Ksdg3Variant, 4> kKsdg3Variants = {
+    Ksdg3Variant::kBaseline,
+    Ksdg3Variant::kEffectHoist,
+    Ksdg3Variant::kNeighborTables,
+    Ksdg3Variant::kCombined,
+};
+
+constexpr std::array<const char*, 4> kKsdg3VariantNames = {
+    "A. baseline",
+    "B. effect-board/opponent hoist",
+    "C. neighbor + direction tables",
+    "D. combined hoist + tables",
+};
+
+enum class Ksdg3BenchOperation {
+  Active,
+  Changed,
+  RawChanged,
+  FullUpdate,
+};
+
+struct Ksdg3CorpusStatistics {
+  std::array<std::uint64_t, 3> dirty_num{};
+  std::uint64_t positions = 0;
+  std::uint64_t perspective_samples = 0;
+  std::uint64_t reset_samples = 0;
+  std::uint64_t non_reset_samples = 0;
+  std::uint64_t valid_neighbors = 0;
+  std::uint64_t removed = 0;
+  std::uint64_t added = 0;
+  std::uint64_t effect_changed_squares = 0;
+};
+
+struct Ksdg3PassResult {
+  NnueBenchTiming timing;
+  std::uint64_t perspective_calls = 0;
+  Features::Ksdg3BenchmarkStageTiming stages;
+};
+
+bool EqualIndexList(const Features::IndexList& left,
+                    const Features::IndexList& right) {
+  if (left.size() != right.size())
+    return false;
+  for (std::size_t i = 0; i < left.size(); ++i)
+    if (left[i] != right[i])
+      return false;
+  return true;
+}
+
+void ChecksumIndexList(const Features::IndexList& list,
+                       std::uint64_t& checksum) {
+  MixNnueBenchChecksum(checksum, static_cast<std::int64_t>(list.size()));
+  for (const auto index : list)
+    MixNnueBenchChecksum(checksum, index);
+}
+
+void CollectKsdg3CorpusStatistics(const Position& pos,
+                                  Ksdg3CorpusStatistics& statistics) {
+  ++statistics.positions;
+  const auto& dirty_piece = pos.state()->dirtyPiece;
+  if (dirty_piece.dirty_num >= 0 && dirty_piece.dirty_num <= 2)
+    ++statistics.dirty_num[dirty_piece.dirty_num];
+
+  for (const Color perspective : {BLACK, WHITE}) {
+    ++statistics.perspective_samples;
+    const bool reset =
+        dirty_piece.pieceNo[0] == PIECE_NUMBER_KING + perspective;
+    if (reset)
+      ++statistics.reset_samples;
+    else
+      ++statistics.non_reset_samples;
+
+    Features::IndexList active;
+    Ksdg3Feature::AppendActiveIndices(pos, perspective, &active);
+    statistics.valid_neighbors += active.size();
+    if (reset)
+      continue;
+
+    Features::IndexList removed;
+    Features::IndexList added;
+    Ksdg3Feature::AppendChangedIndices(
+        pos, perspective, &removed, &added);
+    statistics.removed += removed.size();
+    statistics.added += added.size();
+
+    const Color opponent = ~perspective;
+    const Square king = pos.square<KING>(perspective);
+    Bitboard dirty_squares(ZERO);
+    for (int i = 0; i < dirty_piece.dirty_num; ++i) {
+      for (const BonaPiece piece : {
+               static_cast<BonaPiece>(
+                   dirty_piece.changed_piece[i].old_piece.from[BLACK]),
+               static_cast<BonaPiece>(
+                   dirty_piece.changed_piece[i].new_piece.from[BLACK])}) {
+        Square square;
+        Piece board_piece;
+        Ksdg3Feature::GetSquarePieceFromBonaPiece(
+            piece, square, board_piece);
+        if (square != SQ_NB && dist(king, square) <= 2)
+          dirty_squares |= square;
+      }
+    }
+    const SquareWithWall king_with_wall = to_sqww(king);
+    for (Effect24::Direct direction : Effect24::Direct()) {
+      const SquareWithWall square_with_wall =
+          king_with_wall + Effect24::DirectToDeltaWW(direction);
+      if (!is_ok(square_with_wall))
+        continue;
+      const Square square = sqww_to_sq(square_with_wall);
+      if (dirty_squares & square)
+        continue;
+      const int previous_us = std::min(
+          int(pos.board_effect_prev[perspective].effect(square)), 3);
+      const int previous_them = std::min(
+          int(pos.board_effect_prev[opponent].effect(square)), 3);
+      const int current_us = std::min(
+          int(pos.board_effect[perspective].effect(square)), 3);
+      const int current_them = std::min(
+          int(pos.board_effect[opponent].effect(square)), 3);
+      statistics.effect_changed_squares +=
+          previous_us != current_us || previous_them != current_them;
+    }
+  }
+}
+
+Ksdg3PassResult RunKsdg3BenchmarkPass(
+    const Ksdg3BenchOperation operation, const Ksdg3Variant variant,
+    const std::uint64_t num_games, Ksdg3CorpusStatistics* const statistics,
+    std::uint64_t& checksum, const bool collect_stage_timing = false) {
+  Position pos;
+  StateInfo root_state;
+  std::vector<StateInfo> states(kNnueBenchMaxPly);
+  PRNG prng(kNnueBenchSeed);
+  Ksdg3PassResult result;
+  Features::SetKsdg3BenchmarkVariant(variant);
+  Features::SetKsdg3BenchmarkStageTiming(nullptr);
+
+  for (std::uint64_t game = 0; game < num_games; ++game) {
+    pos.set_hirate(&root_state);
+    for (int ply = 0; ply < kNnueBenchMaxPly; ++ply) {
+      MoveList<LEGAL_ALL> moves(pos);
+      if (moves.size() == 0)
+        break;
+      const Move move = moves.begin()[prng.rand(moves.size())];
+      pos.do_move(move, states[ply]);
+
+      if (collect_stage_timing)
+        Features::SetKsdg3BenchmarkStageTiming(&result.stages);
+      const auto begin = NnueBenchClock::now();
+      if (operation == Ksdg3BenchOperation::Active) {
+        Features::IndexList active[COLOR_NB];
+        for (const Color perspective : {BLACK, WHITE}) {
+          Ksdg3Feature::AppendActiveIndices(pos, perspective,
+                                            &active[perspective]);
+          ++result.perspective_calls;
+        }
+        KeepNnueBenchObject(active);
+      } else if (operation == Ksdg3BenchOperation::Changed) {
+        Features::IndexList removed[COLOR_NB];
+        Features::IndexList added[COLOR_NB];
+        const auto& dirty_piece = pos.state()->dirtyPiece;
+        for (const Color perspective : {BLACK, WHITE}) {
+          if (dirty_piece.pieceNo[0] == PIECE_NUMBER_KING + perspective)
+            continue;
+          Ksdg3Feature::AppendChangedIndices(
+              pos, perspective, &removed[perspective], &added[perspective]);
+          ++result.perspective_calls;
+        }
+        KeepNnueBenchObject(removed);
+        KeepNnueBenchObject(added);
+      } else if (operation == Ksdg3BenchOperation::RawChanged) {
+        Features::IndexList removed[COLOR_NB];
+        Features::IndexList added[COLOR_NB];
+        bool reset[COLOR_NB];
+        RawFeatures::AppendChangedIndices(
+            pos, kRefreshTriggers[0], removed, added, reset);
+        result.perspective_calls += COLOR_NB;
+        KeepNnueBenchObject(removed);
+        KeepNnueBenchObject(added);
+        KeepNnueBenchObject(reset);
+      } else {
+        if (!feature_transformer->UpdateAccumulatorIfPossible(pos)) {
+          std::cout << "error: KSDG3 benchmark incremental update unavailable"
+                    << std::endl;
+          Features::SetKsdg3BenchmarkStageTiming(nullptr);
+          Features::SetKsdg3BenchmarkVariant(Ksdg3Variant::kBaseline);
+          return {};
+        }
+        result.perspective_calls += COLOR_NB;
+      }
+      const auto end = NnueBenchClock::now();
+      // Checksum/statistics regenerate index lists outside the measured
+      // interval. Do not charge those diagnostic calls to stages B/C.
+      Features::SetKsdg3BenchmarkStageTiming(nullptr);
+      result.timing.nanoseconds +=
+          std::chrono::duration<double, std::nano>(end - begin).count();
+      ++result.timing.calls;
+
+      if (statistics != nullptr)
+        CollectKsdg3CorpusStatistics(pos, *statistics);
+
+      if (operation == Ksdg3BenchOperation::Active) {
+        Features::IndexList active[COLOR_NB];
+        for (const Color perspective : {BLACK, WHITE}) {
+          Ksdg3Feature::AppendActiveIndices(pos, perspective,
+                                            &active[perspective]);
+          ChecksumIndexList(active[perspective], checksum);
+        }
+      } else if (operation == Ksdg3BenchOperation::Changed) {
+        const auto& dirty_piece = pos.state()->dirtyPiece;
+        for (const Color perspective : {BLACK, WHITE}) {
+          if (dirty_piece.pieceNo[0] == PIECE_NUMBER_KING + perspective)
+            continue;
+          Features::IndexList removed;
+          Features::IndexList added;
+          Ksdg3Feature::AppendChangedIndices(
+              pos, perspective, &removed, &added);
+          ChecksumIndexList(removed, checksum);
+          ChecksumIndexList(added, checksum);
+        }
+      } else if (operation == Ksdg3BenchOperation::RawChanged) {
+        Features::IndexList removed[COLOR_NB];
+        Features::IndexList added[COLOR_NB];
+        bool reset[COLOR_NB];
+        RawFeatures::AppendChangedIndices(
+            pos, kRefreshTriggers[0], removed, added, reset);
+        for (const Color perspective : {BLACK, WHITE}) {
+          ChecksumIndexList(removed[perspective], checksum);
+          ChecksumIndexList(added[perspective], checksum);
+          MixNnueBenchChecksum(checksum, reset[perspective]);
+        }
+      } else {
+        ChecksumAccumulator(pos, checksum);
+      }
+    }
+  }
+
+  Features::SetKsdg3BenchmarkStageTiming(nullptr);
+  Features::SetKsdg3BenchmarkVariant(Ksdg3Variant::kBaseline);
+  return result;
+}
+
+std::uint64_t ValidateKsdg3Candidates() {
+  std::uint64_t mismatches = Features::ValidateKsdg3BenchmarkTables();
+  Position pos;
+  StateInfo root_state;
+  std::vector<StateInfo> states(kNnueBenchMaxPly);
+  PRNG prng(kNnueBenchSeed);
+
+  for (std::uint64_t game = 0; game < kNnueBenchMeasuredGames; ++game) {
+    pos.set_hirate(&root_state);
+    for (int ply = 0; ply < kNnueBenchMaxPly; ++ply) {
+      MoveList<LEGAL_ALL> moves(pos);
+      if (moves.size() == 0)
+        break;
+      pos.do_move(moves.begin()[prng.rand(moves.size())], states[ply]);
+
+      Features::SetKsdg3BenchmarkVariant(Ksdg3Variant::kBaseline);
+      Features::IndexList baseline_active[COLOR_NB];
+      Features::IndexList baseline_removed[COLOR_NB];
+      Features::IndexList baseline_added[COLOR_NB];
+      bool baseline_reset[COLOR_NB];
+      for (const Color perspective : {BLACK, WHITE})
+        Ksdg3Feature::AppendActiveIndices(
+            pos, perspective, &baseline_active[perspective]);
+      RawFeatures::AppendChangedIndices(
+          pos, kRefreshTriggers[0], baseline_removed, baseline_added,
+          baseline_reset);
+
+      for (std::size_t variant_index = 1;
+           variant_index < kKsdg3Variants.size(); ++variant_index) {
+        Features::SetKsdg3BenchmarkVariant(kKsdg3Variants[variant_index]);
+        Features::IndexList candidate_active[COLOR_NB];
+        Features::IndexList candidate_removed[COLOR_NB];
+        Features::IndexList candidate_added[COLOR_NB];
+        bool candidate_reset[COLOR_NB];
+        for (const Color perspective : {BLACK, WHITE})
+          Ksdg3Feature::AppendActiveIndices(
+              pos, perspective, &candidate_active[perspective]);
+        RawFeatures::AppendChangedIndices(
+            pos, kRefreshTriggers[0], candidate_removed, candidate_added,
+            candidate_reset);
+        for (const Color perspective : {BLACK, WHITE}) {
+          mismatches += !EqualIndexList(
+              baseline_active[perspective], candidate_active[perspective]);
+          mismatches += !EqualIndexList(
+              baseline_removed[perspective], candidate_removed[perspective]);
+          mismatches += !EqualIndexList(
+              baseline_added[perspective], candidate_added[perspective]);
+          mismatches += baseline_reset[perspective]
+                      != candidate_reset[perspective];
+        }
+      }
+
+      Features::SetKsdg3BenchmarkVariant(Ksdg3Variant::kBaseline);
+      if (!feature_transformer->UpdateAccumulatorIfPossible(pos))
+        ++mismatches;
+    }
+  }
+  Features::SetKsdg3BenchmarkVariant(Ksdg3Variant::kBaseline);
+  return mismatches;
+}
+
+void PrintKsdg3Samples(const char* const label,
+                       const NnueBenchSamples& samples,
+                       const std::uint64_t perspective_calls) {
+  PrintNnueBenchSamples(label, samples);
+  if (!samples.ns_per_call.empty() && perspective_calls != 0) {
+    const auto summary = SummarizeNnueBenchSamples(samples);
+    const double perspectives_per_position =
+        static_cast<double>(perspective_calls)
+        / static_cast<double>(samples.calls_per_repeat);
+    std::cout << "  median ns/perspective: " << std::fixed
+              << std::setprecision(1)
+              << summary.median / perspectives_per_position << std::endl;
+  }
+}
+
+void TestKsdg3FeaturesBenchmark(const std::uint64_t repeat_count) {
+  std::cout << "[NNUE benchmark: KingSafety3_DistinguishGolds features]"
+            << std::endl
+            << "  seed           : " << kNnueBenchSeed << std::endl
+            << "  warm-up games  : " << kNnueBenchWarmupGames << std::endl
+            << "  measured games : " << kNnueBenchMeasuredGames << std::endl
+            << "  max ply/game   : " << kNnueBenchMaxPly << std::endl
+            << "  repeats        : " << repeat_count << std::endl
+            << "  variant order  : rotated per repeat" << std::endl;
+
+  constexpr std::size_t kOperationCount = 4;
+  std::array<std::array<NnueBenchSamples, kOperationCount>, 4> samples;
+  std::array<NnueBenchSamples, 4> dirty_stage_samples;
+  std::array<NnueBenchSamples, 4> neighbor_stage_samples;
+  std::array<std::uint64_t, kOperationCount> perspective_calls{};
+  std::array<std::uint64_t, 4> checksums{};
+  checksums.fill(UINT64_C(14695981039346656037));
+  Ksdg3CorpusStatistics statistics;
+
+  for (std::uint64_t repeat = 0; repeat < repeat_count; ++repeat) {
+    for (std::size_t order = 0; order < kKsdg3Variants.size(); ++order) {
+      const std::size_t variant_index = (order + repeat) % 4;
+      const auto variant = kKsdg3Variants[variant_index];
+      for (std::size_t operation_index = 0;
+           operation_index < kOperationCount; ++operation_index) {
+        const auto operation = static_cast<Ksdg3BenchOperation>(operation_index);
+        RunKsdg3BenchmarkPass(operation, variant, kNnueBenchWarmupGames,
+                              nullptr, checksums[variant_index]);
+        auto pass = RunKsdg3BenchmarkPass(
+            operation, variant, kNnueBenchMeasuredGames,
+            repeat == 0 && variant_index == 0 && operation_index == 1
+                ? &statistics : nullptr,
+            checksums[variant_index]);
+        samples[variant_index][operation_index].Add(pass.timing);
+        if (repeat == 0)
+          perspective_calls[operation_index] = pass.perspective_calls;
+        if (operation == Ksdg3BenchOperation::Changed) {
+          // B/C need clocks inside AppendChangedIndices. Measure those in a
+          // separate pass so their clock calls do not contaminate D.
+          std::uint64_t stage_checksum = UINT64_C(14695981039346656037);
+          auto stage_pass = RunKsdg3BenchmarkPass(
+              operation, variant, kNnueBenchMeasuredGames, nullptr,
+              stage_checksum, true);
+          if (stage_pass.stages.calls == 0)
+            continue;
+          dirty_stage_samples[variant_index].Add({
+              stage_pass.stages.calls,
+              stage_pass.stages.dirty_nanoseconds});
+          neighbor_stage_samples[variant_index].Add({
+              stage_pass.stages.calls,
+              stage_pass.stages.neighbor_nanoseconds});
+        }
+      }
+    }
+  }
+
+  const std::uint64_t mismatch_count = ValidateKsdg3Candidates();
+  const std::array<const char*, kOperationCount> operation_names = {
+      "A. KSDG3 AppendActiveIndices",
+      "D. KSDG3 complete AppendChangedIndices",
+      "E. RawFeatures complete AppendChangedIndices",
+      "G. full update_accumulator",
+  };
+  for (std::size_t variant = 0; variant < 4; ++variant) {
+    std::cout << '[' << kKsdg3VariantNames[variant] << ']' << std::endl;
+    for (std::size_t operation = 0; operation < kOperationCount; ++operation)
+      PrintKsdg3Samples(operation_names[operation],
+                       samples[variant][operation],
+                       perspective_calls[operation]);
+    PrintNnueBenchSamples("B. dirty old/new processing (instrumented)",
+                          dirty_stage_samples[variant]);
+    PrintNnueBenchSamples("C. 24-neighbor comparison (instrumented)",
+                          neighbor_stage_samples[variant]);
+
+    // The same fixed corpus/order is used for E and G. Their difference is a
+    // useful no-extra-hook estimate of accumulator application cost; report it
+    // explicitly as derived rather than pretending it is an independently
+    // timed interval.
+    const auto raw = SummarizeNnueBenchSamples(samples[variant][2]);
+    const auto full = SummarizeNnueBenchSamples(samples[variant][3]);
+    std::cout << "F. accumulator application estimate (G median - E median)"
+              << std::endl
+              << "  median ns/position: " << std::fixed << std::setprecision(1)
+              << (full.median - raw.median) << std::endl
+              << "  checksum          : 0x" << std::hex << checksums[variant]
+              << std::dec << std::endl;
+  }
+
+  const auto percentage = [](const std::uint64_t numerator,
+                             const std::uint64_t denominator) {
+    return denominator == 0 ? 0.0
+        : 100.0 * static_cast<double>(numerator) / denominator;
+  };
+  std::cout << "[fixed corpus statistics]" << std::endl
+            << "  positions              : " << statistics.positions << std::endl
+            << "  perspective samples     : "
+            << statistics.perspective_samples << std::endl
+            << "  dirty_num 0 / 1 / 2     : " << statistics.dirty_num[0]
+            << " / " << statistics.dirty_num[1]
+            << " / " << statistics.dirty_num[2] << std::endl
+            << "  reset / non-reset       : " << statistics.reset_samples
+            << " / " << statistics.non_reset_samples << std::endl
+            << "  valid neighbors total   : " << statistics.valid_neighbors
+            << std::endl
+            << "  mean valid/perspective  : " << std::fixed
+            << std::setprecision(3)
+            << static_cast<double>(statistics.valid_neighbors)
+                 / statistics.perspective_samples << std::endl
+            << "  removed / added         : " << statistics.removed
+            << " / " << statistics.added << std::endl
+            << "  effect-changed squares  : "
+            << statistics.effect_changed_squares << std::endl
+            << "  reset rate              : "
+            << percentage(statistics.reset_samples,
+                          statistics.perspective_samples)
+            << "%" << std::endl
+            << "[correctness]" << std::endl
+            << "  table/corpus mismatches : " << mismatch_count << std::endl
+            << "  active/removed/added order match: "
+            << (mismatch_count == 0 ? "yes" : "no") << std::endl;
+}
+
+void SelectKsdg3BenchmarkVariant(std::istream& stream) {
+  int variant = -1;
+  stream >> variant;
+  if (variant < 0 || variant >= static_cast<int>(kKsdg3Variants.size())) {
+    std::cout << "usage: test nnue ksdg3_variant <0..3>" << std::endl
+              << "  0 baseline" << std::endl
+              << "  1 effect hoist" << std::endl
+              << "  2 neighbor + direction tables" << std::endl
+              << "  3 combined" << std::endl;
+    return;
+  }
+  Features::SetKsdg3BenchmarkVariant(kKsdg3Variants[variant]);
+  std::cout << "KSDG3 diagnostic variant: "
+            << kKsdg3VariantNames[variant] << std::endl;
 }
 
 #if defined(USE_FINNY_TABLES)
@@ -8925,6 +9389,12 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::uint64_t repeat_count;
     if (ReadNnueBenchRepeatCount(stream, repeat_count))
       TestFeatureTransformerBenchmark(repeat_count);
+  } else if (sub_command == "bench_ksdg3_features") {
+    std::uint64_t repeat_count;
+    if (ReadNnueBenchRepeatCount(stream, repeat_count))
+      TestKsdg3FeaturesBenchmark(repeat_count);
+  } else if (sub_command == "ksdg3_variant") {
+    SelectKsdg3BenchmarkVariant(stream);
 #if defined(USE_FINNY_TABLES)
   } else if (sub_command == "bench_finny_compare") {
     std::uint64_t repeat_count;
@@ -9027,6 +9497,8 @@ void TestCommand(IEngine& engine, std::istream& stream) {
 #if defined(ENABLE_NNUE_BENCH)
     std::cout << " test nnue export_calibration_corpus \"file\" [count]" << std::endl;
     std::cout << " test nnue bench_ft [repeats]" << std::endl;
+    std::cout << " test nnue bench_ksdg3_features [repeats]" << std::endl;
+    std::cout << " test nnue ksdg3_variant <0..3>" << std::endl;
 #if defined(USE_FINNY_TABLES)
     std::cout << " test nnue bench_finny_compare [repeats]" << std::endl;
     std::cout << " test nnue bench_finny_fm_compare [repeats]" << std::endl;

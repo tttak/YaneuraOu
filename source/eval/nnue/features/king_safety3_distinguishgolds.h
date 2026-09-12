@@ -15,6 +15,26 @@
 namespace YaneuraOu {
 namespace Eval::NNUE::Features {
 
+#if defined(ENABLE_NNUE_BENCH)
+enum class Ksdg3BenchmarkVariant : std::uint8_t {
+  kBaseline,
+  kEffectHoist,
+  kNeighborTables,
+  kCombined,
+};
+
+struct Ksdg3BenchmarkStageTiming {
+  std::uint64_t calls = 0;
+  double dirty_nanoseconds = 0.0;
+  double neighbor_nanoseconds = 0.0;
+};
+
+void SetKsdg3BenchmarkVariant(Ksdg3BenchmarkVariant variant);
+Ksdg3BenchmarkVariant GetKsdg3BenchmarkVariant();
+void SetKsdg3BenchmarkStageTiming(Ksdg3BenchmarkStageTiming* timing);
+std::uint64_t ValidateKsdg3BenchmarkTables();
+#endif
+
 // 特徴量KingSafety3_DistinguishGolds：玉の安全度（玉の24近傍の駒と利き数）（金と小駒の成り駒（と金、成香、成桂、成銀）を区別する）
 template <Side AssociatedKing>
 class KingSafety3_DistinguishGolds {
