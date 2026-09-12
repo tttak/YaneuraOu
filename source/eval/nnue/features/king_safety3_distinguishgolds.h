@@ -21,12 +21,17 @@ enum class Ksdg3BenchmarkVariant : std::uint8_t {
   kEffectHoist,
   kNeighborTables,
   kCombined,
+  kMaskOnly,
+  kTouchedMask,
 };
 
 struct Ksdg3BenchmarkStageTiming {
   std::uint64_t calls = 0;
   double dirty_nanoseconds = 0.0;
   double neighbor_nanoseconds = 0.0;
+  std::uint64_t valid_neighbors = 0;
+  std::uint64_t touched_near_king = 0;
+  std::uint64_t capped_changed_squares = 0;
 };
 
 void SetKsdg3BenchmarkVariant(Ksdg3BenchmarkVariant variant);

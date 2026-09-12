@@ -669,6 +669,45 @@ void TestAccumulator(Position& pos) {
   std::cout << num_games << " games, " << num_moves << " moves" << std::endl;
 }
 
+// Deterministic incremental-evaluation checksum for comparing separately
+// linked production binaries. This is a test command only; no search or NNUE
+// hot-path branch is added.
+void TestIncrementalEvalChecksum() {
+  constexpr std::uint64_t kSeed = 20171128;
+  constexpr int kGames = 64;
+  constexpr int kMaxPly = 128;
+  constexpr std::uint64_t kFnvOffset = UINT64_C(14695981039346656037);
+  constexpr std::uint64_t kFnvPrime = UINT64_C(1099511628211);
+  Position pos;
+  StateInfo root;
+  std::vector<StateInfo> states(kMaxPly);
+  PRNG prng(kSeed);
+  std::uint64_t checksum = kFnvOffset;
+  std::uint64_t positions = 0;
+
+  for (int game = 0; game < kGames; ++game) {
+    pos.set_hirate(&root);
+    ::YaneuraOu::Eval::evaluate_with_no_return(pos);
+    for (int ply = 0; ply < kMaxPly; ++ply) {
+      MoveList<LEGAL_ALL> moves(pos);
+      if (moves.size() == 0)
+        break;
+      const Move move = moves.begin()[prng.rand(moves.size())];
+      pos.do_move(move, states[ply]);
+      const Value value = ::YaneuraOu::Eval::evaluate(pos);
+      checksum ^= static_cast<std::uint32_t>(static_cast<int>(value));
+      checksum *= kFnvPrime;
+      checksum ^= move.to_u16();
+      checksum *= kFnvPrime;
+      ++positions;
+    }
+  }
+  std::cout << "incremental eval checksum positions = " << positions
+            << std::endl
+            << "incremental eval checksum = 0x" << std::hex << checksum
+            << std::dec << std::endl;
+}
+
 #if defined(ENABLE_NNUE_BENCH)
 
 constexpr std::uint64_t kNnueBenchSeed = 20171128;
@@ -1531,6 +1570,393 @@ void TestKsdg3FeaturesBenchmark(const std::uint64_t repeat_count) {
             << "  table/corpus mismatches : " << mismatch_count << std::endl
             << "  active/removed/added order match: "
             << (mismatch_count == 0 ? "yes" : "no") << std::endl;
+}
+
+constexpr std::array<Ksdg3Variant, 3> kLongEffectMaskVariants = {
+    Ksdg3Variant::kBaseline,
+    Ksdg3Variant::kMaskOnly,
+    Ksdg3Variant::kTouchedMask,
+};
+
+constexpr std::array<const char*, 3> kLongEffectMaskVariantNames = {
+    "A. production baseline",
+    "B. touched mask generation only",
+    "C. touched mask + KSDG3 candidate",
+};
+
+void ConfigureLongEffectMaskVariant(const Ksdg3Variant variant) {
+  const bool use_mask = variant == Ksdg3Variant::kMaskOnly
+                     || variant == Ksdg3Variant::kTouchedMask;
+  LongEffect::SetEffectTouchedMaskEnabled(use_mask);
+  Features::SetKsdg3BenchmarkVariant(variant);
+}
+
+enum class LongEffectMaskOperation {
+  DoMove,
+  KsdgChanged,
+  RawChanged,
+  FullUpdate,
+};
+
+struct LongEffectMaskPassResult {
+  NnueBenchTiming timing;
+  std::uint64_t perspective_calls = 0;
+  Features::Ksdg3BenchmarkStageTiming stages;
+};
+
+struct LongEffectMaskCorpusStats {
+  std::uint64_t positions = 0;
+  std::array<std::uint64_t, 4> dirty_num{};
+  std::uint64_t reset_samples = 0;
+  std::uint64_t non_reset_samples = 0;
+  std::uint64_t removed_features = 0;
+  std::uint64_t added_features = 0;
+  std::size_t max_removed = 0;
+  std::size_t max_added = 0;
+};
+
+LongEffectMaskCorpusStats CollectLongEffectMaskCorpusStats() {
+  Position pos;
+  StateInfo root_state;
+  std::vector<StateInfo> states(kNnueBenchMaxPly);
+  PRNG prng(kNnueBenchSeed);
+  LongEffectMaskCorpusStats statistics;
+  ConfigureLongEffectMaskVariant(Ksdg3Variant::kTouchedMask);
+
+  for (std::uint64_t game = 0; game < kNnueBenchMeasuredGames; ++game) {
+    pos.set_hirate(&root_state);
+    for (int ply = 0; ply < kNnueBenchMaxPly; ++ply) {
+      MoveList<LEGAL_ALL> moves(pos);
+      if (moves.size() == 0)
+        break;
+      pos.do_move(moves.begin()[prng.rand(moves.size())], states[ply]);
+      ++statistics.positions;
+      const int dirty_num = pos.state()->dirtyPiece.dirty_num;
+      ++statistics.dirty_num[std::min(dirty_num, 3)];
+
+      Features::IndexList removed[COLOR_NB];
+      Features::IndexList added[COLOR_NB];
+      bool reset[COLOR_NB];
+      RawFeatures::AppendChangedIndices(
+          pos, kRefreshTriggers[0], removed, added, reset);
+      for (const Color perspective : {BLACK, WHITE}) {
+        if (reset[perspective])
+          ++statistics.reset_samples;
+        else
+          ++statistics.non_reset_samples;
+        statistics.removed_features += removed[perspective].size();
+        statistics.added_features += added[perspective].size();
+        statistics.max_removed =
+            std::max(statistics.max_removed, removed[perspective].size());
+        statistics.max_added =
+            std::max(statistics.max_added, added[perspective].size());
+      }
+    }
+  }
+  ConfigureLongEffectMaskVariant(Ksdg3Variant::kBaseline);
+  return statistics;
+}
+
+LongEffectMaskPassResult RunLongEffectMaskPass(
+    const LongEffectMaskOperation operation, const Ksdg3Variant variant,
+    const std::uint64_t num_games, std::uint64_t& checksum,
+    const bool collect_stage_timing = false,
+    LongEffect::EffectTouchedBenchmarkStats* const effect_stats = nullptr) {
+  Position pos;
+  StateInfo root_state;
+  std::vector<StateInfo> states(kNnueBenchMaxPly);
+  PRNG prng(kNnueBenchSeed);
+  LongEffectMaskPassResult result;
+  ConfigureLongEffectMaskVariant(variant);
+  Features::SetKsdg3BenchmarkStageTiming(nullptr);
+  LongEffect::SetEffectTouchedBenchmarkStats(effect_stats);
+
+  for (std::uint64_t game = 0; game < num_games; ++game) {
+    pos.set_hirate(&root_state);
+    for (int ply = 0; ply < kNnueBenchMaxPly; ++ply) {
+      MoveList<LEGAL_ALL> moves(pos);
+      if (moves.size() == 0)
+        break;
+      const Move move = moves.begin()[prng.rand(moves.size())];
+      const auto do_move_begin = NnueBenchClock::now();
+      pos.do_move(move, states[ply]);
+      const auto do_move_end = NnueBenchClock::now();
+
+      if (collect_stage_timing)
+        Features::SetKsdg3BenchmarkStageTiming(&result.stages);
+      const auto begin = NnueBenchClock::now();
+      if (operation == LongEffectMaskOperation::DoMove) {
+        result.timing.nanoseconds += std::chrono::duration<double, std::nano>(
+            do_move_end - do_move_begin).count();
+      } else if (operation == LongEffectMaskOperation::KsdgChanged) {
+        Features::IndexList removed[COLOR_NB];
+        Features::IndexList added[COLOR_NB];
+        const auto& dirty_piece = pos.state()->dirtyPiece;
+        for (const Color perspective : {BLACK, WHITE}) {
+          if (dirty_piece.pieceNo[0] == PIECE_NUMBER_KING + perspective)
+            continue;
+          Ksdg3Feature::AppendChangedIndices(
+              pos, perspective, &removed[perspective], &added[perspective]);
+          ++result.perspective_calls;
+        }
+        KeepNnueBenchObject(removed);
+        KeepNnueBenchObject(added);
+      } else if (operation == LongEffectMaskOperation::RawChanged) {
+        Features::IndexList removed[COLOR_NB];
+        Features::IndexList added[COLOR_NB];
+        bool reset[COLOR_NB];
+        RawFeatures::AppendChangedIndices(
+            pos, kRefreshTriggers[0], removed, added, reset);
+        result.perspective_calls += COLOR_NB;
+        KeepNnueBenchObject(removed);
+        KeepNnueBenchObject(added);
+        KeepNnueBenchObject(reset);
+      } else {
+        if (!feature_transformer->UpdateAccumulatorIfPossible(pos)) {
+          std::cout << "error: changed-mask benchmark incremental update unavailable"
+                    << std::endl;
+          LongEffect::SetEffectTouchedBenchmarkStats(nullptr);
+          ConfigureLongEffectMaskVariant(Ksdg3Variant::kBaseline);
+          return {};
+        }
+        result.perspective_calls += COLOR_NB;
+        KeepNnueBenchObject(pos.state()->accumulator);
+      }
+      const auto end = NnueBenchClock::now();
+      Features::SetKsdg3BenchmarkStageTiming(nullptr);
+      if (operation != LongEffectMaskOperation::DoMove)
+        result.timing.nanoseconds +=
+            std::chrono::duration<double, std::nano>(end - begin).count();
+      ++result.timing.calls;
+
+      // Generate an order-sensitive checksum outside the measured interval.
+      Features::IndexList removed[COLOR_NB];
+      Features::IndexList added[COLOR_NB];
+      bool reset[COLOR_NB];
+      RawFeatures::AppendChangedIndices(
+          pos, kRefreshTriggers[0], removed, added, reset);
+      for (const Color perspective : {BLACK, WHITE}) {
+        ChecksumIndexList(removed[perspective], checksum);
+        ChecksumIndexList(added[perspective], checksum);
+        MixNnueBenchChecksum(checksum, reset[perspective]);
+      }
+    }
+  }
+
+  LongEffect::SetEffectTouchedBenchmarkStats(nullptr);
+  Features::SetKsdg3BenchmarkStageTiming(nullptr);
+  ConfigureLongEffectMaskVariant(Ksdg3Variant::kBaseline);
+  return result;
+}
+
+std::uint64_t ValidateLongEffectMaskCandidate() {
+  std::uint64_t mismatches = Features::ValidateKsdg3BenchmarkTables();
+  Position pos;
+  StateInfo root_state;
+  std::vector<StateInfo> states(kNnueBenchMaxPly);
+  PRNG prng(kNnueBenchSeed);
+  ConfigureLongEffectMaskVariant(Ksdg3Variant::kTouchedMask);
+
+  for (std::uint64_t game = 0; game < kNnueBenchMeasuredGames; ++game) {
+    pos.set_hirate(&root_state);
+    for (int ply = 0; ply < kNnueBenchMaxPly; ++ply) {
+      MoveList<LEGAL_ALL> moves(pos);
+      if (moves.size() == 0)
+        break;
+      pos.do_move(moves.begin()[prng.rand(moves.size())], states[ply]);
+
+      ConfigureLongEffectMaskVariant(Ksdg3Variant::kBaseline);
+      Features::IndexList baseline_active[COLOR_NB];
+      Features::IndexList baseline_removed[COLOR_NB];
+      Features::IndexList baseline_added[COLOR_NB];
+      bool baseline_reset[COLOR_NB];
+      for (const Color perspective : {BLACK, WHITE})
+        Ksdg3Feature::AppendActiveIndices(
+            pos, perspective, &baseline_active[perspective]);
+      RawFeatures::AppendChangedIndices(
+          pos, kRefreshTriggers[0], baseline_removed, baseline_added,
+          baseline_reset);
+
+      ConfigureLongEffectMaskVariant(Ksdg3Variant::kTouchedMask);
+      Features::IndexList candidate_active[COLOR_NB];
+      Features::IndexList candidate_removed[COLOR_NB];
+      Features::IndexList candidate_added[COLOR_NB];
+      bool candidate_reset[COLOR_NB];
+      for (const Color perspective : {BLACK, WHITE})
+        Ksdg3Feature::AppendActiveIndices(
+            pos, perspective, &candidate_active[perspective]);
+      RawFeatures::AppendChangedIndices(
+          pos, kRefreshTriggers[0], candidate_removed, candidate_added,
+          candidate_reset);
+      for (const Color perspective : {BLACK, WHITE}) {
+        mismatches += !EqualIndexList(
+            baseline_active[perspective], candidate_active[perspective]);
+        mismatches += !EqualIndexList(
+            baseline_removed[perspective], candidate_removed[perspective]);
+        mismatches += !EqualIndexList(
+            baseline_added[perspective], candidate_added[perspective]);
+        mismatches += baseline_reset[perspective] != candidate_reset[perspective];
+      }
+    }
+  }
+  ConfigureLongEffectMaskVariant(Ksdg3Variant::kBaseline);
+  return mismatches;
+}
+
+void TestLongEffectChangedMaskBenchmark(const std::uint64_t repeat_count) {
+  std::cout << "[NNUE benchmark: LongEffect changed-square mask]" << std::endl
+            << "  seed           : " << kNnueBenchSeed << std::endl
+            << "  warm-up games  : " << kNnueBenchWarmupGames << std::endl
+            << "  measured games : " << kNnueBenchMeasuredGames << std::endl
+            << "  max ply/game   : " << kNnueBenchMaxPly << std::endl
+            << "  repeats        : " << repeat_count << std::endl
+            << "  order          : A/B/C rotated per repeat" << std::endl;
+
+  constexpr std::size_t kVariantCount = 3;
+  constexpr std::size_t kOperationCount = 4;
+  std::array<std::array<NnueBenchSamples, kOperationCount>, kVariantCount>
+      samples;
+  std::array<NnueBenchSamples, kVariantCount> dirty_samples;
+  std::array<NnueBenchSamples, kVariantCount> neighbor_samples;
+  std::array<Features::Ksdg3BenchmarkStageTiming, kVariantCount> stage_totals{};
+  std::array<std::uint64_t, kVariantCount> checksums{};
+  checksums.fill(UINT64_C(14695981039346656037));
+
+  for (std::uint64_t repeat = 0; repeat < repeat_count; ++repeat) {
+    for (std::size_t order = 0; order < kVariantCount; ++order) {
+      const std::size_t variant_index = (order + repeat) % kVariantCount;
+      const auto variant = kLongEffectMaskVariants[variant_index];
+      for (std::size_t operation_index = 0;
+           operation_index < kOperationCount; ++operation_index) {
+        const auto operation =
+            static_cast<LongEffectMaskOperation>(operation_index);
+        RunLongEffectMaskPass(operation, variant, kNnueBenchWarmupGames,
+                              checksums[variant_index]);
+        const auto pass = RunLongEffectMaskPass(
+            operation, variant, kNnueBenchMeasuredGames,
+            checksums[variant_index]);
+        samples[variant_index][operation_index].Add(pass.timing);
+        if (operation == LongEffectMaskOperation::KsdgChanged) {
+          std::uint64_t stage_checksum = UINT64_C(14695981039346656037);
+          const auto stage_pass = RunLongEffectMaskPass(
+              operation, variant, kNnueBenchMeasuredGames,
+              stage_checksum, true);
+          if (stage_pass.stages.calls != 0) {
+            dirty_samples[variant_index].Add({
+                stage_pass.stages.calls,
+                stage_pass.stages.dirty_nanoseconds});
+            neighbor_samples[variant_index].Add({
+                stage_pass.stages.calls,
+                stage_pass.stages.neighbor_nanoseconds});
+            if (repeat == 0) {
+              stage_totals[variant_index].valid_neighbors =
+                  stage_pass.stages.valid_neighbors;
+              stage_totals[variant_index].touched_near_king =
+                  stage_pass.stages.touched_near_king;
+              stage_totals[variant_index].capped_changed_squares =
+                  stage_pass.stages.capped_changed_squares;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  LongEffect::EffectTouchedBenchmarkStats effect_stats;
+  std::uint64_t stats_checksum = UINT64_C(14695981039346656037);
+  RunLongEffectMaskPass(LongEffectMaskOperation::DoMove,
+                        Ksdg3Variant::kTouchedMask,
+                        kNnueBenchMeasuredGames, stats_checksum,
+                        false, &effect_stats);
+  const auto corpus_stats = CollectLongEffectMaskCorpusStats();
+  const std::uint64_t mismatch_count = ValidateLongEffectMaskCandidate();
+
+  const std::array<const char*, kOperationCount> operation_names = {
+      "do_move including LongEffect",
+      "KSDG3 AppendChangedIndices",
+      "RawFeatures AppendChangedIndices",
+      "full update_accumulator",
+  };
+  for (std::size_t variant = 0; variant < kVariantCount; ++variant) {
+    std::cout << '[' << kLongEffectMaskVariantNames[variant] << ']' << std::endl;
+    for (std::size_t operation = 0; operation < kOperationCount; ++operation)
+      PrintNnueBenchSamples(operation_names[operation],
+                            samples[variant][operation]);
+    PrintNnueBenchSamples("dirty old/new processing (instrumented)",
+                          dirty_samples[variant]);
+    PrintNnueBenchSamples("neighbor/effect comparison (instrumented)",
+                          neighbor_samples[variant]);
+    std::cout << "  valid neighbors       : "
+              << stage_totals[variant].valid_neighbors << std::endl
+              << "  touched near king     : "
+              << stage_totals[variant].touched_near_king << std::endl
+              << "  capped changed squares: "
+              << stage_totals[variant].capped_changed_squares << std::endl
+              << "  checksum              : 0x" << std::hex
+              << checksums[variant] << std::dec << std::endl;
+  }
+
+  const auto baseline_do = SummarizeNnueBenchSamples(samples[0][0]);
+  const auto mask_do = SummarizeNnueBenchSamples(samples[1][0]);
+  const auto baseline_full = SummarizeNnueBenchSamples(samples[0][3]);
+  const auto candidate_full = SummarizeNnueBenchSamples(samples[2][3]);
+  std::cout << "[derived A/B/C deltas]" << std::endl
+            << "  mask generation cost B-A (median ns/move): "
+            << std::fixed << std::setprecision(1)
+            << mask_do.median - baseline_do.median << std::endl
+            << "  full update C-A (median ns/call)          : "
+            << candidate_full.median - baseline_full.median << std::endl
+            << "[LongEffect mask statistics]" << std::endl
+            << "  update calls               : " << effect_stats.update_calls
+            << std::endl
+            << "  square write events        : "
+            << effect_stats.square_write_events << std::endl
+            << "  color writes               : " << effect_stats.color_writes
+            << std::endl
+            << "  unique touched squares     : "
+            << effect_stats.unique_touched_squares << std::endl
+            << "  duplicate square writes    : "
+            << effect_stats.duplicate_square_writes << std::endl
+            << "  final raw changed squares  : "
+            << effect_stats.final_raw_changed_squares << std::endl
+            << "  final capped changed squares: "
+            << effect_stats.final_capped_changed_squares << std::endl
+            << "[fixed-corpus feature statistics]" << std::endl
+            << "  positions                  : " << corpus_stats.positions
+            << std::endl
+            << "  dirty_num 0 / 1 / 2 / 3+   : "
+            << corpus_stats.dirty_num[0] << " / "
+            << corpus_stats.dirty_num[1] << " / "
+            << corpus_stats.dirty_num[2] << " / "
+            << corpus_stats.dirty_num[3] << std::endl
+            << "  reset / non-reset samples  : "
+            << corpus_stats.reset_samples << " / "
+            << corpus_stats.non_reset_samples << std::endl
+            << "  removed / added features   : "
+            << corpus_stats.removed_features << " / "
+            << corpus_stats.added_features << std::endl
+            << "  max removed / added        : "
+            << corpus_stats.max_removed << " / "
+            << corpus_stats.max_added << std::endl
+            << "[correctness]" << std::endl
+            << "  table/corpus mismatches    : " << mismatch_count << std::endl
+            << "  active/removed/added order match: "
+            << (mismatch_count == 0 ? "yes" : "no") << std::endl;
+}
+
+void SelectLongEffectMaskVariant(std::istream& stream) {
+  int variant = -1;
+  stream >> variant;
+  if (variant < 0 || variant >= 3) {
+    std::cout << "usage: test nnue long_effect_mask_variant <0..2>" << std::endl
+              << "  0 production baseline" << std::endl
+              << "  1 touched mask generation only" << std::endl
+              << "  2 touched mask + KSDG3 candidate" << std::endl;
+    return;
+  }
+  ConfigureLongEffectMaskVariant(kLongEffectMaskVariants[variant]);
+  std::cout << "LongEffect changed-mask diagnostic variant: "
+            << kLongEffectMaskVariantNames[variant] << std::endl;
 }
 
 void SelectKsdg3BenchmarkVariant(std::istream& stream) {
@@ -9335,6 +9761,8 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     TestFeatures(pos);
   } else if (sub_command == "test_accumulator") {
     TestAccumulator(pos);
+  } else if (sub_command == "incremental_eval_checksum") {
+    TestIncrementalEvalChecksum();
   } else if (sub_command == "info") {
     PrintInfo(stream);
   } else if (sub_command == "accuracy") {
@@ -9393,6 +9821,12 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::uint64_t repeat_count;
     if (ReadNnueBenchRepeatCount(stream, repeat_count))
       TestKsdg3FeaturesBenchmark(repeat_count);
+  } else if (sub_command == "bench_long_effect_changed_mask") {
+    std::uint64_t repeat_count;
+    if (ReadNnueBenchRepeatCount(stream, repeat_count))
+      TestLongEffectChangedMaskBenchmark(repeat_count);
+  } else if (sub_command == "long_effect_mask_variant") {
+    SelectLongEffectMaskVariant(stream);
   } else if (sub_command == "ksdg3_variant") {
     SelectKsdg3BenchmarkVariant(stream);
 #if defined(USE_FINNY_TABLES)
@@ -9486,6 +9920,7 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << "usage:" << std::endl;
     std::cout << " test nnue test_features" << std::endl;
     std::cout << " test nnue test_accumulator" << std::endl;
+    std::cout << " test nnue incremental_eval_checksum" << std::endl;
     std::cout << " test nnue accuracy <sfenpack file>" << std::endl;
     std::cout << " test nnue accuracy_detail <sfenpack file> <output.csv>"
               << std::endl;
@@ -9498,6 +9933,9 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << " test nnue export_calibration_corpus \"file\" [count]" << std::endl;
     std::cout << " test nnue bench_ft [repeats]" << std::endl;
     std::cout << " test nnue bench_ksdg3_features [repeats]" << std::endl;
+    std::cout << " test nnue bench_long_effect_changed_mask [repeats]"
+              << std::endl;
+    std::cout << " test nnue long_effect_mask_variant <0..2>" << std::endl;
     std::cout << " test nnue ksdg3_variant <0..3>" << std::endl;
 #if defined(USE_FINNY_TABLES)
     std::cout << " test nnue bench_finny_compare [repeats]" << std::endl;

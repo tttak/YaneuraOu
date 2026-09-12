@@ -199,6 +199,15 @@ struct StateInfo {
 	Eval::NNUE::Accumulator accumulator;
 #endif
 
+#if (defined(ENABLE_NNUE_BENCH) \
+     || defined(USE_NNUE_KSDG3_EFFECT_TOUCHED_MASK)) \
+    && defined(LONG_EFFECT_LIBRARY) \
+    && defined(USE_BOARD_EFFECT_PREV)
+	// LongEffect transition mask. This member is intentionally below the
+	// do_move() memcpy boundary, so its block-copy size is unchanged.
+	Bitboard effect_touched_any;
+#endif
+
 #if defined (USE_EVAL_LIST)
 	// 評価値の差分計算の管理用
 	Eval::DirtyPiece dirtyPiece;

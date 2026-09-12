@@ -2366,6 +2366,15 @@ void Position::do_null_move(StateInfo& newSt, const T& tt) {
 	newSt.previous = st;
     st             = &newSt;
 
+#if (defined(ENABLE_NNUE_BENCH) \
+     || defined(USE_NNUE_KSDG3_EFFECT_TOUCHED_MASK)) \
+    && defined(LONG_EFFECT_LIBRARY) \
+    && defined(USE_BOARD_EFFECT_PREV)
+    // A null move changes no board effects.  Do not inherit the previous
+    // transition's diagnostic touched mask through the full StateInfo copy.
+    st->effect_touched_any = Bitboard(ZERO);
+#endif
+
 #if STOCKFISH
 	if (st->epSquare != SQ_NONE)
     {

@@ -192,6 +192,22 @@ namespace LongEffect
 {
   using namespace Effect8;
 
+#if defined(ENABLE_NNUE_BENCH) && defined(USE_BOARD_EFFECT_PREV)
+  struct EffectTouchedBenchmarkStats {
+    std::uint64_t update_calls = 0;
+    std::uint64_t square_write_events = 0;
+    std::uint64_t color_writes = 0;
+    std::uint64_t unique_touched_squares = 0;
+    std::uint64_t duplicate_square_writes = 0;
+    std::uint64_t final_raw_changed_squares = 0;
+    std::uint64_t final_capped_changed_squares = 0;
+  };
+
+  void SetEffectTouchedMaskEnabled(bool enabled);
+  bool IsEffectTouchedMaskEnabled();
+  void SetEffectTouchedBenchmarkStats(EffectTouchedBenchmarkStats* stats);
+#endif
+
   // ----------------------
   //  ByteBoard(利きの数を表現)
   // ----------------------

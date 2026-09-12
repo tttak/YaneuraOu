@@ -385,6 +385,7 @@
 // #define DISABLE_NNUE_PHASE_L2_FIXED_C32 // production既定のC32 Phase/L2を比較時に無効化
 // #define DISABLE_NNUE_LCA_LMR    // 295/epoch20用LCA top-1% LMRを比較時に無効化
 // #define DISABLE_NNUE_CROSS_LMR  // Cross high-tail LMRを比較時に無効化
+// #define DISABLE_NNUE_KSDG3_EFFECT_TOUCHED_MASK // production既定のchanged-maskを従来24近傍全走査へ戻す
 //
 // ENABLE_NNUE_ROUTER_LMR_EXPERIMENTはENABLE_NNUE_SIGNAL_LOGを必要とするため、
 // 下の既定設定でsignal log有効時に自動定義する。ここでは直接定義しない。
@@ -408,6 +409,15 @@
 #if defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536) \
 	&& !defined(DISABLE_NNUE_APPROX_SIGMOID_LUT)
 	#define USE_NNUE_APPROX_SIGMOID_LUT
+#endif
+
+// SFNNwoP1536ではLongEffect更新時に記録したeffect touched maskを使い、
+// KSDG3の非reset更新で従来行っていた王24近傍の全走査を省略する。
+// 比較・検証用buildではDISABLE_NNUE_KSDG3_EFFECT_TOUCHED_MASKを定義して
+// 従来の24近傍全走査へ戻せる。
+#if defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536) \
+	&& !defined(DISABLE_NNUE_KSDG3_EFFECT_TOUCHED_MASK)
+	#define USE_NNUE_KSDG3_EFFECT_TOUCHED_MASK
 #endif
 
 // SFNNwoP1536ではfc_1の出力幅64を標準使用する。

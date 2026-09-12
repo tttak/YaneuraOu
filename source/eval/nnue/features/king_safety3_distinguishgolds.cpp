@@ -7,10 +7,13 @@
 #include "king_safety3_distinguishgolds.h"
 #include "index_list.h"
 
-#if defined(ENABLE_NNUE_BENCH)
+#if defined(ENABLE_NNUE_BENCH) \
+    || defined(USE_NNUE_KSDG3_EFFECT_TOUCHED_MASK)
 #include <array>
-#include <chrono>
 #include <cstdint>
+#endif
+#if defined(ENABLE_NNUE_BENCH)
+#include <chrono>
 #endif
 
 namespace YaneuraOu {
@@ -82,6 +85,40 @@ constexpr auto BuildKsdg3Neighborhoods() {
 constexpr auto kKsdg3DirectionTable = BuildKsdg3DirectionTable();
 constexpr auto kKsdg3Neighborhoods = BuildKsdg3Neighborhoods();
 
+constexpr auto BuildKsdg3SquareByDirection() {
+  std::array<std::array<std::uint8_t, Effect24::DIRECT_NB>, SQ_NB> table{};
+  for (int king = 0; king < SQ_NB; ++king) {
+    for (int direction = 0; direction < Effect24::DIRECT_NB; ++direction)
+      table[king][direction] = 0xff;
+    for (int square = 0; square < SQ_NB; ++square) {
+      const auto direction = Ksdg3Direction(king, square);
+      if (direction != kInvalidKsdg3Direction)
+        table[king][direction] = static_cast<std::uint8_t>(square);
+    }
+  }
+  return table;
+}
+
+auto BuildKsdg3NeighborhoodBitboards() {
+  std::array<Bitboard, SQ_NB> table;
+  for (int king = 0; king < SQ_NB; ++king) {
+    table[king] = Bitboard(ZERO);
+    for (std::uint8_t i = 0; i < kKsdg3Neighborhoods[king].count; ++i)
+      table[king] |= static_cast<Square>(
+          kKsdg3Neighborhoods[king].neighbors[i].square);
+  }
+  return table;
+}
+
+constexpr auto kKsdg3SquareByDirection = BuildKsdg3SquareByDirection();
+
+const auto& Ksdg3NeighborhoodBitboards() {
+  // SquareBB is initialized at engine startup, so this table must not be
+  // constructed during namespace static initialization.
+  static const auto table = BuildKsdg3NeighborhoodBitboards();
+  return table;
+}
+
 Ksdg3BenchmarkVariant kKsdg3BenchmarkVariant =
     Ksdg3BenchmarkVariant::kBaseline;
 thread_local Ksdg3BenchmarkStageTiming* kKsdg3BenchmarkStageTiming = nullptr;
@@ -137,7 +174,8 @@ void AppendKsdg3ActiveCandidate(const Position& pos, Color perspective,
   }
 }
 
-template <Side AssociatedKing, bool HoistEffects, bool UseTables>
+template <Side AssociatedKing, bool HoistEffects, bool UseTables,
+          bool UseTouchedMask = false>
 void AppendKsdg3ChangedCandidate(const Position& pos, Color perspective,
                                  IndexList* const removed,
                                  IndexList* const added) {
@@ -259,6 +297,8 @@ void AppendKsdg3ChangedCandidate(const Position& pos, Color perspective,
     const int current_us = now_effect_us(square);
     const int current_them = now_effect_them(square);
     if (previous_us != current_us || previous_them != current_them) {
+      if (kKsdg3BenchmarkStageTiming != nullptr)
+        ++kKsdg3BenchmarkStageTiming->capped_changed_squares;
       const Piece piece = pos.piece_on(square);
       removed->push_back(Feature::MakeIndex(
           perspective, direction, piece, previous_us, previous_them));
@@ -270,8 +310,33 @@ void AppendKsdg3ChangedCandidate(const Position& pos, Color perspective,
   std::chrono::steady_clock::time_point neighbor_begin;
   if (kKsdg3BenchmarkStageTiming != nullptr)
     neighbor_begin = std::chrono::steady_clock::now();
-  if constexpr (UseTables) {
+  if constexpr (UseTouchedMask) {
+    Bitboard touched = pos.state()->effect_touched_any
+                     & Ksdg3NeighborhoodBitboards()[king];
+    if (kKsdg3BenchmarkStageTiming != nullptr) {
+      kKsdg3BenchmarkStageTiming->valid_neighbors +=
+          kKsdg3Neighborhoods[king].count;
+      kKsdg3BenchmarkStageTiming->touched_near_king += touched.pop_count();
+    }
+    std::uint32_t touched_directions = 0;
+    while (touched) {
+      const Square square = touched.pop();
+      const auto direction = kKsdg3DirectionTable[king][square];
+      if (direction != kInvalidKsdg3Direction)
+        touched_directions |= UINT32_C(1) << direction;
+    }
+    touched_directions &= ~dirty_directions;
+    while (touched_directions) {
+      const unsigned direction = LSB32(touched_directions);
+      touched_directions &= touched_directions - 1;
+      const auto square = kKsdg3SquareByDirection[king][direction];
+      process_neighbor(static_cast<Square>(square),
+                       static_cast<Effect24::Direct>(direction));
+    }
+  } else if constexpr (UseTables) {
     const auto& neighborhood = kKsdg3Neighborhoods[king];
+    if (kKsdg3BenchmarkStageTiming != nullptr)
+      kKsdg3BenchmarkStageTiming->valid_neighbors += neighborhood.count;
     for (std::uint8_t i = 0; i < neighborhood.count; ++i) {
       const auto neighbor = neighborhood.neighbors[i];
       process_neighbor(static_cast<Square>(neighbor.square),
@@ -281,8 +346,11 @@ void AppendKsdg3ChangedCandidate(const Position& pos, Color perspective,
     for (Effect24::Direct direction : Effect24::Direct()) {
       const SquareWithWall square_with_wall =
           king_with_wall + DirectToDeltaWW(direction);
-      if (is_ok(square_with_wall))
+      if (is_ok(square_with_wall)) {
+        if (kKsdg3BenchmarkStageTiming != nullptr)
+          ++kKsdg3BenchmarkStageTiming->valid_neighbors;
         process_neighbor(sqww_to_sq(square_with_wall), direction);
+      }
     }
   }
   std::chrono::steady_clock::time_point neighbor_end;
@@ -341,10 +409,194 @@ std::uint64_t ValidateKsdg3BenchmarkTables() {
         mismatches += table_direction != static_cast<std::uint8_t>(
             KingSafety3_DistinguishGolds<Side::kFriend>::CalcDirect(
                 static_cast<Square>(king), static_cast<Square>(square)));
+      if (nearby)
+        mismatches += kKsdg3SquareByDirection[king][table_direction]
+                    != square;
     }
+    mismatches += Ksdg3NeighborhoodBitboards()[king].pop_count()
+                != expected_count;
   }
   return mismatches;
 }
+#endif
+
+#if defined(USE_NNUE_KSDG3_EFFECT_TOUCHED_MASK)
+namespace {
+
+constexpr std::uint8_t kProductionInvalidDirection = 0xff;
+
+constexpr int ProductionAbs(const int value) {
+  return value < 0 ? -value : value;
+}
+
+constexpr std::uint8_t ProductionDirection(const int king, const int square) {
+  const int file_diff = square / 9 - king / 9;
+  const int rank_diff = square % 9 - king % 9;
+  if ((file_diff == 0 && rank_diff == 0)
+      || ProductionAbs(file_diff) > 2 || ProductionAbs(rank_diff) > 2)
+    return kProductionInvalidDirection;
+  const int uncompressed = file_diff * 5 + rank_diff + 12;
+  return static_cast<std::uint8_t>(
+      uncompressed - (uncompressed >= 12));
+}
+
+constexpr auto BuildProductionDirectionTable() {
+  std::array<std::array<std::uint8_t, SQ_NB>, SQ_NB> table{};
+  for (int king = 0; king < SQ_NB; ++king)
+    for (int square = 0; square < SQ_NB; ++square)
+      table[king][square] = ProductionDirection(king, square);
+  return table;
+}
+
+constexpr auto BuildProductionSquareByDirection() {
+  std::array<std::array<std::uint8_t, Effect24::DIRECT_NB>, SQ_NB> table{};
+  for (int king = 0; king < SQ_NB; ++king) {
+    for (int direction = 0; direction < Effect24::DIRECT_NB; ++direction)
+      table[king][direction] = 0xff;
+    for (int square = 0; square < SQ_NB; ++square) {
+      const auto direction = ProductionDirection(king, square);
+      if (direction != kProductionInvalidDirection)
+        table[king][direction] = static_cast<std::uint8_t>(square);
+    }
+  }
+  return table;
+}
+
+constexpr auto kProductionDirectionTable = BuildProductionDirectionTable();
+constexpr auto kProductionSquareByDirection =
+    BuildProductionSquareByDirection();
+
+auto BuildProductionNeighborhoodBitboards() {
+  std::array<Bitboard, SQ_NB> table;
+  for (int king = 0; king < SQ_NB; ++king) {
+    table[king] = Bitboard(ZERO);
+    for (int square = 0; square < SQ_NB; ++square)
+      if (kProductionDirectionTable[king][square]
+          != kProductionInvalidDirection)
+        table[king] |= static_cast<Square>(square);
+  }
+  return table;
+}
+
+const auto& ProductionNeighborhoodBitboards() {
+  // SquareBB is initialized during engine startup, so initialize lazily.
+  static const auto table = BuildProductionNeighborhoodBitboards();
+  return table;
+}
+
+inline int ProductionCappedEffect(const LongEffect::ByteBoard& effects,
+                                  const Square square) {
+  return std::min(int(effects.effect(square)), 3);
+}
+
+template <Side AssociatedKing>
+void AppendKsdg3ChangedProduction(const Position& pos, Color perspective,
+                                  IndexList* const removed,
+                                  IndexList* const added) {
+  using Feature = KingSafety3_DistinguishGolds<AssociatedKing>;
+  if constexpr (AssociatedKing == Side::kEnemy)
+    perspective = ~perspective;
+
+  const Color opponent = ~perspective;
+  const Square king = pos.square<KING>(perspective);
+  const auto& dirty_piece = pos.state()->dirtyPiece;
+  const auto& prev_us = pos.board_effect_prev[perspective];
+  const auto& prev_them = pos.board_effect_prev[opponent];
+  const auto& now_us = pos.board_effect[perspective];
+  const auto& now_them = pos.board_effect[opponent];
+  std::uint32_t dirty_directions = 0;
+
+  const auto previous_us = [&](const Square square) {
+    return ProductionCappedEffect(prev_us, square);
+  };
+  const auto previous_them = [&](const Square square) {
+    return ProductionCappedEffect(prev_them, square);
+  };
+  const auto current_us = [&](const Square square) {
+    return ProductionCappedEffect(now_us, square);
+  };
+  const auto current_them = [&](const Square square) {
+    return ProductionCappedEffect(now_them, square);
+  };
+
+  for (int i = 0; i < dirty_piece.dirty_num; ++i) {
+    const auto old_piece = static_cast<BonaPiece>(
+        dirty_piece.changed_piece[i].old_piece.from[BLACK]);
+    Square old_square;
+    Piece old_board_piece;
+    Feature::GetSquarePieceFromBonaPiece(
+        old_piece, old_square, old_board_piece);
+    if (old_square != SQ_NB) {
+      const auto direction = kProductionDirectionTable[king][old_square];
+      if (direction != kProductionInvalidDirection) {
+        dirty_directions |= UINT32_C(1) << direction;
+        const auto direct = static_cast<Effect24::Direct>(direction);
+        removed->push_back(Feature::MakeIndex(
+            perspective, direct, old_board_piece,
+            previous_us(old_square), previous_them(old_square)));
+        if (i == 0)
+          added->push_back(Feature::MakeIndex(
+              perspective, direct, NO_PIECE,
+              current_us(old_square), current_them(old_square)));
+      }
+    }
+
+    const auto new_piece = static_cast<BonaPiece>(
+        dirty_piece.changed_piece[i].new_piece.from[BLACK]);
+    Square new_square;
+    Piece new_board_piece;
+    Feature::GetSquarePieceFromBonaPiece(
+        new_piece, new_square, new_board_piece);
+    if (new_square != SQ_NB) {
+      const auto direction = kProductionDirectionTable[king][new_square];
+      if (direction != kProductionInvalidDirection) {
+        dirty_directions |= UINT32_C(1) << direction;
+        const auto direct = static_cast<Effect24::Direct>(direction);
+        if ((dirty_piece.dirty_num == 1 && i == 0)
+            || (dirty_piece.dirty_num == 2 && i == 1))
+          removed->push_back(Feature::MakeIndex(
+              perspective, direct, NO_PIECE,
+              previous_us(new_square), previous_them(new_square)));
+        added->push_back(Feature::MakeIndex(
+            perspective, direct, new_board_piece,
+            current_us(new_square), current_them(new_square)));
+      }
+    }
+  }
+
+  Bitboard touched = pos.state()->effect_touched_any
+                   & ProductionNeighborhoodBitboards()[king];
+  std::uint32_t touched_directions = 0;
+  while (touched) {
+    const Square square = touched.pop();
+    const auto direction = kProductionDirectionTable[king][square];
+    if (direction != kProductionInvalidDirection)
+      touched_directions |= UINT32_C(1) << direction;
+  }
+  touched_directions &= ~dirty_directions;
+
+  // Enumerate the direction mask in the original Effect24::Direct order.
+  while (touched_directions) {
+    const unsigned direction = LSB32(touched_directions);
+    touched_directions &= touched_directions - 1;
+    const Square square = static_cast<Square>(
+        kProductionSquareByDirection[king][direction]);
+    const int prev_us_value = previous_us(square);
+    const int prev_them_value = previous_them(square);
+    const int now_us_value = current_us(square);
+    const int now_them_value = current_them(square);
+    if (prev_us_value == now_us_value && prev_them_value == now_them_value)
+      continue;
+    const auto direct = static_cast<Effect24::Direct>(direction);
+    const Piece piece = pos.piece_on(square);
+    removed->push_back(Feature::MakeIndex(
+        perspective, direct, piece, prev_us_value, prev_them_value));
+    added->push_back(Feature::MakeIndex(
+        perspective, direct, piece, now_us_value, now_them_value));
+  }
+}
+
+}  // namespace
 #endif
 
 // 盤上の駒のBonaPieceからPieceへの変換配列
@@ -444,6 +696,11 @@ void KingSafety3_DistinguishGolds<AssociatedKing>::AppendActiveIndices(
       AppendKsdg3ActiveCandidate<AssociatedKing, true, true>(
           pos, perspective, active);
       return;
+    case Ksdg3BenchmarkVariant::kTouchedMask:
+      AppendKsdg3ActiveCandidate<AssociatedKing, true, true>(
+          pos, perspective, active);
+      return;
+    case Ksdg3BenchmarkVariant::kMaskOnly:
     case Ksdg3BenchmarkVariant::kBaseline:
       break;
   }
@@ -465,6 +722,11 @@ void KingSafety3_DistinguishGolds<AssociatedKing>::AppendActiveIndices(
     // 盤内の場合
     if (is_ok(sqww)) {
       Square sq = sqww_to_sq(sqww);
+
+#if defined(ENABLE_NNUE_BENCH)
+      if (kKsdg3BenchmarkStageTiming != nullptr)
+        ++kKsdg3BenchmarkStageTiming->valid_neighbors;
+#endif
       active->push_back(MakeIndex(perspective, dir, pos.piece_on(sq)
           , GetEffectCount(pos, sq, perspective, false)
           , GetEffectCount(pos, sq, ~perspective, false)
@@ -482,7 +744,11 @@ void KingSafety3_DistinguishGolds<AssociatedKing>::AppendChangedIndices(
     const Position& pos, Color perspective,
     IndexList* removed, IndexList* added) {
 
-#if defined(ENABLE_NNUE_BENCH)
+#if defined(USE_NNUE_KSDG3_EFFECT_TOUCHED_MASK)
+  AppendKsdg3ChangedProduction<AssociatedKing>(
+      pos, perspective, removed, added);
+  return;
+#elif defined(ENABLE_NNUE_BENCH)
   switch (GetKsdg3BenchmarkVariant()) {
     case Ksdg3BenchmarkVariant::kEffectHoist:
       AppendKsdg3ChangedCandidate<AssociatedKing, true, false>(
@@ -496,6 +762,11 @@ void KingSafety3_DistinguishGolds<AssociatedKing>::AppendChangedIndices(
       AppendKsdg3ChangedCandidate<AssociatedKing, true, true>(
           pos, perspective, removed, added);
       return;
+    case Ksdg3BenchmarkVariant::kTouchedMask:
+      AppendKsdg3ChangedCandidate<AssociatedKing, true, true, true>(
+          pos, perspective, removed, added);
+      return;
+    case Ksdg3BenchmarkVariant::kMaskOnly:
     case Ksdg3BenchmarkVariant::kBaseline:
       break;
   }
@@ -592,6 +863,11 @@ void KingSafety3_DistinguishGolds<AssociatedKing>::AppendChangedIndices(
     if (is_ok(sqww)) {
       Square sq = sqww_to_sq(sqww);
 
+#if defined(ENABLE_NNUE_BENCH)
+      if (kKsdg3BenchmarkStageTiming != nullptr)
+        ++kKsdg3BenchmarkStageTiming->valid_neighbors;
+#endif
+
       // dirtyな場合は既に処理済み
       if (dirty_bb & sq) {
         continue;
@@ -605,6 +881,10 @@ void KingSafety3_DistinguishGolds<AssociatedKing>::AppendChangedIndices(
       // 利き数に変化があった場合
       if (   effectCount_prev_1 != effectCount_now_1
           || effectCount_prev_2 != effectCount_now_2) {
+#if defined(ENABLE_NNUE_BENCH)
+        if (kKsdg3BenchmarkStageTiming != nullptr)
+          ++kKsdg3BenchmarkStageTiming->capped_changed_squares;
+#endif
         Piece pc = pos.piece_on(sq);
         removed->push_back(MakeIndex(perspective, dir, pc, effectCount_prev_1, effectCount_prev_2));
         added->push_back(MakeIndex(perspective, dir, pc, effectCount_now_1, effectCount_now_2));

@@ -288,6 +288,117 @@ namespace LongEffect
   // ----------------------
 
   using namespace Effect8;
+
+#if defined(ENABLE_NNUE_BENCH) && defined(USE_BOARD_EFFECT_PREV)
+  namespace {
+  thread_local bool effect_touched_mask_enabled = false;
+  thread_local EffectTouchedBenchmarkStats* effect_touched_stats = nullptr;
+
+  class EffectTouchedCollector {
+   public:
+    explicit EffectTouchedCollector(Position& pos, const bool enabled = true)
+        : pos_(pos), enabled_(enabled && effect_touched_mask_enabled) {}
+
+    void Record(const Bitboard squares, const std::uint64_t writes_per_square = 1) {
+      if (!enabled_)
+        return;
+      const auto count = static_cast<std::uint64_t>(squares.pop_count());
+      square_write_events_ += count;
+      color_writes_ += count * writes_per_square;
+      touched_ |= squares;
+    }
+
+    void Record(const Square square, const int first_delta,
+                const int second_delta) {
+      if (!enabled_)
+        return;
+      ++square_write_events_;
+      color_writes_ += (first_delta != 0) + (second_delta != 0);
+      touched_ |= square;
+    }
+
+    void Finish() {
+      if (!enabled_)
+        return;
+      pos_.state()->effect_touched_any = touched_;
+      if (effect_touched_stats == nullptr)
+        return;
+
+      auto squares = touched_;
+      const auto unique = static_cast<std::uint64_t>(squares.pop_count());
+      std::uint64_t raw_changed = 0;
+      std::uint64_t capped_changed = 0;
+      while (squares) {
+        const Square square = squares.pop();
+        bool raw = false;
+        bool capped = false;
+        for (const Color color : {BLACK, WHITE}) {
+          const int previous = pos_.board_effect_prev[color].effect(square);
+          const int current = pos_.board_effect[color].effect(square);
+          raw |= previous != current;
+          capped |= (previous < 3 ? previous : 3)
+                 != (current < 3 ? current : 3);
+        }
+        raw_changed += raw;
+        capped_changed += capped;
+      }
+      ++effect_touched_stats->update_calls;
+      effect_touched_stats->square_write_events += square_write_events_;
+      effect_touched_stats->color_writes += color_writes_;
+      effect_touched_stats->unique_touched_squares += unique;
+      effect_touched_stats->duplicate_square_writes +=
+          square_write_events_ - unique;
+      effect_touched_stats->final_raw_changed_squares += raw_changed;
+      effect_touched_stats->final_capped_changed_squares += capped_changed;
+    }
+
+   private:
+    Position& pos_;
+    bool enabled_;
+    Bitboard touched_{ZERO};
+    std::uint64_t square_write_events_ = 0;
+    std::uint64_t color_writes_ = 0;
+  };
+  }  // namespace
+
+  void SetEffectTouchedMaskEnabled(const bool enabled) {
+    effect_touched_mask_enabled = enabled;
+  }
+
+  bool IsEffectTouchedMaskEnabled() { return effect_touched_mask_enabled; }
+
+  void SetEffectTouchedBenchmarkStats(EffectTouchedBenchmarkStats* const stats) {
+    effect_touched_stats = stats;
+  }
+#elif defined(USE_NNUE_KSDG3_EFFECT_TOUCHED_MASK) \
+   && defined(USE_BOARD_EFFECT_PREV)
+  // Production candidate: compile-time fixed collector. There is no runtime
+  // selector, timer, statistics pointer, or per-write enable branch.
+  class EffectTouchedCollector {
+   public:
+    explicit EffectTouchedCollector(Position& pos, bool = true) : pos_(pos) {}
+
+    void Record(const Bitboard squares, std::uint64_t = 1) {
+      touched_ |= squares;
+    }
+
+    void Record(const Square square, int, int) { touched_ |= square; }
+
+    void Finish() { pos_.state()->effect_touched_any = touched_; }
+
+   private:
+    Position& pos_;
+    Bitboard touched_{ZERO};
+  };
+#else
+  class EffectTouchedCollector {
+   public:
+    explicit EffectTouchedCollector(Position&, bool = true) {}
+    void Record(Bitboard, std::uint64_t = 1) {}
+    void Record(Square, int, int) {}
+    void Finish() {}
+  };
+#endif
  
   // 駒pcをsqの地点においたときの短い利きを取得する(長い利きは含まれない)
   inline Bitboard short_effects_from(Piece pc,Square sq)
@@ -365,6 +476,7 @@ namespace LongEffect
         /* trick b) xorで先後同時にこの方向の利きを更新*/                                            \
         long_effect.le16[sq].u16 ^= value;                                                           \
         EFFECT_FUNC(Us,sq,e1,e2);                                                                    \
+        effect_touched.Record(sq,e1,e2);                                                             \
       } while (pos.piece_on(sq) == NO_PIECE);                                                        \
     }}
 
@@ -379,10 +491,12 @@ namespace LongEffect
   template <Color Us> void update_by_dropping_piece(Position& pos, Square to, Piece dropped_pc)
   {
     auto& board_effect = pos.board_effect;
+    EffectTouchedCollector effect_touched(pos);
 
     // 駒打ちなので
     // 1) 打った駒による利きの数の加算処理
     auto inc_target = short_effects_from(dropped_pc, to);
+    effect_touched.Record(inc_target);
     while (inc_target)
     {
       auto sq = inc_target.pop();
@@ -408,6 +522,7 @@ namespace LongEffect
     auto dir_bw_us = LongEffect::long_effect16_of(dropped_pc); // 自分の打った駒による利きは増えて
     auto dir_bw_others = pos.long_effect.long_effect16(to); // その駒によって遮断された利きは減る
     UPDATE_LONG_EFFECT_FROM(to , dir_bw_us, dir_bw_others, +1);
+    effect_touched.Finish();
   }
 
   // Usの手番で駒pcをtoに移動させ、成りがある場合、moved_after_pcになっており、捕獲された駒captured_pcがあるときの盤面の利きの更新
@@ -415,6 +530,7 @@ namespace LongEffect
   {
     auto& board_effect = pos.board_effect;
     auto& long_effect = pos.long_effect;
+    EffectTouchedCollector effect_touched(pos);
 
     // -- 移動させた駒と捕獲された駒による利きの更新
 
@@ -429,11 +545,15 @@ namespace LongEffect
     inc_target ^= and_target;
     dec_target ^= and_target;
 
+    effect_touched.Record(inc_target);
+    effect_touched.Record(dec_target);
+
     while (inc_target) { auto sq = inc_target.pop(); ADD_BOARD_EFFECT( Us, sq , +1); }
     while (dec_target) { auto sq = dec_target.pop(); ADD_BOARD_EFFECT( Us, sq , -1); }
 
     // 捕獲された駒の利きの消失
     dec_target = short_effects_from(captured_pc, to);
+    effect_touched.Record(dec_target);
     while (dec_target) { auto sq = dec_target.pop(); ADD_BOARD_EFFECT(~Us, sq , -1); }
 
     // -- fromの地点での長い利きの更新。
@@ -468,6 +588,7 @@ namespace LongEffect
     dir_bw_us = LongEffect::long_effect16_of(moved_after_pc);
     dir_bw_others = LongEffect::long_effect16_of(captured_pc);
     UPDATE_LONG_EFFECT_FROM(to, dir_bw_us , dir_bw_others , +1);
+    effect_touched.Finish();
   }
 
   // Usの手番で駒pcをtoに移動させ、成りがある場合、moved_after_pcになっている(捕獲された駒はない)ときの盤面の利きの更新
@@ -475,6 +596,7 @@ namespace LongEffect
   {
     auto& board_effect = pos.board_effect;
     auto& long_effect = pos.long_effect;
+    EffectTouchedCollector effect_touched(pos);
 
     // -- 移動させた駒と捕獲された駒による利きの更新
 
@@ -484,6 +606,9 @@ namespace LongEffect
     auto and_target = inc_target & dec_target;
     inc_target ^= and_target;
     dec_target ^= and_target;
+
+    effect_touched.Record(inc_target);
+    effect_touched.Record(dec_target);
 
     while (inc_target) { auto sq = inc_target.pop(); ADD_BOARD_EFFECT(Us, sq , +1); }
     while (dec_target) { auto sq = dec_target.pop(); ADD_BOARD_EFFECT(Us, sq , -1); }
@@ -513,6 +638,7 @@ namespace LongEffect
     dir_bw_others = pos.long_effect.long_effect16(to);
     
     UPDATE_LONG_EFFECT_FROM(to, dir_bw_us, dir_bw_others, +1);
+    effect_touched.Finish();
   }
 
   // ----------------------
@@ -524,6 +650,7 @@ namespace LongEffect
   template <Color Us> void rewind_by_dropping_piece(Position& pos, Square to, Piece dropped_pc)
   {
     auto& board_effect = pos.board_effect;
+    EffectTouchedCollector effect_touched(pos, false);
 
     auto inc_target = short_effects_from(dropped_pc, to);
     while (inc_target)
@@ -543,6 +670,7 @@ namespace LongEffect
   {
     auto& board_effect = pos.board_effect;
     auto& long_effect = pos.long_effect;
+    EffectTouchedCollector effect_touched(pos, false);
 
     auto inc_target = short_effects_from(moved_pc, from);
     auto dec_target = short_effects_from(moved_after_pc, to);
@@ -587,6 +715,7 @@ namespace LongEffect
   {
     auto& board_effect = pos.board_effect;
     auto& long_effect = pos.long_effect;
+    EffectTouchedCollector effect_touched(pos, false);
 
     auto inc_target = short_effects_from(moved_pc, from);
     auto dec_target = short_effects_from(moved_after_pc, to);
