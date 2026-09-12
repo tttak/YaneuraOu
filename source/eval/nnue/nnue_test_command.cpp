@@ -3706,6 +3706,319 @@ const Network& NnueBenchSelectedNetwork(const int selected_bucket) {
 #endif
 }
 
+enum class PairWeightReuseStage {
+  MainPairAndPacking,
+  FullTransform,
+  FreshEvaluate,
+};
+
+constexpr std::array<const char*, 4> kPairWeightReuseVariantNames = {
+    "A. legacy perspective-outer",
+    "B1. shared weight load only",
+    "B2. shared load + int32 expand",
+    "B3. full chunk-outer expanded reuse",
+};
+
+constexpr std::array<const char*, 3> kPairWeightReuseStageNames = {
+    "PairWeight blend + Main packing (complete Main FT stage)",
+    "Transform total (precomputed accumulator)",
+    "fresh NNUE evaluate pipeline (precomputed accumulator)",
+};
+
+template<int Variant, PairWeightReuseStage Stage>
+NnueBenchTiming MeasurePairWeightReuseCorpus(
+    const std::vector<FtTransformBenchCase>& corpus,
+    std::uint64_t& checksum) {
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType,
+                 FeatureTransformer::kOutputDimensions> main_output{};
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType, 128> diff_output{};
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType, 128> abs_output{};
+  alignas(kCacheLineSize) std::int32_t router_output[32];
+  alignas(kCacheLineSize) char network_buffer[Network::kBufferSize];
+  NetworkBenchCase network_input{};
+  NnueBenchTiming timing;
+
+  const auto begin = NnueBenchClock::now();
+  for (const auto& sample : corpus) {
+    if constexpr (Stage == PairWeightReuseStage::MainPairAndPacking) {
+      feature_transformer->BenchmarkTransformMainPairReuse<Variant>(
+          *sample.position, main_output.data(), sample.material_bucket);
+      KeepNnueBenchObject(main_output);
+      MixNnueBenchChecksum(
+          checksum, main_output[static_cast<std::size_t>(timing.calls)
+                              % main_output.size()]);
+    } else {
+      feature_transformer->BenchmarkTransformReconstructedPairReuse<Variant>(
+          *sample.position, main_output.data(), diff_output.data(),
+          abs_output.data(), sample.material_bucket);
+      if constexpr (Stage == PairWeightReuseStage::FullTransform) {
+        KeepNnueBenchObject(main_output);
+        KeepNnueBenchObject(diff_output);
+        KeepNnueBenchObject(abs_output);
+        const std::size_t main_index =
+            static_cast<std::size_t>(timing.calls) % main_output.size();
+        const std::size_t fm_index =
+            static_cast<std::size_t>(timing.calls) % diff_output.size();
+        MixNnueBenchChecksum(checksum, main_output[main_index]);
+        MixNnueBenchChecksum(checksum, diff_output[fm_index]);
+        MixNnueBenchChecksum(checksum, abs_output[fm_index]);
+      } else {
+        network_input.transformed = main_output;
+        network_input.diff_transformed = diff_output;
+        network_input.abs_transformed = abs_output;
+        network_input.material_bucket = sample.material_bucket;
+        FillNnueBenchRouterInput(network_input);
+        router->PropagatePrefix<12>(
+            network_input.router_input.data(), router_output);
+        const int selected_bucket = SelectNnueBenchBucket(router_output);
+        const std::int32_t final_output =
+            NnueBenchSelectedNetwork(selected_bucket)
+                .Propagate(
+                    network_input.transformed.data(),
+                    network_input.diff_transformed.data(),
+                    network_input.abs_transformed.data(),
+                    network_input.material_bucket, network_buffer)[0];
+        MixNnueBenchChecksum(checksum, final_output);
+      }
+    }
+    ++timing.calls;
+  }
+  const auto end = NnueBenchClock::now();
+  timing.nanoseconds =
+      std::chrono::duration<double, std::nano>(end - begin).count();
+  return timing;
+}
+
+template<int Variant>
+NnueBenchTiming MeasurePairWeightReuseByStage(
+    const std::vector<FtTransformBenchCase>& corpus,
+    const PairWeightReuseStage stage, std::uint64_t& checksum) {
+  switch (stage) {
+    case PairWeightReuseStage::MainPairAndPacking:
+      return MeasurePairWeightReuseCorpus<
+          Variant, PairWeightReuseStage::MainPairAndPacking>(corpus,
+                                                              checksum);
+    case PairWeightReuseStage::FullTransform:
+      return MeasurePairWeightReuseCorpus<
+          Variant, PairWeightReuseStage::FullTransform>(corpus, checksum);
+    case PairWeightReuseStage::FreshEvaluate:
+      return MeasurePairWeightReuseCorpus<
+          Variant, PairWeightReuseStage::FreshEvaluate>(corpus, checksum);
+  }
+  return {};
+}
+
+NnueBenchTiming MeasurePairWeightReuseVariant(
+    const std::vector<FtTransformBenchCase>& corpus, const int variant,
+    const PairWeightReuseStage stage, std::uint64_t& checksum) {
+  switch (variant) {
+    case 0: return MeasurePairWeightReuseByStage<0>(corpus, stage, checksum);
+    case 1: return MeasurePairWeightReuseByStage<1>(corpus, stage, checksum);
+    case 2: return MeasurePairWeightReuseByStage<2>(corpus, stage, checksum);
+    case 3: return MeasurePairWeightReuseByStage<3>(corpus, stage, checksum);
+    default: return {};
+  }
+}
+
+void TestPairWeightPerspectiveReuseBenchmark(
+    const std::uint64_t repeat_count) {
+  std::cout << "[NNUE benchmark: PairWeight perspective reuse]" << std::endl
+            << "  seed         : " << kNnueBenchSeed << std::endl
+            << "  corpus games : " << kNnueBenchMeasuredGames << std::endl
+            << "  max ply/game : " << kNnueBenchMaxPly << std::endl
+            << "  repeats      : " << repeat_count << std::endl
+            << "  variants     : legacy / load / expand / full chunk"
+            << std::endl
+            << "  production path changed: no" << std::endl
+            << "  corpus build : real positions and precomputed accumulators..."
+            << std::flush;
+  const auto corpus = MakeFtTransformStageBenchCorpus();
+  std::cout << "done (" << corpus.size() << ")" << std::endl;
+  if (corpus.empty()) {
+    std::cout << "error: PairWeight benchmark corpus is empty" << std::endl;
+    return;
+  }
+  std::cout << "  warm-up calls: " << corpus.size()
+            << " before every timed sample" << std::endl
+            << "[source-level intended counts per 32 outputs]" << std::endl
+            << "  note: compiler CSE may share additional extensions"
+            << std::endl
+            << "  A  : weight loads 24, int32 extends 24" << std::endl
+            << "  B1 : weight loads 12, int32 extends 24" << std::endl
+            << "  B2 : weight loads 12, int32 extends 12" << std::endl
+            << "  B3 : weight loads 12, int32 extends 12; 12 expanded weights live"
+            << std::endl;
+
+  constexpr std::array<PairWeightReuseStage, 3> stages = {
+      PairWeightReuseStage::MainPairAndPacking,
+      PairWeightReuseStage::FullTransform,
+      PairWeightReuseStage::FreshEvaluate,
+  };
+  std::array<std::array<NnueBenchSamples, 4>, 3> samples;
+  std::array<std::array<std::uint64_t, 4>, 3> checksums;
+  for (auto& row : checksums)
+    row.fill(UINT64_C(14695981039346656037));
+
+  for (std::size_t stage_index = 0; stage_index < stages.size();
+       ++stage_index) {
+    for (std::uint64_t repeat = 0; repeat < repeat_count; ++repeat) {
+      for (int offset = 0; offset < 4; ++offset) {
+        const int variant = static_cast<int>((repeat + offset) % 4);
+        std::uint64_t warmup = UINT64_C(14695981039346656037);
+        MeasurePairWeightReuseVariant(
+            corpus, variant, stages[stage_index], warmup);
+        samples[stage_index][variant].Add(MeasurePairWeightReuseVariant(
+            corpus, variant, stages[stage_index],
+            checksums[stage_index][variant]));
+      }
+    }
+  }
+
+  for (std::size_t stage_index = 0; stage_index < stages.size();
+       ++stage_index) {
+    std::cout << kPairWeightReuseStageNames[stage_index] << std::endl;
+    const auto baseline =
+        SummarizeNnueBenchSamples(samples[stage_index][0]);
+    for (int variant = 0; variant < 4; ++variant) {
+      PrintNnueBenchSamples(
+          kPairWeightReuseVariantNames[variant],
+          samples[stage_index][variant]);
+      if (variant != 0) {
+        const auto candidate =
+            SummarizeNnueBenchSamples(samples[stage_index][variant]);
+        const double improvement = baseline.median == 0.0
+            ? 0.0
+            : (baseline.median - candidate.median) * 100.0
+                / baseline.median;
+        std::cout << "  improvement vs A : " << std::fixed
+                  << std::setprecision(2) << improvement << "%"
+                  << std::endl;
+      }
+    }
+  }
+
+  std::array<std::uint64_t, 4> output_checksums;
+  std::array<std::uint64_t, 4> final_checksums;
+  output_checksums.fill(UINT64_C(14695981039346656037));
+  final_checksums.fill(UINT64_C(14695981039346656037));
+  std::array<std::uint64_t, 4> black_mismatches{};
+  std::array<std::uint64_t, 4> white_mismatches{};
+  std::array<std::uint64_t, 4> packed_mismatches{};
+  std::array<std::uint64_t, 4> final_mismatches{};
+  std::array<std::int32_t, 4> first_final_reference{};
+  std::array<std::int32_t, 4> first_final_candidate{};
+  std::array<std::size_t, 4> first_final_sample{};
+  alignas(kCacheLineSize)
+      std::array<FeatureTransformer::OutputType,
+                 FeatureTransformer::kOutputDimensions> candidate_main{};
+  alignas(kCacheLineSize) std::int32_t router_output[32];
+  alignas(kCacheLineSize) char network_buffer[Network::kBufferSize];
+  NetworkBenchCase network_input{};
+
+  auto final_from_main = [&](const FtTransformBenchCase& sample,
+                             const auto& main) {
+    network_input.transformed = main;
+    network_input.diff_transformed = sample.expected_diff;
+    network_input.abs_transformed = sample.expected_abs;
+    network_input.material_bucket = sample.material_bucket;
+    FillNnueBenchRouterInput(network_input);
+    router->PropagatePrefix<12>(
+        network_input.router_input.data(), router_output);
+    const int selected_bucket = SelectNnueBenchBucket(router_output);
+    return NnueBenchSelectedNetwork(selected_bucket)
+        .Propagate(
+            network_input.transformed.data(),
+            network_input.diff_transformed.data(),
+            network_input.abs_transformed.data(),
+            network_input.material_bucket, network_buffer)[0];
+  };
+
+  for (std::size_t sample_index = 0; sample_index < corpus.size();
+       ++sample_index) {
+    const auto& sample = corpus[sample_index];
+    const std::int32_t reference_final =
+        final_from_main(sample, sample.expected_main);
+    for (int variant = 0; variant < 4; ++variant) {
+      switch (variant) {
+        case 0:
+          feature_transformer->BenchmarkTransformMainPairReuse<0>(
+              *sample.position, candidate_main.data(), sample.material_bucket);
+          break;
+        case 1:
+          feature_transformer->BenchmarkTransformMainPairReuse<1>(
+              *sample.position, candidate_main.data(), sample.material_bucket);
+          break;
+        case 2:
+          feature_transformer->BenchmarkTransformMainPairReuse<2>(
+              *sample.position, candidate_main.data(), sample.material_bucket);
+          break;
+        case 3:
+          feature_transformer->BenchmarkTransformMainPairReuse<3>(
+              *sample.position, candidate_main.data(), sample.material_bucket);
+          break;
+      }
+      const Color first = sample.position->side_to_move();
+      constexpr std::size_t half =
+          FeatureTransformer::kOutputDimensions / 2;
+      for (std::size_t index = 0; index < candidate_main.size(); ++index) {
+        MixNnueBenchChecksum(output_checksums[variant], candidate_main[index]);
+        if (candidate_main[index] != sample.expected_main[index]) {
+          ++packed_mismatches[variant];
+          const Color perspective = index < half ? first : ~first;
+          if (perspective == BLACK)
+            ++black_mismatches[variant];
+          else
+            ++white_mismatches[variant];
+        }
+      }
+      const std::int32_t candidate_final =
+          final_from_main(sample, candidate_main);
+      MixNnueBenchChecksum(final_checksums[variant], candidate_final);
+      if (candidate_final != reference_final) {
+        if (final_mismatches[variant] == 0) {
+          first_final_sample[variant] = sample_index;
+          first_final_reference[variant] = reference_final;
+          first_final_candidate[variant] = candidate_final;
+        }
+        ++final_mismatches[variant];
+      }
+    }
+  }
+
+  std::cout << "[correctness]" << std::endl;
+  for (int variant = 0; variant < 4; ++variant) {
+    std::cout << "  " << kPairWeightReuseVariantNames[variant] << std::endl
+              << "    BLACK output mismatch : "
+              << black_mismatches[variant] << std::endl
+              << "    WHITE output mismatch : "
+              << white_mismatches[variant] << std::endl
+              << "    packed Main mismatch  : "
+              << packed_mismatches[variant] << std::endl
+              << "    final Network mismatch: "
+              << final_mismatches[variant] << std::endl
+              << "    Main checksum : 0x" << std::hex
+              << output_checksums[variant] << std::endl
+              << "    final checksum: 0x" << final_checksums[variant]
+              << std::dec << std::endl;
+    if (final_mismatches[variant] != 0)
+      std::cout << "    first final mismatch: sample="
+                << first_final_sample[variant] << " A="
+                << first_final_reference[variant] << " B="
+                << first_final_candidate[variant] << std::endl;
+  }
+  std::cout << "[timing checksum match by stage]" << std::endl;
+  for (std::size_t stage = 0; stage < stages.size(); ++stage) {
+    std::cout << "  " << kPairWeightReuseStageNames[stage] << " : ";
+    bool match = true;
+    for (int variant = 1; variant < 4; ++variant)
+      match = match && checksums[stage][variant] == checksums[stage][0];
+    std::cout << (match ? "yes" : "NO") << std::endl;
+  }
+}
+
 struct alignas(kCacheLineSize) NetworkStageBenchCase {
   NetworkBenchCase input;
   Network::Buffer intermediate;
@@ -10226,6 +10539,10 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::uint64_t repeat_count;
     if (ReadNnueBenchRepeatCount(stream, repeat_count))
       TestFeatureTransformerStagesBenchmark(repeat_count);
+  } else if (sub_command == "bench_pairweight_perspective_reuse") {
+    std::uint64_t repeat_count;
+    if (ReadNnueBenchRepeatCount(stream, repeat_count))
+      TestPairWeightPerspectiveReuseBenchmark(repeat_count);
 #if defined(USE_AVX2)
   } else if (sub_command == "bench_ft_fm_scaling_compare") {
     std::uint64_t repeat_count;
@@ -10327,6 +10644,8 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << " test nnue bench_finny_fm_compare [repeats]" << std::endl;
 #endif
     std::cout << " test nnue bench_ft_transform_stages [repeats]"
+              << std::endl;
+    std::cout << " test nnue bench_pairweight_perspective_reuse [repeats]"
               << std::endl;
 #if defined(USE_AVX2)
     std::cout << " test nnue bench_ft_fm_scaling_compare [repeats]"

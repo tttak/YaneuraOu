@@ -355,6 +355,20 @@ class FeatureTransformer {
 		const int16_t* curr_w_sum  = pair_weights_sum[pair_bucket];
 
 		// --- 2. Main Transformation: Accumulatorからの特徴抽出 ---
+#if defined(ENABLE_NNUE_BENCH) \
+	&& defined(NNUE_BENCH_PAIRWEIGHT_REUSE_VARIANT)
+		// Diagnostic-only selector used by the production-path A/B binaries.
+		// Normal builds never enter this branch.
+#if NNUE_BENCH_PAIRWEIGHT_REUSE_VARIANT == 1
+		BenchmarkTransformMainPairReuse<1>(pos, output, bucket_id);
+#elif NNUE_BENCH_PAIRWEIGHT_REUSE_VARIANT == 2
+		BenchmarkTransformMainPairReuse<2>(pos, output, bucket_id);
+#elif NNUE_BENCH_PAIRWEIGHT_REUSE_VARIANT == 3
+		BenchmarkTransformMainPairReuse<3>(pos, output, bucket_id);
+#else
+#error "NNUE_BENCH_PAIRWEIGHT_REUSE_VARIANT must be 1, 2, or 3"
+#endif
+#else
 		const Color perspectives[2] = {pos.side_to_move(), ~pos.side_to_move()};
 		for (IndexType p = 0; p < 2; ++p)
 		{
@@ -433,6 +447,7 @@ class FeatureTransformer {
 #endif // #if defined(VECTOR)
 
 		} // for (IndexType p = 0; p < 2; ++p)
+#endif
 
 
 		// --- 3. FM Path calculation: 2次相互作用（Factorization Machines）の抽出 ---
@@ -1755,6 +1770,181 @@ class FeatureTransformer {
 			}
 #endif
 		}
+	}
+
+	// Diagnostic-only PairWeight perspective-reuse candidates.
+	// variant 0: legacy perspective-outer implementation above.
+	// variant 1: share each 128-bit weight load, repeat int32 extension.
+	// variant 2: share load and int32 extension one 8-lane group at a time.
+	// variant 3: expand all four 8-lane groups for a 32-output chunk first.
+	template<int Variant>
+	void BenchmarkTransformMainPairReuse(
+		const Position& pos, OutputType* output, const int bucket_id) const {
+		static_assert(Variant >= 0 && Variant <= 3,
+		              "PairWeight benchmark variant must be 0..3");
+		if constexpr (Variant == 0) {
+			BenchmarkTransformMain(pos, output, bucket_id);
+			return;
+		}
+#if defined(USE_AVX2)
+		const auto& accumulation = pos.state()->accumulator.accumulation;
+		const int pair_bucket =
+			std::clamp(bucket_id, 0, static_cast<int>(kPairWeightBuckets) - 1);
+		const int16_t* curr_w_mul = pair_weights_mul[pair_bucket];
+		const int16_t* curr_w_diff = pair_weights_diff[pair_bucket];
+		const int16_t* curr_w_sum = pair_weights_sum[pair_bucket];
+		const Color perspectives[2] = {
+			pos.side_to_move(), ~pos.side_to_move()};
+		constexpr IndexType kOutputsPerPerspective = kHalfDimensions / 2;
+		constexpr IndexType kOutputsPerChunk = 32;
+		constexpr IndexType kGroupsPerChunk = 4;
+		constexpr IndexType kGroupWidth = 8;
+		constexpr IndexType kChunkCount =
+			kOutputsPerPerspective / kOutputsPerChunk;
+		const __m256i zero16 = _mm256_setzero_si256();
+		const __m256i max16 = _mm256_set1_epi16(127);
+		const __m256i scale64 = _mm256_set1_epi32(64);
+
+		auto compute8 = [&](const __m128i a16, const __m128i b16,
+		                    const __m256i w_mul, const __m256i w_diff,
+		                    const __m256i w_sum) {
+			const __m256i a32 = _mm256_cvtepi16_epi32(a16);
+			const __m256i b32 = _mm256_cvtepi16_epi32(b16);
+			const __m256i term_mul = _mm256_mullo_epi32(
+				_mm256_mullo_epi32(a32, b32), w_mul);
+			const __m256i diff = _mm256_sub_epi32(a32, b32);
+			const __m256i term_diff = _mm256_mullo_epi32(
+				_mm256_mullo_epi32(diff, diff), w_diff);
+			const __m256i term_sum = _mm256_mullo_epi32(
+				_mm256_mullo_epi32(_mm256_add_epi32(a32, b32), w_sum),
+				scale64);
+			return _mm256_srai_epi32(
+				_mm256_add_epi32(_mm256_add_epi32(term_mul, term_diff),
+				                   term_sum),
+				21);
+		};
+
+		for (IndexType chunk = 0; chunk < kChunkCount; ++chunk) {
+			const IndexType chunk_index = chunk * kOutputsPerChunk;
+			__m256i expanded_mul[kGroupsPerChunk];
+			__m256i expanded_diff[kGroupsPerChunk];
+			__m256i expanded_sum[kGroupsPerChunk];
+			if constexpr (Variant >= 3) {
+				for (IndexType group = 0; group < kGroupsPerChunk; ++group) {
+					const IndexType index = chunk_index + group * kGroupWidth;
+					expanded_mul[group] = _mm256_cvtepi16_epi32(
+						_mm_loadu_si128(reinterpret_cast<const __m128i*>(
+							&curr_w_mul[index])));
+					expanded_diff[group] = _mm256_cvtepi16_epi32(
+						_mm_loadu_si128(reinterpret_cast<const __m128i*>(
+							&curr_w_diff[index])));
+					expanded_sum[group] = _mm256_cvtepi16_epi32(
+						_mm_loadu_si128(reinterpret_cast<const __m128i*>(
+							&curr_w_sum[index])));
+				}
+			}
+
+			__m256i blended16[2][2];
+			for (IndexType half = 0; half < 2; ++half) {
+				__m256i a16[2];
+				__m256i b16[2];
+				for (IndexType p = 0; p < 2; ++p) {
+					const Color side = perspectives[p];
+					const IndexType index = chunk_index + half * 16;
+					a16[p] = _mm256_loadu_si256(
+						reinterpret_cast<const __m256i*>(
+							&accumulation[side][0][index]));
+					b16[p] = _mm256_loadu_si256(
+						reinterpret_cast<const __m256i*>(
+							&accumulation[side][0][kOutputsPerPerspective + index]));
+					a16[p] = _mm256_max_epi16(
+						_mm256_min_epi16(a16[p], max16), zero16);
+					b16[p] = _mm256_max_epi16(
+						_mm256_min_epi16(b16[p], max16), zero16);
+				}
+
+				__m256i results[2][2];
+				for (IndexType sub = 0; sub < 2; ++sub) {
+					const IndexType group = half * 2 + sub;
+					const IndexType index = chunk_index + group * kGroupWidth;
+					if constexpr (Variant == 1) {
+						const __m128i raw_mul = _mm_loadu_si128(
+							reinterpret_cast<const __m128i*>(&curr_w_mul[index]));
+						const __m128i raw_diff = _mm_loadu_si128(
+							reinterpret_cast<const __m128i*>(&curr_w_diff[index]));
+						const __m128i raw_sum = _mm_loadu_si128(
+							reinterpret_cast<const __m128i*>(&curr_w_sum[index]));
+						for (IndexType p = 0; p < 2; ++p) {
+							const __m128i a = sub == 0
+								? _mm256_castsi256_si128(a16[p])
+								: _mm256_extracti128_si256(a16[p], 1);
+							const __m128i b = sub == 0
+								? _mm256_castsi256_si128(b16[p])
+								: _mm256_extracti128_si256(b16[p], 1);
+							results[p][sub] = compute8(
+								a, b, _mm256_cvtepi16_epi32(raw_mul),
+								_mm256_cvtepi16_epi32(raw_diff),
+								_mm256_cvtepi16_epi32(raw_sum));
+						}
+					} else {
+						__m256i shared_mul;
+						__m256i shared_diff;
+						__m256i shared_sum;
+						if constexpr (Variant >= 3) {
+							shared_mul = expanded_mul[group];
+							shared_diff = expanded_diff[group];
+							shared_sum = expanded_sum[group];
+						} else {
+							shared_mul = _mm256_cvtepi16_epi32(_mm_loadu_si128(
+								reinterpret_cast<const __m128i*>(&curr_w_mul[index])));
+							shared_diff = _mm256_cvtepi16_epi32(_mm_loadu_si128(
+								reinterpret_cast<const __m128i*>(&curr_w_diff[index])));
+							shared_sum = _mm256_cvtepi16_epi32(_mm_loadu_si128(
+								reinterpret_cast<const __m128i*>(&curr_w_sum[index])));
+						}
+						for (IndexType p = 0; p < 2; ++p) {
+							const __m128i a = sub == 0
+								? _mm256_castsi256_si128(a16[p])
+								: _mm256_extracti128_si256(a16[p], 1);
+							const __m128i b = sub == 0
+								? _mm256_castsi256_si128(b16[p])
+								: _mm256_extracti128_si256(b16[p], 1);
+							results[p][sub] = compute8(
+								a, b, shared_mul, shared_diff, shared_sum);
+						}
+					}
+				}
+				for (IndexType p = 0; p < 2; ++p) {
+					blended16[p][half] = _mm256_permute4x64_epi64(
+						_mm256_packs_epi32(results[p][0], results[p][1]),
+						_MM_SHUFFLE(3, 1, 2, 0));
+				}
+			}
+
+			for (IndexType p = 0; p < 2; ++p) {
+				const __m256i packed8 = _mm256_permute4x64_epi64(
+					_mm256_packus_epi16(blended16[p][0], blended16[p][1]),
+					_MM_SHUFFLE(3, 1, 2, 0));
+				_mm256_storeu_si256(
+					reinterpret_cast<__m256i*>(
+						&output[p * kOutputsPerPerspective + chunk_index]),
+					packed8);
+			}
+		}
+#else
+		BenchmarkTransformMain(pos, output, bucket_id);
+#endif
+	}
+
+	template<int Variant>
+	void BenchmarkTransformReconstructedPairReuse(
+		const Position& pos, OutputType* output, OutputType* diff_output,
+		OutputType* abs_output, const int bucket_id) const {
+		BenchmarkFmInteractions interactions;
+		BenchmarkTransformMainPairReuse<Variant>(pos, output, bucket_id);
+		BenchmarkTransformFmInteractionsOnly(pos, interactions);
+		BenchmarkTransformFmOutputsOnly(
+			pos, interactions, diff_output, abs_output);
 	}
 
 	// Recompute the four 32-element FM interaction vectors. The stored layout
