@@ -377,6 +377,9 @@
 // #define ENABLE_NNUE_BENCH       // test nnue bench_* の専用benchmark
 // #define ENABLE_NNUE_SIGNAL_LOG  // 探索中のNNUE内部signal収集・report
 // #define ENABLE_NNUE_RFP_SHADOW  // 成立したreverse futilityの一部をshadow探索
+// #define ENABLE_NNUE_UNCERTAINTY_SIGNAL // frozen teacher-disagreement headを診断ログへ追加
+// #define ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL // Hao static-vs-depth9 probe 4種を診断ログへ追加
+// #define ENABLE_NNUE_FUTILITY_SHADOW // uncertainty別のforward-futility誤cut診断(1/256 sampling)
 // #define ENABLE_NNUE_CROSS_LMR_EXPERIMENT // Cross maxによるLMR +1 plyの診断A/B
 // #define USE_NNUE_PHASE_FM_LMR   // Router非対象の高評価・低FM relianceを明示的に+1 ply
 // #define USE_NNUE_LCA_WIDTH_24   // optional LCA 24d architecture（32d既定）

@@ -8,6 +8,7 @@
 
 #if defined(ENABLE_NNUE_SIGNAL_LOG) || defined(USE_NNUE_ROUTER_LMR)
 
+#include <cstddef>
 #include <cstdint>
 
 namespace YaneuraOu::Eval::NNUE {
@@ -86,6 +87,32 @@ struct NnueSignalSnapshot {
     float lca_mean_abs_delta = 0.0f;
     std::int32_t lca_max_abs_delta = 0;
     std::int32_t lca_abs_delta_sum = 0;
+#if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
+    // Frozen DLS/Fuka disagreement probe.  These fields are diagnostic only;
+    // uncertainty_q8 is the scalar intended for later search logging.
+    float uncertainty_logit = 0.0f;
+    float uncertainty_probability = 0.0f;
+    std::uint8_t uncertainty_q8 = 0;
+#endif
+#if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
+    // Diagnostic-only predictions of Hao static-vs-depth9 abs-delta-probability.
+    // Context uses this engine's static score in place of the Hao HalfKP score;
+    // that substitution is intentionally tracked as a distribution shift.
+    enum HaoRiskKind : std::size_t {
+        HaoFc1Only = 0,
+        HaoContextOnly,
+        HaoContextFc1,
+        HaoResidualPositive,
+        HaoRiskCount
+    };
+    float hao_risk_logit[HaoRiskCount]{};
+    float hao_risk_probability[HaoRiskCount]{};
+    std::uint8_t hao_risk_q8[HaoRiskCount]{};
+    std::uint32_t hao_risk_compute_ns = 0;
+    std::int16_t hao_context_static_eval = 0;
+    std::int16_t hao_context_material = 0;
+    std::uint16_t hao_context_game_ply = 0;
+#endif
     bool valid = false;
 };
 

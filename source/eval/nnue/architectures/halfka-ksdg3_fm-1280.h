@@ -8,7 +8,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -41,6 +43,21 @@ constexpr IndexType kHidden1Dims = 31;
 #endif
 #if defined(USE_NNUE_FC1_WIDTH_64) && !defined(NNUE_COMPACT_PHASE5)
 #error USE_NNUE_FC1_WIDTH_64 requires the 160-input Phase5 architecture
+#endif
+#if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL) && !defined(ENABLE_NNUE_SIGNAL_LOG)
+#error ENABLE_NNUE_UNCERTAINTY_SIGNAL requires ENABLE_NNUE_SIGNAL_LOG
+#endif
+#if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL) && !defined(USE_NNUE_FC1_WIDTH_64)
+#error ENABLE_NNUE_UNCERTAINTY_SIGNAL requires the FC1x64 architecture
+#endif
+#if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL) && !defined(ENABLE_NNUE_SIGNAL_LOG)
+#error ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL requires ENABLE_NNUE_SIGNAL_LOG
+#endif
+#if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL) && !defined(USE_NNUE_FC1_WIDTH_64)
+#error ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL requires the FC1x64 architecture
+#endif
+#if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL) && defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
+#error Hao search-risk and legacy teacher-disagreement diagnostic formats are mutually exclusive
 #endif
 #if defined(USE_NNUE_CROSS_WIDTH_24) \
 	&& (!defined(NNUE_COMPACT_PHASE5) || !defined(USE_NNUE_FC1_WIDTH_64))
@@ -194,12 +211,125 @@ struct Network {
 	// Bypassパスと DeepPath のブレンド係数 (バケットごとに学習)
 	int32_t bucket_blend_alpha;
 
+#if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
+	// Diagnostic-only frozen bucket-specific Linear(64,1) head.  Float32 is
+	// intentional: it preserves the Python probe parameters without changing
+	// the evaluation network's quantization or output.
+	std::array<float, 64> uncertainty_head_weight{};
+	float uncertainty_head_bias = 0.0f;
+
+	std::uint8_t ComputeUncertaintySignal(
+		const std::uint8_t* activation, float* logit_out = nullptr,
+		float* probability_out = nullptr) const {
+		float logit = uncertainty_head_bias;
+		constexpr float kInverseActivationScale = 1.0f / 127.0f;
+		for (IndexType j = 0; j < kHidden2Dims; ++j)
+			logit += uncertainty_head_weight[j]
+				* (static_cast<float>(activation[j]) * kInverseActivationScale);
+		const float probability = 1.0f / (1.0f + std::exp(-logit));
+		const int q8 = static_cast<int>(
+			std::floor(probability * 255.0f + 0.5f));
+		if (logit_out)
+			*logit_out = logit;
+		if (probability_out)
+			*probability_out = probability;
+		return static_cast<std::uint8_t>(std::clamp(q8, 0, 255));
+	}
+#endif
+
+#if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
+	// Frozen diagnostic probes trained on Hao static-vs-depth9 disagreement.
+	// The block is serialized only in the experiment-specific network format.
+	// Common context parameters are duplicated per selected-bucket Network to
+	// keep the production file/layout and evaluation objects untouched.
+	std::array<float, 16 * 6> hao_context_numeric_weight{};
+	std::array<float, 16> hao_context_numeric_bias{};
+	std::array<float, 16> hao_context_bucket_embedding{};
+	std::array<float, 16> hao_context_output_weight{};
+	float hao_context_output_bias = 0.0f;
+	std::array<float, 64> hao_fc1_head_weight{};
+	float hao_fc1_head_bias = 0.0f;
+	std::array<float, 80> hao_joint_head_weight{};
+	float hao_joint_head_bias = 0.0f;
+	std::array<float, 64> hao_residual_head_weight{};
+	float hao_residual_head_bias = 0.0f;
+
+	static inline float HaoSigmoid(const float x) {
+		return 1.0f / (1.0f + std::exp(-x));
+	}
+
+	static inline std::uint8_t HaoQuantizeQ8(const float probability) {
+		const int q = static_cast<int>(std::floor(probability * 255.0f + 0.5f));
+		return static_cast<std::uint8_t>(std::clamp(q, 0, 255));
+	}
+
+	void ComputeHaoSearchRiskSignals(
+		const std::uint8_t* activation, const int game_ply,
+		const int material_stm, const int static_eval,
+		NnueSignalSnapshot* signal) const {
+		if (!signal)
+			return;
+		const auto started = std::chrono::steady_clock::now();
+		const float ply = std::clamp(game_ply, 0, 256) * (1.0f / 256.0f);
+		const float material = std::clamp(material_stm, -6000, 6000) * (1.0f / 6000.0f);
+		const float material_abs = std::clamp(std::abs(material_stm), 0, 6000) * (1.0f / 6000.0f);
+		const float score = std::clamp(static_eval, -4000, 4000) * (1.0f / 4000.0f);
+		const float score_abs = std::clamp(std::abs(static_eval), 0, 4000) * (1.0f / 4000.0f);
+		// Exact formula used by probability_from_score() in the offline probe.
+		const float sigmoid_positive = HaoSigmoid((static_eval - 240.0f) * (1.0f / 380.0f));
+		const float sigmoid_negative = HaoSigmoid((-static_eval - 240.0f) * (1.0f / 380.0f));
+		const float numeric[6] = {
+			ply, material, material_abs, score, score_abs,
+			0.5f * (1.0f + sigmoid_positive - sigmoid_negative)};
+		float hidden[16];
+		for (std::size_t row = 0; row < 16; ++row) {
+			float value = hao_context_numeric_bias[row]
+			            + hao_context_bucket_embedding[row];
+			for (std::size_t column = 0; column < 6; ++column)
+				value += hao_context_numeric_weight[row * 6 + column] * numeric[column];
+			hidden[row] = value * HaoSigmoid(value); // SiLU
+		}
+		float context_logit = hao_context_output_bias;
+		for (std::size_t j = 0; j < 16; ++j)
+			context_logit += hao_context_output_weight[j] * hidden[j];
+		float fc1_logit = hao_fc1_head_bias;
+		float joint_logit = hao_joint_head_bias;
+		float residual_logit = hao_residual_head_bias;
+		for (std::size_t j = 0; j < 16; ++j)
+			joint_logit += hao_joint_head_weight[j] * hidden[j];
+		for (std::size_t j = 0; j < 64; ++j) {
+			const float a = static_cast<float>(activation[j]) * (1.0f / 127.0f);
+			fc1_logit += hao_fc1_head_weight[j] * a;
+			joint_logit += hao_joint_head_weight[16 + j] * a;
+			residual_logit += hao_residual_head_weight[j] * a;
+		}
+		const float logits[NnueSignalSnapshot::HaoRiskCount] = {
+			fc1_logit, context_logit, joint_logit, residual_logit};
+		for (std::size_t kind = 0; kind < NnueSignalSnapshot::HaoRiskCount; ++kind) {
+			const float probability = HaoSigmoid(logits[kind]);
+			signal->hao_risk_logit[kind] = logits[kind];
+			signal->hao_risk_probability[kind] = probability;
+			signal->hao_risk_q8[kind] = HaoQuantizeQ8(probability);
+		}
+		signal->hao_context_static_eval = static_cast<std::int16_t>(
+			std::clamp(static_eval, -32768, 32767));
+		signal->hao_context_material = static_cast<std::int16_t>(
+			std::clamp(material_stm, -32768, 32767));
+		signal->hao_context_game_ply = static_cast<std::uint16_t>(
+			std::clamp(game_ply, 0, 65535));
+		const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now() - started).count();
+		signal->hao_risk_compute_ns = static_cast<std::uint32_t>(
+			std::clamp<std::int64_t>(elapsed, 0, UINT32_MAX));
+	}
+#endif
+
 
 	using OutputType = std::int32_t;
 	static constexpr IndexType kOutputDimensions = 1;
 
 	// Hash値などは適宜実装
-	static constexpr std::uint32_t GetHashValue() {
+	static constexpr std::uint32_t GetBaseHashValue() {
 #if defined(NNUE_COMPACT_PHASE5)
 	#if defined(USE_NNUE_FC1_WIDTH_64)
 		// Same serialized hash derivation as the Python writer, with fc_1
@@ -233,7 +363,17 @@ struct Network {
 #endif
 	}
 
-	static std::string GetStructureString() {
+	static constexpr std::uint32_t GetHashValue() {
+#if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
+		return GetBaseHashValue() ^ 0x48414F52u;
+#elif defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
+		return GetBaseHashValue() ^ 0x00554E43u;
+#else
+		return GetBaseHashValue();
+#endif
+	}
+
+	static std::string GetBaseStructureString() {
 #if defined(NNUE_COMPACT_PHASE5)
 	#if defined(USE_NNUE_FC1_WIDTH_64)
 		#if defined(USE_NNUE_L2_PHYSICAL_128)
@@ -259,6 +399,17 @@ struct Network {
 #endif
 	}
 
+	static std::string GetStructureString() {
+		auto result = GetBaseStructureString();
+#if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
+		result += "-UncertaintyBucket12x64";
+#endif
+#if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
+		result += "-HaoSearchRiskContextFc1V1";
+#endif
+		return result;
+	}
+
 	Tools::Result ReadParameters(std::istream& stream) {
 		fc_0.ReadParameters(stream);
 		fc_diff.ReadParameters(stream);
@@ -274,6 +425,26 @@ struct Network {
 		fc_2.ReadParameters(stream).is_ok();
 		stream.read(reinterpret_cast<char*>(&bucket_blend_alpha), sizeof(int32_t));
 		std::cout << "Read Alpha: " << bucket_blend_alpha << " / 16384" << std::endl;
+#if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
+		stream.read(reinterpret_cast<char*>(uncertainty_head_weight.data()),
+		            sizeof(float) * uncertainty_head_weight.size());
+		stream.read(reinterpret_cast<char*>(&uncertainty_head_bias), sizeof(float));
+#endif
+#if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
+		stream.read(reinterpret_cast<char*>(hao_context_numeric_weight.data()), sizeof(hao_context_numeric_weight));
+		stream.read(reinterpret_cast<char*>(hao_context_numeric_bias.data()), sizeof(hao_context_numeric_bias));
+		stream.read(reinterpret_cast<char*>(hao_context_bucket_embedding.data()), sizeof(hao_context_bucket_embedding));
+		stream.read(reinterpret_cast<char*>(hao_context_output_weight.data()), sizeof(hao_context_output_weight));
+		stream.read(reinterpret_cast<char*>(&hao_context_output_bias), sizeof(float));
+		stream.read(reinterpret_cast<char*>(hao_fc1_head_weight.data()), sizeof(hao_fc1_head_weight));
+		stream.read(reinterpret_cast<char*>(&hao_fc1_head_bias), sizeof(float));
+		stream.read(reinterpret_cast<char*>(hao_joint_head_weight.data()), sizeof(hao_joint_head_weight));
+		stream.read(reinterpret_cast<char*>(&hao_joint_head_bias), sizeof(float));
+		stream.read(reinterpret_cast<char*>(hao_residual_head_weight.data()), sizeof(hao_residual_head_weight));
+		stream.read(reinterpret_cast<char*>(&hao_residual_head_bias), sizeof(float));
+		if (!stream)
+			return Tools::ResultCode::FileMismatch;
+#endif
 #if defined(USE_NNUE_APPROX_SIGMOID_LUT)
 		// tournament builds use -fno-threadsafe-statics, so construct both the
 		// source float LUT and compact Main-gate LUT on the single-threaded
@@ -1224,6 +1395,13 @@ struct Network {
 		// --- 7. Deep Path 推論 ---
 		fc_1.Propagate(buf.l2_input, buf.fc_1_out);
 		ac_1.Propagate(buf.fc_1_out, buf.ac_1_out);
+#if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
+		if (signal) {
+			signal->uncertainty_q8 = ComputeUncertaintySignal(
+				buf.ac_1_out, &signal->uncertainty_logit,
+				&signal->uncertainty_probability);
+		}
+#endif
 		fc_2.Propagate(buf.ac_1_out, buf.fc_2_out);
 
 

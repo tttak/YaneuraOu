@@ -19,6 +19,12 @@
 #error "NNUE_COMBINED_LCA_SUM_THRESHOLD must be in [0, 4064]"
 #endif
 
+#if (defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL) \
+     || defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)) \
+    && !defined(NNUE_CROSS_LMR_MAX_THRESHOLD)
+#define NNUE_CROSS_LMR_MAX_THRESHOLD 127
+#endif
+
 #if defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)
 #ifndef NNUE_ROUTER_LMR_VARIANT
 #define NNUE_ROUTER_LMR_VARIANT 3
@@ -74,6 +80,8 @@
 #endif
 
 #include "../../eval/nnue/nnue_signal.h"
+#include "nnue_uncertainty_logger.h"
+#include "nnue_hao_risk_logger.h"
 
 #include <algorithm>
 #include <array>
@@ -985,10 +993,24 @@ class NodeObservation {
             update_shadow_outcome(stats.rfp_shadow_by_static_eval
               [reverse_futility_shadow_static_eval_bin_]
               [reverse_futility_shadow_disagreement_bin_]);
+#if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
+            NnueUncertaintyLog::RecordRfpOutcome(
+              reverse_futility_shadow_uncertainty_q8_, result_, beta_, static_eval_);
+#endif
+#if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
+            NnueHaoRiskLog::RecordRfpOutcome(
+              reverse_futility_shadow_hao_q8_, result_, beta_, static_eval_);
+#endif
         }
 #endif
 
         if (access_.source == Eval::NNUE::NnueSignalEvalSource::FreshNetwork && valid) {
+#if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
+            NnueUncertaintyLog::RecordFresh(access_.signal);
+#endif
+#if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
+            NnueHaoRiskLog::RecordFresh(access_.signal);
+#endif
             const double values[19] = {
               double(access_.signal.deep_output), double(access_.signal.bypass_output),
               double(access_.signal.signed_deep_bypass),
@@ -1031,6 +1053,13 @@ class NodeObservation {
           std::min<std::int64_t>(std::llabs(std::int64_t(result_) - static_eval_),
                                  std::numeric_limits<std::uint32_t>::max()));
         const std::int64_t signed_error = std::int64_t(result_) - static_eval_;
+#if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
+        NnueUncertaintyLog::RecordNode(access_.signal, error, result_, alpha_, beta_,
+                                       futility_pruned_);
+#endif
+#if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
+        NnueHaoRiskLog::RecordNode(access_.signal, error, result_, alpha_, beta_);
+#endif
         for (std::size_t kind = 0; kind < kSignalKinds; ++kind) {
             const auto bin = SignalBin(access_.signal, kind);
             AddPredictionSample(stats.prediction[kind][bin], error, result_, alpha_, beta_,
@@ -1126,6 +1155,31 @@ class NodeObservation {
     }
 
     void MarkFutilityPruned() { futility_pruned_ = true; }
+#if defined(ENABLE_NNUE_FUTILITY_SHADOW)
+    bool SelectForwardFutilityShadowSample() {
+        if (!access_.signal.valid || !has_static_eval_)
+            return false;
+#if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
+        forward_futility_shadow_uncertainty_q8_ = access_.signal.uncertainty_q8;
+        return NnueUncertaintyLog::SelectForwardFutilityShadowSample(
+          forward_futility_shadow_uncertainty_q8_);
+#elif defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
+        return NnueHaoRiskLog::SelectFutilitySample(
+          access_.signal, forward_futility_shadow_hao_q8_);
+#else
+        return false;
+#endif
+    }
+    void RecordForwardFutilityShadowOutcome(const int result, const int alpha) {
+#if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
+        NnueUncertaintyLog::RecordForwardFutilityShadowOutcome(
+          forward_futility_shadow_uncertainty_q8_, result, alpha, static_eval_);
+#elif defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
+        NnueHaoRiskLog::RecordFutilityOutcome(
+          forward_futility_shadow_hao_q8_, result, alpha, static_eval_);
+#endif
+    }
+#endif
     void MarkLmr() { lmr_ = true; }
     void MarkLmrResearch() { lmr_research_ = true; }
     void MarkReverseFutilityEligible(const int distance, const bool taken) {
@@ -1163,6 +1217,15 @@ class NodeObservation {
         reverse_futility_shadow_sampled_ = true;
         reverse_futility_shadow_disagreement_bin_ = disagreement_bin;
         reverse_futility_shadow_static_eval_bin_ = static_eval_bin;
+#if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
+        reverse_futility_shadow_uncertainty_q8_ = access_.signal.uncertainty_q8;
+        NnueUncertaintyLog::RecordRfpSelected(
+          reverse_futility_shadow_uncertainty_q8_);
+#endif
+#if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
+        reverse_futility_shadow_hao_q8_ = NnueHaoRiskLog::Values(access_.signal);
+        NnueHaoRiskLog::RecordRfpSelected(reverse_futility_shadow_hao_q8_);
+#endif
         return true;
     }
 #endif
@@ -1215,7 +1278,6 @@ class NodeObservation {
         const auto router_group = RouterMarginGroup(access_.signal.router_margin);
         const auto fm_group = FmRelianceGroup(access_.signal.fm_reliance);
         const auto fm_fine_group = FmRelianceFineGroup(access_.signal.fm_reliance);
-
         const bool router_danger = !pv_ && depth >= 3 && depth <= 8
           && move_count >= 2 && move_count <= 8
           && access_.signal.router_margin <= NNUE_ROUTER_LMR_MARGIN_THRESHOLD;
@@ -1245,6 +1307,23 @@ class NodeObservation {
 
         const bool cross_structural = depth >= 3 && depth <= 8
           && move_count >= 2 && move_count <= 8;
+#if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
+        const bool uncertainty_cross_danger = cross_structural
+          && access_.signal.cross_abs_max >= NNUE_CROSS_LMR_MAX_THRESHOLD;
+        // Record independent signal predicates, rather than whether an earlier
+        // signal happened to consume the single deployable +1 ply. This makes
+        // overlap and "none detected" cohorts meaningful in a shadow-only run.
+        NnueUncertaintyLog::RecordLmr(
+          access_.signal, ply_, reduced_fail_high, researched, final_cutoff,
+          router_danger, lca_danger, uncertainty_cross_danger);
+#endif
+#if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
+        const bool hao_cross_danger = cross_structural
+          && access_.signal.cross_abs_max >= NNUE_CROSS_LMR_MAX_THRESHOLD;
+        NnueHaoRiskLog::RecordLmr(
+          access_.signal, ply_, reduced_fail_high, researched, final_cutoff,
+          router_danger, lca_danger, hao_cross_danger);
+#endif
         // Keep this population identical to the historical model-relative
         // LCA percentile analysis: every signal-valid LMR move which was not
         // actually deepened by Router-LMR.  Positive-reduction eligibility is
@@ -1594,6 +1673,19 @@ class NodeObservation {
     bool reverse_futility_shadow_sampled_ = false;
     std::size_t reverse_futility_shadow_disagreement_bin_ = 0;
     std::size_t reverse_futility_shadow_static_eval_bin_ = 0;
+#if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
+    std::uint8_t reverse_futility_shadow_uncertainty_q8_ = 0;
+#endif
+#if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
+    NnueHaoRiskLog::QValues reverse_futility_shadow_hao_q8_{};
+#endif
+#if defined(ENABLE_NNUE_FUTILITY_SHADOW)
+#if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
+    std::uint8_t forward_futility_shadow_uncertainty_q8_ = 0;
+#elif defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
+    NnueHaoRiskLog::QValues forward_futility_shadow_hao_q8_{};
+#endif
+#endif
 #endif
     std::array<std::uint32_t, kConditionBins> lmr_events_{};
     std::array<std::uint32_t, kConditionBins> lmr_researches_{};
@@ -1604,6 +1696,12 @@ class NodeObservation {
 };
 
 inline void Reset() {
+#if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
+    NnueUncertaintyLog::Reset();
+#endif
+#if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
+    NnueHaoRiskLog::Reset();
+#endif
     std::lock_guard<std::mutex> lock(g_registry_mutex);
     for (auto* stats : g_thread_stats) {
         // ThreadStats contains large diagnostic matrices. Reconstruct it in
@@ -3602,6 +3700,12 @@ inline void Report(std::ostream& out) {
         out << '\n';
     }
     out << "  note: searched nodes, NPS, and completed depth are reported by the normal bench output.\n";
+#endif
+#if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
+    NnueUncertaintyLog::Report(out);
+#endif
+#if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
+    NnueHaoRiskLog::Report(out);
 #endif
 }
 

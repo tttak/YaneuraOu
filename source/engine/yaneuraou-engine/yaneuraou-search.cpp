@@ -66,6 +66,12 @@
 #error "ENABLE_NNUE_RFP_SHADOW requires ENABLE_NNUE_SIGNAL_LOG"
 #endif
 
+#if defined(ENABLE_NNUE_FUTILITY_SHADOW) \
+    && !defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL) \
+    && !defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
+#error "ENABLE_NNUE_FUTILITY_SHADOW requires a diagnostic uncertainty/risk signal"
+#endif
+
 #if defined(ENABLE_NNUE_CROSS_LMR_EXPERIMENT) && !defined(ENABLE_NNUE_SIGNAL_LOG)
 #error "ENABLE_NNUE_CROSS_LMR_EXPERIMENT requires ENABLE_NNUE_SIGNAL_LOG"
 #endif
@@ -3258,6 +3264,9 @@ moves_loop:  // When in check, search starts here
 
     while ((move = mp.next_move()) != Move::none())
     {
+#if defined(ENABLE_NNUE_FUTILITY_SHADOW)
+        bool nnueForwardFutilityShadow = false;
+#endif
         ASSERT_LV3(move.is_ok());
         ASSERT_LV5(pos.pseudo_legal_s<true>(move) && pos.legal_promote(move));
 
@@ -3406,7 +3415,14 @@ moves_loop:  // When in check, search starts here
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
                         nnueSignalObservation.MarkFutilityPruned();
 #endif
+#if defined(ENABLE_NNUE_FUTILITY_SHADOW)
+                        nnueForwardFutilityShadow =
+                          nnueSignalObservation.SelectForwardFutilityShadowSample();
+                        if (!nnueForwardFutilityShadow)
+                            continue;
+#else
                         continue;
+#endif
                     }
                 }
 
@@ -3424,7 +3440,11 @@ moves_loop:  // When in check, search starts here
 
                 if ((alpha >= VALUE_DRAW)
 #endif
-                    && !pos.see_ge(move, -margin))
+                    && !pos.see_ge(move, -margin)
+#if defined(ENABLE_NNUE_FUTILITY_SHADOW)
+                    && !nnueForwardFutilityShadow
+#endif
+                    )
                     continue;
 
             }
@@ -3466,9 +3486,17 @@ moves_loop:  // When in check, search starts here
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
                     nnueSignalObservation.MarkFutilityPruned();
 #endif
+#if defined(ENABLE_NNUE_FUTILITY_SHADOW)
+                    nnueForwardFutilityShadow =
+                      nnueSignalObservation.SelectForwardFutilityShadowSample();
+                    if (!nnueForwardFutilityShadow) {
+#endif
                     if (bestValue <= futilityValue && !is_decisive(bestValue) && !is_win(futilityValue))
                         bestValue = futilityValue;
                     continue;
+#if defined(ENABLE_NNUE_FUTILITY_SHADOW)
+                    }
+#endif
                 }
 
                 /*
@@ -3484,7 +3512,11 @@ moves_loop:  // When in check, search starts here
                 // 負のSEEを持つ指し手を枝刈りする
                 // 💡 lmrDepthの2乗に比例するのでこのパラメーターの影響はすごく大きい。
 
-                if (!pos.see_ge(move, -27 * lmrDepth * lmrDepth))
+                if (!pos.see_ge(move, -27 * lmrDepth * lmrDepth)
+#if defined(ENABLE_NNUE_FUTILITY_SHADOW)
+                    && !nnueForwardFutilityShadow
+#endif
+                    )
                     continue;
             }
         }
@@ -4248,6 +4280,11 @@ moves_loop:  // When in check, search starts here
               nnueLcaLmrAdjusted, nnueCrossLmrCandidate,
               nnueCrossLmrAdjusted);
         }
+#endif
+#if defined(ENABLE_NNUE_FUTILITY_SHADOW)
+        if (nnueForwardFutilityShadow)
+            nnueSignalObservation.RecordForwardFutilityShadowOutcome(
+              static_cast<int>(value + inc), static_cast<int>(alpha));
 #endif
 
 #if defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)

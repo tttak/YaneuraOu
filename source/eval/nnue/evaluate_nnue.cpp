@@ -647,6 +647,18 @@ namespace {
         // 2) accumulator.scoreは、差分計算の時に用いないので書き換えて問題ない。
         score = Math::clamp(score, -VALUE_MAX_EVAL, VALUE_MAX_EVAL);
 
+#if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL) \
+    && !defined(DISABLE_NNUE_HAO_SEARCH_RISK_COMPUTE)
+        // The offline context used Hao HalfKP static score.  This diagnostic
+        // deliberately substitutes the current production NNUE static score,
+        // which is a distribution shift and is labelled as such in the report.
+        const int material_stm = pos.state()->materialValue
+          * (pos.side_to_move() == BLACK ? 1 : -1);
+        network[bucket_id2]->ComputeHaoSearchRiskSignals(
+          network_buffer.ac_1_out, pos.game_ply(), material_stm,
+          static_cast<int>(score), &signal);
+#endif
+
         accumulator.score = score;
         accumulator.computed_score = true;
 #if defined(ENABLE_NNUE_SIGNAL_LOG)

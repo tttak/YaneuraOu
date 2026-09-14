@@ -14,8 +14,14 @@
 #include "../../engine/yaneuraou-engine/nnue_signal_logger.h"
 #endif
 
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -57,8 +63,390 @@ struct MoveAccuracyRecord {
   u8 padding;
 };
 
+#if defined(ENABLE_STATIC_EVAL_BIN_TOOL)
 static_assert(sizeof(MoveAccuracyRecord) == 40,
               "sfenpack record must be exactly 40 bytes");
+static_assert(offsetof(MoveAccuracyRecord, score) == 32,
+              "PackedSfenValue score must start at byte 32");
+static_assert(sizeof(s16) == 2,
+              "PackedSfenValue score must be a signed 16-bit value");
+
+void WriteCsvField(std::ostream& output, std::string_view value);
+
+// Replaces only PackedSfenValue::score with a fresh, no-search NNUE
+// evaluation.  Input bytes are copied verbatim and the two score bytes are
+// overwritten explicitly, so move/gamePly/result/padding cannot be rewritten
+// by structure assignment or padding initialization.
+void MakeStaticEvalBin(std::istream& stream) {
+  std::string input_name;
+  std::string output_name;
+  std::string csv_name;
+  std::uint64_t start_record = 0;
+  std::uint64_t max_records = 0;
+  std::uint64_t csv_records = 0;
+  std::string metadata_name;
+  stream >> std::quoted(input_name) >> std::quoted(output_name)
+         >> start_record >> max_records >> std::quoted(csv_name) >> csv_records;
+  if (!(stream >> std::quoted(metadata_name)))
+    stream.clear();
+  if (input_name.empty() || output_name.empty()) {
+    std::cout << "error: make_static_eval_bin requires input and output paths"
+              << std::endl;
+    return;
+  }
+
+  std::ifstream input(input_name, std::ios::binary);
+  if (!input) {
+    std::cout << "error: failed to open input: " << input_name << std::endl;
+    return;
+  }
+  input.seekg(0, std::ios::end);
+  const auto end_position = input.tellg();
+  if (end_position < 0
+      || static_cast<std::uint64_t>(end_position) % sizeof(MoveAccuracyRecord) != 0) {
+    std::cout << "error: input size is not a multiple of 40 bytes" << std::endl;
+    return;
+  }
+  const std::uint64_t total_records =
+      static_cast<std::uint64_t>(end_position) / sizeof(MoveAccuracyRecord);
+  if (start_record > total_records) {
+    std::cout << "error: start record exceeds input record count" << std::endl;
+    return;
+  }
+  const std::uint64_t available = total_records - start_record;
+  const std::uint64_t requested =
+      max_records == 0 ? available : std::min(max_records, available);
+  input.seekg(static_cast<std::streamoff>(
+                  start_record * sizeof(MoveAccuracyRecord)),
+              std::ios::beg);
+
+  // Never replace an existing result.  The temporary file is renamed only
+  // after every record has been decoded, validated, evaluated and flushed.
+  {
+    std::ifstream existing(output_name, std::ios::binary);
+    if (existing) {
+      std::cout << "error: output already exists: " << output_name << std::endl;
+      return;
+    }
+  }
+  const std::string temporary_name = output_name + ".tmp";
+  {
+    std::ifstream existing(temporary_name, std::ios::binary);
+    if (existing) {
+      std::cout << "error: temporary output already exists: "
+                << temporary_name << std::endl;
+      return;
+    }
+  }
+  std::ofstream output(temporary_name, std::ios::binary | std::ios::trunc);
+  if (!output) {
+    std::cout << "error: failed to create temporary output: "
+              << temporary_name << std::endl;
+    return;
+  }
+
+  const std::string csv_temporary_name =
+      csv_name.empty() ? std::string() : csv_name + ".tmp";
+  std::ofstream csv;
+  if (!csv_name.empty()) {
+    std::ifstream existing(csv_name);
+    std::ifstream temporary_existing(csv_temporary_name);
+    if (existing || temporary_existing) {
+      std::cout << "error: validation CSV or its temporary file already exists"
+                << std::endl;
+      output.close();
+      std::remove(temporary_name.c_str());
+      return;
+    }
+    csv.open(csv_temporary_name, std::ios::out | std::ios::trunc);
+    if (!csv) {
+      std::cout << "error: failed to create validation CSV" << std::endl;
+      output.close();
+      std::remove(temporary_name.c_str());
+      return;
+    }
+    csv << "record_index,sfen,side_to_move,original_depth9_score,"
+           "static_eval_score,depth9_minus_static,game_ply,game_result,move\n";
+  }
+
+  struct StaticEvalMetadata {
+    std::int32_t material_black;
+    std::int32_t material_stm;
+    std::uint16_t game_ply;
+    std::uint8_t selected_bucket;
+    std::uint8_t side_to_move;
+  };
+  static_assert(sizeof(StaticEvalMetadata) == 12, "unexpected metadata layout");
+  const std::string metadata_temporary_name =
+      metadata_name.empty() ? std::string() : metadata_name + ".tmp";
+  std::ofstream metadata;
+  if (!metadata_name.empty()) {
+    std::ifstream existing(metadata_name, std::ios::binary);
+    std::ifstream temporary_existing(metadata_temporary_name, std::ios::binary);
+    if (existing || temporary_existing) {
+      std::cout << "error: metadata output or temporary already exists" << std::endl;
+      output.close();
+      std::remove(temporary_name.c_str());
+      return;
+    }
+    metadata.open(metadata_temporary_name, std::ios::binary | std::ios::trunc);
+    if (!metadata) {
+      std::cout << "error: failed to create metadata output" << std::endl;
+      output.close();
+      std::remove(temporary_name.c_str());
+      return;
+    }
+  }
+
+  std::uint64_t processed = 0;
+  std::uint64_t decode_errors = 0;
+  std::uint64_t illegal_positions = 0;
+  std::uint64_t non_score_byte_mismatches = 0;
+  bool failed = false;
+  std::string failure;
+  const auto started = std::chrono::steady_clock::now();
+  auto last_report = started;
+  std::array<char, sizeof(MoveAccuracyRecord)> original_bytes{};
+  std::array<char, sizeof(MoveAccuracyRecord)> output_bytes{};
+
+  while (processed < requested
+         && input.read(original_bytes.data(), original_bytes.size())) {
+    MoveAccuracyRecord record;
+    std::memcpy(&record, original_bytes.data(), sizeof(record));
+
+    Position position;
+    StateInfo state;
+    if (position.set_from_packed_sfen(
+            record.sfen, &state, false, record.game_ply).is_not_ok()) {
+      ++decode_errors;
+      failed = true;
+      failure = "PackedSfen decode failed at record "
+              + std::to_string(start_record + processed);
+      break;
+    }
+    if (!position.pos_is_ok()) {
+      ++illegal_positions;
+      failed = true;
+      failure = "illegal/inconsistent position at record "
+              + std::to_string(start_record + processed);
+      break;
+    }
+
+    // Eval::evaluate() performs no search.  set_from_packed_sfen() leaves the
+    // accumulator invalid, so this call takes the normal full-refresh path.
+    // Its return convention is side-to-move, matching PackedSfenValue::score.
+    const Value evaluated = ::YaneuraOu::Eval::evaluate(position);
+    const s16 static_score = static_cast<s16>(evaluated);
+
+    if (metadata.is_open()) {
+      const int material_black = position.state()->materialValue;
+      const int material_stm = material_black
+          * (position.side_to_move() == BLACK ? 1 : -1);
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+      const auto& signal_access = LastNnueSignalAccess();
+      const int selected_bucket = signal_access.signal.valid
+          ? signal_access.signal.selected_bucket : -1;
+#else
+      const int selected_bucket = -1;
+#endif
+      const StaticEvalMetadata value{
+          material_black, material_stm, record.game_ply,
+          static_cast<std::uint8_t>(std::clamp(selected_bucket, 0, 255)),
+          static_cast<std::uint8_t>(position.side_to_move())};
+      metadata.write(reinterpret_cast<const char*>(&value), sizeof(value));
+      if (!metadata) {
+        failed = true;
+        failure = "failed while writing metadata output";
+        break;
+      }
+    }
+
+    output_bytes = original_bytes;
+    std::memcpy(output_bytes.data() + offsetof(MoveAccuracyRecord, score),
+                &static_score, sizeof(static_score));
+    for (std::size_t i = 0; i < output_bytes.size(); ++i)
+      if ((i < offsetof(MoveAccuracyRecord, score)
+           || i >= offsetof(MoveAccuracyRecord, score) + sizeof(static_score))
+          && output_bytes[i] != original_bytes[i])
+        ++non_score_byte_mismatches;
+    output.write(output_bytes.data(), output_bytes.size());
+    if (!output) {
+      failed = true;
+      failure = "failed while writing temporary output";
+      break;
+    }
+
+    if (csv && processed < csv_records) {
+      csv << (start_record + processed) << ',';
+      WriteCsvField(csv, position.sfen());
+      csv << ',' << static_cast<int>(position.side_to_move())
+          << ',' << record.score << ',' << static_score
+          << ',' << (static_cast<int>(record.score) - static_cast<int>(static_score))
+          << ',' << record.game_ply
+          << ',' << static_cast<int>(record.game_result)
+          << ',' << Move16(record.move).to_usi_string() << '\n';
+    }
+    ++processed;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_report >= std::chrono::seconds(5)) {
+      last_report = now;
+      const double seconds = std::chrono::duration<double>(now - started).count();
+      const double rate = seconds > 0.0 ? processed / seconds : 0.0;
+      const double eta = rate > 0.0 ? (requested - processed) / rate : 0.0;
+      std::cout << "static_eval_bin progress=" << processed << '/' << requested
+                << " records_per_sec=" << std::fixed << std::setprecision(1)
+                << rate << " eta_sec=" << std::setprecision(0) << eta
+                << std::endl;
+    }
+  }
+
+  if (!failed && processed != requested) {
+    failed = true;
+    failure = "input ended before the requested record count";
+  }
+  output.flush();
+  if (!failed && !output) {
+    failed = true;
+    failure = "failed while flushing temporary output";
+  }
+  if (csv) {
+    csv.flush();
+    if (!failed && !csv) {
+      failed = true;
+      failure = "failed while flushing validation CSV";
+    }
+  }
+  output.close();
+  if (csv)
+    csv.close();
+  if (metadata.is_open()) {
+    metadata.flush();
+    if (!failed && !metadata) {
+      failed = true;
+      failure = "failed while flushing metadata output";
+    }
+    metadata.close();
+  }
+
+  if (failed || decode_errors != 0 || illegal_positions != 0
+      || non_score_byte_mismatches != 0) {
+    std::remove(temporary_name.c_str());
+    if (!csv_temporary_name.empty())
+      std::remove(csv_temporary_name.c_str());
+    if (!metadata_temporary_name.empty())
+      std::remove(metadata_temporary_name.c_str());
+    std::cout << "static_eval_bin status=error processed=" << processed
+              << " decode_errors=" << decode_errors
+              << " illegal_positions=" << illegal_positions
+              << " non_score_byte_mismatches=" << non_score_byte_mismatches
+              << " message=" << failure << std::endl;
+    return;
+  }
+
+  if (std::rename(temporary_name.c_str(), output_name.c_str()) != 0) {
+    std::cout << "error: failed to rename completed output: "
+              << temporary_name << std::endl;
+    return;
+  }
+  if (!csv_temporary_name.empty()
+      && std::rename(csv_temporary_name.c_str(), csv_name.c_str()) != 0) {
+    std::cout << "error: output completed, but validation CSV rename failed: "
+              << csv_temporary_name << std::endl;
+    return;
+  }
+  if (!metadata_temporary_name.empty()
+      && std::rename(metadata_temporary_name.c_str(), metadata_name.c_str()) != 0) {
+    std::cout << "error: output completed, but metadata rename failed: "
+              << metadata_temporary_name << std::endl;
+    return;
+  }
+
+  const double seconds = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - started).count();
+  std::cout << "static_eval_bin status=ok input_records=" << total_records
+            << " start_record=" << start_record
+            << " processed=" << processed
+            << " output_bytes=" << processed * sizeof(MoveAccuracyRecord)
+            << " decode_errors=0 illegal_positions=0"
+            << " non_score_byte_mismatches=0 records_per_sec="
+            << std::fixed << std::setprecision(1)
+            << (seconds > 0.0 ? processed / seconds : 0.0)
+            << " elapsed_sec=" << std::setprecision(3) << seconds
+            << std::endl;
+}
+
+#endif
+
+#if defined(ENABLE_NNUE_BENCH)
+// Diagnostic decoder for Phase-1 teacher-corpus inventory.  It deliberately
+// consumes the same 40-byte record layout as the existing accuracy command;
+// no NNUE value is evaluated and production paths are untouched.
+void InspectPackedSfenSample(std::istream& stream) {
+  std::string input_name;
+  std::string output_name;
+  stream >> std::quoted(input_name) >> std::quoted(output_name);
+  int include_sfen = 0;
+  stream >> include_sfen;
+  if (input_name.empty() || output_name.empty()) {
+    std::cout << "error: inspect_packed_sfen_sample requires input and output paths"
+              << std::endl;
+    return;
+  }
+
+  std::ifstream input(input_name, std::ios::binary);
+  std::ofstream output(output_name, std::ios::out | std::ios::trunc);
+  if (!input || !output) {
+    std::cout << "error: failed to open packed-sfen sample input/output" << std::endl;
+    return;
+  }
+
+  output << "sample_index,decoded,side_to_move,material_black,material_stm,"
+            "teacher_move_pseudo_legal,teacher_move_legal";
+  if (include_sfen)
+    output << ",teacher_move_usi,sfen";
+  output << '\n';
+  std::uint64_t sample_index = 0;
+  std::uint64_t decode_errors = 0;
+  MoveAccuracyRecord record;
+  while (input.read(reinterpret_cast<char*>(&record), sizeof(record))) {
+    Position position;
+    StateInfo state;
+    const bool decoded = position
+        .set_from_packed_sfen(record.sfen, &state, false, record.game_ply)
+        .is_ok();
+    output << sample_index++ << ',' << (decoded ? 1 : 0);
+    if (!decoded) {
+      ++decode_errors;
+      output << ",,,,,";
+      if (include_sfen)
+        output << ",,";
+      output << '\n';
+      continue;
+    }
+
+    const int material_black = static_cast<int>(Eval::material(position));
+    const int side = static_cast<int>(position.side_to_move());
+    bool pseudo_legal = false;
+    bool legal = false;
+    if (record.move != 0) {
+      const Move move = position.to_move(Move16(record.move));
+      pseudo_legal = position.pseudo_legal_s<true>(move);
+      legal = pseudo_legal && position.legal(move);
+    }
+    output << ',' << side << ',' << material_black << ','
+           << (position.side_to_move() == BLACK ? material_black : -material_black)
+           << ',' << (pseudo_legal ? 1 : 0) << ',' << (legal ? 1 : 0);
+    if (include_sfen)
+      output << ',' << Move16(record.move).to_usi_string() << ',' << position.sfen();
+    output << '\n';
+  }
+
+  std::cout << "inspect_packed_sfen_sample: records=" << sample_index
+            << " decode_errors=" << decode_errors
+            << " output=" << output_name << std::endl;
+}
+#endif
 
 class NullStreamBuffer : public std::streambuf {
  protected:
@@ -10440,6 +10828,77 @@ void PrintInfo(std::istream& stream) {
   }
 }
 
+#if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
+void TestHaoRiskHeads(const Position& pos) {
+  std::uint8_t activation[64];
+  std::cout << std::setprecision(10)
+            << "[NNUE Hao search-risk heads self-test]" << std::endl;
+  for (std::size_t bucket = 0; bucket < kLayerStacks; ++bucket) {
+    for (std::size_t lane = 0; lane < 64; ++lane)
+      activation[lane] = static_cast<std::uint8_t>(
+          (lane * 37 + bucket * 11 + 3) & 127);
+    NnueSignalSnapshot sample{};
+    const int game_ply = static_cast<int>(bucket * 19 + 7);
+    const int material = static_cast<int>(bucket * 731) - 3500;
+    const int static_eval = static_cast<int>(bucket * 613) - 3000;
+    network[bucket]->ComputeHaoSearchRiskSignals(
+      activation, game_ply, material, static_eval, &sample);
+    std::cout << "bucket=" << bucket << " game_ply=" << game_ply
+              << " material=" << material << " static_eval=" << static_eval;
+    for (std::size_t kind = 0; kind < NnueSignalSnapshot::HaoRiskCount; ++kind)
+      std::cout << " logit" << kind << '=' << sample.hao_risk_logit[kind]
+                << " probability" << kind << '=' << sample.hao_risk_probability[kind]
+                << " q8_" << kind << '=' << static_cast<unsigned>(sample.hao_risk_q8[kind]);
+    std::cout << std::endl;
+  }
+  const Value value = Eval::evaluate(pos);
+  const auto& access = LastNnueSignalAccess();
+  std::cout << "current_position eval=" << value
+            << " source=" << static_cast<unsigned>(access.source)
+            << " valid=" << (access.signal.valid ? 1 : 0);
+  if (access.signal.valid) {
+    std::cout << " bucket=" << access.signal.selected_bucket;
+    for (std::size_t kind = 0; kind < NnueSignalSnapshot::HaoRiskCount; ++kind)
+      std::cout << " q8_" << kind << '='
+                << static_cast<unsigned>(access.signal.hao_risk_q8[kind]);
+  }
+  std::cout << std::endl;
+}
+#endif
+
+#if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
+void TestUncertaintyHead(const Position& pos) {
+  std::uint8_t activation[64];
+  std::cout << std::setprecision(10)
+            << "[NNUE uncertainty head self-test]" << std::endl;
+  for (std::size_t bucket = 0; bucket < kLayerStacks; ++bucket) {
+    for (std::size_t lane = 0; lane < 64; ++lane)
+      activation[lane] = static_cast<std::uint8_t>(
+          (lane * 37 + bucket * 11 + 3) & 127);
+    float logit = 0.0f;
+    float probability = 0.0f;
+    const auto q8 = network[bucket]->ComputeUncertaintySignal(
+        activation, &logit, &probability);
+    std::cout << "bucket=" << bucket << " logit=" << logit
+              << " probability=" << probability
+              << " q8=" << static_cast<unsigned>(q8) << std::endl;
+  }
+
+  const Value value = Eval::evaluate(pos);
+  const auto& access = LastNnueSignalAccess();
+  const bool valid = access.signal.valid;
+  std::cout << "current_position eval=" << value
+            << " source=" << static_cast<unsigned>(access.source)
+            << " valid=" << (valid ? 1 : 0);
+  if (valid)
+    std::cout << " bucket=" << access.signal.selected_bucket
+              << " logit=" << access.signal.uncertainty_logit
+              << " probability=" << access.signal.uncertainty_probability
+              << " q8=" << static_cast<unsigned>(access.signal.uncertainty_q8);
+  std::cout << std::endl;
+}
+#endif
+
 }  // namespace
 
 // NNUE評価関数に関するUSI拡張コマンド
@@ -10461,6 +10920,14 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     TestMoveAccuracy(engine, stream, false);
   } else if (sub_command == "accuracy_detail") {
     TestMoveAccuracy(engine, stream, true);
+#if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
+  } else if (sub_command == "uncertainty_head_selftest") {
+    TestUncertaintyHead(pos);
+#endif
+#if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
+  } else if (sub_command == "hao_risk_head_selftest") {
+    TestHaoRiskHeads(pos);
+#endif
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
   } else if (sub_command == "signal_log_reset") {
     Search::NnueSignalLog::Reset();
@@ -10502,7 +10969,13 @@ void TestCommand(IEngine& engine, std::istream& stream) {
       }
     }
 #endif
+#if defined(ENABLE_STATIC_EVAL_BIN_TOOL)
+  } else if (sub_command == "make_static_eval_bin") {
+    MakeStaticEvalBin(stream);
+#endif
 #if defined(ENABLE_NNUE_BENCH)
+  } else if (sub_command == "inspect_packed_sfen_sample") {
+    InspectPackedSfenSample(stream);
   } else if (sub_command == "export_calibration_corpus") {
     ExportNnueCalibrationCorpus(stream);
   } else if (sub_command == "bench_ft") {
@@ -10625,9 +11098,19 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << " test nnue accuracy_detail <sfenpack file> <output.csv>"
               << std::endl;
     std::cout << " test nnue info [path/to/" << kFileName << "...]" << std::endl;
+#if defined(ENABLE_STATIC_EVAL_BIN_TOOL)
+    std::cout << " test nnue make_static_eval_bin <input> <output> <start>"
+                 " <count> <csv> <csv_count> [metadata]" << std::endl;
+#endif
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
     std::cout << " test nnue signal_log_reset" << std::endl;
     std::cout << " test nnue signal_log_report [output file]" << std::endl;
+#endif
+#if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
+    std::cout << " test nnue uncertainty_head_selftest" << std::endl;
+#endif
+#if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
+    std::cout << " test nnue hao_risk_head_selftest" << std::endl;
 #endif
 #if defined(ENABLE_NNUE_BENCH)
     std::cout << " test nnue export_calibration_corpus \"file\" [count]" << std::endl;
