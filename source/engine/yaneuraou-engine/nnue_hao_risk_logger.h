@@ -64,6 +64,21 @@ struct Stats {
     std::uint64_t futility_sequence = 0;
 };
 
+// Tiny Threads=1 per-root counters.  Keeping these separate avoids clearing
+// and snapshotting the large rank-joint diagnostic matrices after every root.
+// The phase-3 runner fixes Threads=1; these counters are not for multithreaded
+// aggregate reporting.
+struct RootCompactStats {
+    NodeOutcome node{};
+    LmrOutcome lmr{};
+    LmrOutcome uncovered{};
+    Shadow rfp{};
+    Shadow futility{};
+    std::uint64_t fresh = 0;
+};
+inline RootCompactStats g_root_compact{};
+inline void ResetRootCompact() { g_root_compact = RootCompactStats{}; }
+
 inline std::mutex g_mutex;
 inline std::vector<Stats*> g_stats;
 inline Stats& Local() {
@@ -111,6 +126,7 @@ inline void Add(Correlation& d, const Correlation& s) {
 
 inline void RecordFresh(const Snapshot& s) {
     auto& stats = Local();
+    ++g_root_compact.fresh;
     ++stats.fresh_compute_count;
     stats.fresh_compute_ns += s.hao_risk_compute_ns;
     for (std::size_t kind = 0; kind < kKinds; ++kind)
@@ -119,6 +135,10 @@ inline void RecordFresh(const Snapshot& s) {
 inline void RecordNode(const Snapshot& s, const std::uint32_t error,
                        const int result, const int alpha, const int beta) {
     auto& stats = Local();
+    ++g_root_compact.node.count;
+    g_root_compact.node.abs_error_sum += error;
+    g_root_compact.node.fail_high += result >= beta;
+    g_root_compact.node.fail_low += result <= alpha;
     for (std::size_t kind = 0; kind < kKinds; ++kind) {
         auto& v = stats.signal[kind].node[s.hao_risk_q8[kind]];
         ++v.count; v.abs_error_sum += error;
@@ -134,6 +154,16 @@ inline void RecordLmr(const Snapshot& s, const int search_ply,
         v.research += researched; v.cutoff += cutoff;
     };
     auto& stats = Local();
+    ++g_root_compact.lmr.count;
+    g_root_compact.lmr.reduced_fail_high += reduced_fh;
+    g_root_compact.lmr.research += researched;
+    g_root_compact.lmr.cutoff += cutoff;
+    if (!router && !lca && !cross) {
+        ++g_root_compact.uncovered.count;
+        g_root_compact.uncovered.reduced_fail_high += reduced_fh;
+        g_root_compact.uncovered.research += researched;
+        g_root_compact.uncovered.cutoff += cutoff;
+    }
     const auto bucket = static_cast<std::size_t>(std::clamp(s.selected_bucket, 0, 11));
     for (std::size_t kind = 0; kind < kKinds; ++kind) {
         auto& p = stats.signal[kind];
@@ -157,12 +187,17 @@ inline QValues Values(const Snapshot& s) {
 }
 inline void RecordRfpSelected(const QValues& q) {
     auto& stats = Local();
+    ++g_root_compact.rfp.samples;
     for (std::size_t kind = 0; kind < kKinds; ++kind)
         ++stats.signal[kind].rfp[q[kind]].samples;
 }
 inline void RecordRfpOutcome(const QValues& q, const int result,
                              const int beta, const int static_eval) {
     auto& stats = Local();
+    ++g_root_compact.rfp.completed;
+    g_root_compact.rfp.wrong += result < beta;
+    g_root_compact.rfp.boundary_delta_sum += std::int64_t(result) - beta;
+    g_root_compact.rfp.static_delta_sum += std::int64_t(result) - static_eval;
     for (std::size_t kind = 0; kind < kKinds; ++kind) {
         auto& v = stats.signal[kind].rfp[q[kind]];
         ++v.completed; v.wrong += result < beta;
@@ -176,6 +211,8 @@ inline bool SelectFutilitySample(const Snapshot& s, QValues& q) {
     constexpr std::uint64_t kMask = 255;
     const bool selected = (stats.futility_sequence++ & kMask) == 0;
     if (selected)
+        ++g_root_compact.futility.samples;
+    if (selected)
         for (std::size_t kind = 0; kind < kKinds; ++kind)
             ++stats.signal[kind].futility[q[kind]].samples;
     return selected;
@@ -183,6 +220,10 @@ inline bool SelectFutilitySample(const Snapshot& s, QValues& q) {
 inline void RecordFutilityOutcome(const QValues& q, const int result,
                                   const int alpha, const int static_eval) {
     auto& stats = Local();
+    ++g_root_compact.futility.completed;
+    g_root_compact.futility.wrong += result > alpha;
+    g_root_compact.futility.boundary_delta_sum += std::int64_t(result) - alpha;
+    g_root_compact.futility.static_delta_sum += std::int64_t(result) - static_eval;
     for (std::size_t kind = 0; kind < kKinds; ++kind) {
         auto& v = stats.signal[kind].futility[q[kind]];
         ++v.completed; v.wrong += result > alpha;
@@ -245,6 +286,36 @@ inline double Spearman(const std::array<std::uint64_t,kQ*kQ>& joint) {
 }
 template<class T> inline T Tail(const std::array<T,kQ>& a, const std::size_t threshold){T r{};for(std::size_t q=threshold;q<kQ;++q)Add(r,a[q]);return r;}
 template<class T> inline T Range(const std::array<T,kQ>& a, const std::size_t lo,const std::size_t hi){T r{};for(std::size_t q=lo;q<hi;++q)Add(r,a[q]);return r;}
+// Compact per-root output for experiments which attach an external label to
+// the root position.  Every Hao signal kind observes the same node/move set,
+// so kind 0 is sufficient for the all-q totals.  This is diagnostic-only and
+// does not affect search decisions.
+inline void ReportRootSummary(std::ostream& out) {
+    const auto& node = g_root_compact.node;
+    const auto& lmr = g_root_compact.lmr;
+    const auto& uncovered = g_root_compact.uncovered;
+    const auto& rfp = g_root_compact.rfp;
+    const auto& futility = g_root_compact.futility;
+    out << "NNUE_ROOT_DIAG"
+        << " fresh=" << g_root_compact.fresh
+        << " node=" << node.count
+        << " node_abs_error_sum=" << node.abs_error_sum
+        << " node_fail_high=" << node.fail_high
+        << " node_fail_low=" << node.fail_low
+        << " lmr=" << lmr.count
+        << " lmr_reduced_fail_high=" << lmr.reduced_fail_high
+        << " lmr_research=" << lmr.research
+        << " lmr_cutoff=" << lmr.cutoff
+        << " uncovered_lmr=" << uncovered.count
+        << " uncovered_lmr_research=" << uncovered.research
+        << " rfp_samples=" << rfp.samples
+        << " rfp_completed=" << rfp.completed
+        << " rfp_wrong=" << rfp.wrong
+        << " futility_samples=" << futility.samples
+        << " futility_completed=" << futility.completed
+        << " futility_wrong=" << futility.wrong
+        << '\n';
+}
 inline std::size_t Threshold(const std::array<LmrOutcome,kQ>& a,const unsigned bp){std::uint64_t n=0;for(auto&v:a)n+=v.count;auto want=(n*bp+9999)/10000,got=std::uint64_t(0);for(std::size_t q=kQ;q-->0;){got+=a[q].count;if(got>=want)return q;}return 0;}
 inline void PrintLmr(std::ostream& o,const LmrOutcome& v){o<<" n="<<v.count<<" FH="<<Percent(v.reduced_fail_high,v.count)<<"% re-search="<<Percent(v.research,v.count)<<"% cutoff="<<Percent(v.cutoff,v.count)<<'%';}
 inline void PrintNode(std::ostream& o,const NodeOutcome& v){o<<" n="<<v.count<<" mean|search-static|="<<(v.count?double(v.abs_error_sum)/v.count:0.0)<<" node-FH="<<Percent(v.fail_high,v.count)<<"% node-FL="<<Percent(v.fail_low,v.count)<<'%';}

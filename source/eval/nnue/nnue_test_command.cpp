@@ -10927,6 +10927,11 @@ void TestCommand(IEngine& engine, std::istream& stream) {
 #if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
   } else if (sub_command == "hao_risk_head_selftest") {
     TestHaoRiskHeads(pos);
+  } else if (sub_command == "hao_root_diagnostic_reset") {
+    Search::NnueHaoRiskLog::ResetRootCompact();
+    std::cout << "NNUE Hao root diagnostics reset." << std::endl;
+  } else if (sub_command == "hao_root_diagnostic_summary") {
+    Search::NnueHaoRiskLog::ReportRootSummary(std::cout);
 #endif
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
   } else if (sub_command == "signal_log_reset") {
