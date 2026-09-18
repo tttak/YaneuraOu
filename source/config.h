@@ -375,6 +375,7 @@
 // 必要なときだけコメントを解除する。通常公開buildではすべて無効のままにする。
 // #define ENABLE_NNUE_TRACE       // trace_fullなどのNNUE詳細trace
 // #define ENABLE_NNUE_BENCH       // test nnue bench_* の専用benchmark
+// #define ENABLE_NNUE_POLICY_SHADOW // Experiment 51 frozen policy diagnostics
 // #define ENABLE_NNUE_SIGNAL_LOG  // 探索中のNNUE内部signal収集・report
 // #define ENABLE_NNUE_RFP_SHADOW  // 成立したreverse futilityの一部をshadow探索
 // #define ENABLE_NNUE_UNCERTAINTY_SIGNAL // frozen teacher-disagreement headを診断ログへ追加

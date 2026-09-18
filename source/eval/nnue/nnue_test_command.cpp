@@ -13,6 +13,9 @@
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
 #include "../../engine/yaneuraou-engine/nnue_signal_logger.h"
 #endif
+#if defined(ENABLE_NNUE_POLICY_SHADOW)
+#include "../../engine/yaneuraou-engine/nnue_policy_shadow.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -401,10 +404,13 @@ void InspectPackedSfenSample(std::istream& stream) {
     return;
   }
 
-  output << "sample_index,decoded,side_to_move,material_black,material_stm,"
-            "teacher_move_pseudo_legal,teacher_move_legal";
+  output << "sample_index,decoded,score,game_ply,move_raw,move_none_or_zero,"
+            "move16_structurally_valid,side_to_move,material_black,material_stm,"
+            "teacher_move_pseudo_legal,teacher_move_legal,illegal_reason,"
+            "legal_move_count,teacher_capture,teacher_quiet,teacher_check,"
+            "teacher_promotion,teacher_drop,teacher_piece_type";
   if (include_sfen)
-    output << ",teacher_move_usi,sfen";
+    output << ",teacher_move_usi,sfen,legal_move_features";
   output << '\n';
   std::uint64_t sample_index = 0;
   std::uint64_t decode_errors = 0;
@@ -418,33 +424,208 @@ void InspectPackedSfenSample(std::istream& stream) {
     output << sample_index++ << ',' << (decoded ? 1 : 0);
     if (!decoded) {
       ++decode_errors;
-      output << ",,,,,";
+      output << ",,,,,,,,,,,packed_sfen_decode_failed,,,,,,,";
       if (include_sfen)
-        output << ",,";
+        output << ",,,";
       output << '\n';
       continue;
     }
 
     const int material_black = static_cast<int>(Eval::material(position));
     const int side = static_cast<int>(position.side_to_move());
+    const Move16 move16(record.move);
+    const bool none_or_zero = move16 == Move16::none();
+    const bool ordinary_type = !(move16.is_drop() && move16.is_promote());
+    const bool valid_to = static_cast<int>(move16.to_sq()) >= 0
+                       && static_cast<int>(move16.to_sq()) < SQ_NB;
+    const bool valid_from_or_drop = move16.is_drop()
+      ? (PAWN <= move16.move_dropped_piece()
+         && move16.move_dropped_piece() < KING)
+      : (static_cast<int>(move16.from_sq()) >= 0
+         && static_cast<int>(move16.from_sq()) < SQ_NB);
+    const bool structurally_valid = !none_or_zero && move16.is_ok()
+                                 && ordinary_type && valid_to
+                                 && valid_from_or_drop;
     bool pseudo_legal = false;
     bool legal = false;
-    if (record.move != 0) {
-      const Move move = position.to_move(Move16(record.move));
-      pseudo_legal = position.pseudo_legal_s<true>(move);
-      legal = pseudo_legal && position.legal(move);
+    bool teacher_capture = false;
+    bool teacher_check = false;
+    bool teacher_promotion = false;
+    bool teacher_drop = false;
+    int teacher_piece_type = 0;
+    Move teacher_move = Move::none();
+    std::string illegal_reason;
+    if (structurally_valid) {
+      teacher_move = position.to_move(move16);
+      pseudo_legal = position.pseudo_legal_s<true>(teacher_move);
+      legal = pseudo_legal && position.legal(teacher_move);
+      if (legal) {
+        teacher_capture = position.capture(teacher_move);
+        teacher_check = position.gives_check(teacher_move);
+        teacher_promotion = teacher_move.is_promote();
+        teacher_drop = teacher_move.is_drop();
+        teacher_piece_type = static_cast<int>(
+            raw_type_of(position.moved_piece_before(teacher_move)));
+      }
+      if (!pseudo_legal)
+        illegal_reason = "pseudo_legal_false";
+      else if (!legal)
+        illegal_reason = "legal_false_self_check";
+    } else if (none_or_zero) {
+      illegal_reason = "move_none_or_zero";
+    } else if (move16 == Move16::null()) {
+      illegal_reason = "move_null";
+    } else if (move16 == Move16::resign()) {
+      illegal_reason = "move_resign";
+    } else if (move16 == Move16::win()) {
+      illegal_reason = "move_win";
+    } else {
+      illegal_reason = "move16_structurally_invalid";
     }
-    output << ',' << side << ',' << material_black << ','
+    MoveList<LEGAL_ALL> legal_moves(position);
+    output << ',' << record.score << ',' << record.game_ply << ',' << record.move
+           << ',' << (none_or_zero ? 1 : 0)
+           << ',' << (structurally_valid ? 1 : 0)
+           << ',' << side << ',' << material_black << ','
            << (position.side_to_move() == BLACK ? material_black : -material_black)
-           << ',' << (pseudo_legal ? 1 : 0) << ',' << (legal ? 1 : 0);
-    if (include_sfen)
-      output << ',' << Move16(record.move).to_usi_string() << ',' << position.sfen();
+           << ',' << (pseudo_legal ? 1 : 0) << ',' << (legal ? 1 : 0)
+           << ',' << illegal_reason << ',' << legal_moves.size()
+           << ',' << (teacher_capture ? 1 : 0)
+           << ',' << (legal && !teacher_capture ? 1 : 0)
+           << ',' << (teacher_check ? 1 : 0)
+           << ',' << (teacher_promotion ? 1 : 0)
+           << ',' << (teacher_drop ? 1 : 0)
+           << ',' << teacher_piece_type;
+    if (include_sfen) {
+      output << ',' << (structurally_valid ? move16.to_usi_string() : std::string())
+             << ',' << position.sfen() << ',';
+      bool first_move = true;
+      for (const auto& ext_move : legal_moves) {
+        const Move move = ext_move;
+        if (!first_move)
+          output << '|';
+        first_move = false;
+        const Move16 compact(move.to_u16());
+        const int from_or_drop = move.is_drop()
+            ? 81 + static_cast<int>(move.move_dropped_piece())
+            : static_cast<int>(move.from_sq());
+        const int piece_type = static_cast<int>(
+            raw_type_of(position.moved_piece_before(move)));
+        const Color us = position.side_to_move();
+        const Color them = ~us;
+        const Square to = move.to_sq();
+        const Square normalized_to = us == BLACK ? to : Inv(to);
+        const Square own_king = us == BLACK
+            ? position.square<KING>(us) : Inv(position.square<KING>(us));
+        const Square enemy_king = us == BLACK
+            ? position.square<KING>(them) : Inv(position.square<KING>(them));
+        const int captured_type = position.capture(move)
+            ? static_cast<int>(type_of(position.piece_on(to))) : 0;
+        const int moved_after_type = static_cast<int>(
+            type_of(position.moved_piece_after(move)));
+        const int delta_file = move.is_drop() ? 17
+            : int(file_of(normalized_to))
+              - int(file_of(us == BLACK ? move.from_sq() : Inv(move.from_sq()))) + 8;
+        const int delta_rank = move.is_drop() ? 17
+            : int(rank_of(normalized_to))
+              - int(rank_of(us == BLACK ? move.from_sq() : Inv(move.from_sq()))) + 8;
+        const int own_king_file = int(file_of(normalized_to)) - int(file_of(own_king)) + 8;
+        const int own_king_rank = int(rank_of(normalized_to)) - int(rank_of(own_king)) + 8;
+        const int enemy_king_file = int(file_of(normalized_to)) - int(file_of(enemy_king)) + 8;
+        const int enemy_king_rank = int(rank_of(normalized_to)) - int(rank_of(enemy_king)) + 8;
+        output << compact.to_u16() << ':' << from_or_drop << ':'
+               << static_cast<int>(move.to_sq()) << ':' << piece_type << ':'
+               << (move.is_promote() ? 1 : 0) << ':'
+               << (move.is_drop() ? 1 : 0) << ':'
+               << (position.capture(move) ? 1 : 0) << ':'
+               << (position.gives_check(move) ? 1 : 0) << ':'
+               << captured_type << ':' << moved_after_type << ':'
+               << delta_file << ':' << delta_rank << ':'
+               << int(file_of(normalized_to)) << ':' << int(rank_of(normalized_to)) << ':'
+               << own_king_file << ':' << own_king_rank << ':'
+               << enemy_king_file << ':' << enemy_king_rank << ':'
+               << dist(normalized_to, enemy_king) << ':'
+               << std::min(int(position.board_effect[us].effect(to)), 3) << ':'
+               << std::min(int(position.board_effect[them].effect(to)), 3);
+      }
+    }
     output << '\n';
   }
 
   std::cout << "inspect_packed_sfen_sample: records=" << sample_index
             << " decode_errors=" << decode_errors
             << " output=" << output_name << std::endl;
+}
+#endif
+
+#if defined(ENABLE_NNUE_POLICY_SHADOW)
+void PolicyProbeSelftest(std::istream& stream) {
+  std::string input_name, output_name;
+  std::uint64_t limit = 1000;
+  stream >> std::quoted(input_name) >> std::quoted(output_name) >> limit;
+  std::ifstream input(input_name, std::ios::binary);
+  std::ofstream output(output_name, std::ios::out | std::ios::trunc);
+  std::ofstream queries(output_name + ".queries.csv", std::ios::out | std::ios::trunc);
+  if (!input || !output || !queries) {
+    std::cout << "error: policy_probe_selftest failed to open input/output" << std::endl;
+    return;
+  }
+  output << "record_index,move_raw,logit16,rank16,logit32,rank32\n";
+  queries << "record_index,width,query\n";
+  std::uint64_t index = 0, positions = 0, moves = 0, unavailable = 0;
+  MoveAccuracyRecord record;
+  while (index < limit && input.read(reinterpret_cast<char*>(&record), sizeof(record))) {
+    Position position;
+    StateInfo state;
+    if (position.set_from_packed_sfen(record.sfen, &state, false, record.game_ply).is_not_ok()) {
+      ++index;
+      continue;
+    }
+    // Force a fresh network pass so the diagnostic L2 query belongs to this
+    // exact position rather than an accumulator/eval-hash cache entry.
+    Eval::compute_eval(position);
+    const auto& access = LastNnueSignalAccess();
+    if (access.source != NnueSignalEvalSource::FreshNetwork || !access.signal.valid) {
+      ++unavailable; ++index; continue;
+    }
+    queries << std::setprecision(9) << index << ",16,\"";
+    for (int i = 0; i < 16; ++i) {
+      if (i) queries << ';';
+      queries << access.signal.policy_query16[i];
+    }
+    queries << "\"\n" << index << ",32,\"";
+    for (int i = 0; i < 32; ++i) {
+      if (i) queries << ';';
+      queries << access.signal.policy_query32[i];
+    }
+    queries << "\"\n";
+    struct Item { Move move; float p16, p32; int r16 = 0, r32 = 0; };
+    std::vector<Item> items;
+    for (const auto& ext : MoveList<LEGAL_ALL>(position)) {
+      const Move move = ext;
+      const auto feature = Search::NnuePolicyShadow::Features(position, move);
+      items.push_back({move,
+        PolicyProbe::Score<16>(access.signal.policy_query16, feature),
+        PolicyProbe::Score<32>(access.signal.policy_query32, feature)});
+    }
+    const auto assign_rank = [&](auto value, auto rank) {
+      std::vector<std::size_t> order(items.size());
+      for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+      std::stable_sort(order.begin(), order.end(), [&](const auto a, const auto b) {
+        return items[a].*value > items[b].*value;
+      });
+      for (std::size_t i = 0; i < order.size(); ++i) items[order[i]].*rank = int(i + 1);
+    };
+    assign_rank(&Item::p16, &Item::r16);
+    assign_rank(&Item::p32, &Item::r32);
+    output << std::setprecision(9);
+    for (const auto& item : items)
+      output << index << ',' << item.move.to_u16() << ',' << item.p16 << ','
+             << item.r16 << ',' << item.p32 << ',' << item.r32 << '\n';
+    ++positions; moves += items.size(); ++index;
+  }
+  std::cout << "policy_probe_selftest positions=" << positions << " moves=" << moves
+            << " unavailable=" << unavailable << " output=" << output_name << std::endl;
 }
 #endif
 
@@ -10924,6 +11105,10 @@ void TestCommand(IEngine& engine, std::istream& stream) {
   } else if (sub_command == "uncertainty_head_selftest") {
     TestUncertaintyHead(pos);
 #endif
+#if defined(ENABLE_NNUE_POLICY_SHADOW)
+  } else if (sub_command == "policy_probe_selftest") {
+    PolicyProbeSelftest(stream);
+#endif
 #if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
   } else if (sub_command == "hao_risk_head_selftest") {
     TestHaoRiskHeads(pos);
@@ -10972,6 +11157,24 @@ void TestCommand(IEngine& engine, std::istream& stream) {
         Search::NnueSignalLog::CalibrationReportJson(output);
         std::cout << "NNUE signal calibration JSON written: " << json_file << std::endl;
       }
+    }
+#endif
+#if defined(ENABLE_NNUE_POLICY_SHADOW)
+  } else if (sub_command == "policy_shadow_reset") {
+    Search::NnuePolicyShadow::Reset();
+    std::cout << "NNUE policy shadow diagnostics reset." << std::endl;
+  } else if (sub_command == "policy_shadow_report") {
+    std::string summary_file;
+    std::string raw_file;
+    stream >> std::quoted(summary_file) >> std::quoted(raw_file);
+    Search::NnuePolicyShadow::Report(std::cout);
+    if (!summary_file.empty()) {
+      std::ofstream output(summary_file);
+      Search::NnuePolicyShadow::Report(output);
+    }
+    if (!raw_file.empty()) {
+      std::ofstream output(raw_file);
+      Search::NnuePolicyShadow::RawReport(output);
     }
 #endif
 #if defined(ENABLE_STATIC_EVAL_BIN_TOOL)
@@ -11111,8 +11314,15 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << " test nnue signal_log_reset" << std::endl;
     std::cout << " test nnue signal_log_report [output file]" << std::endl;
 #endif
+#if defined(ENABLE_NNUE_POLICY_SHADOW)
+    std::cout << " test nnue policy_shadow_reset" << std::endl;
+    std::cout << " test nnue policy_shadow_report [summary.csv] [raw.csv]" << std::endl;
+#endif
 #if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
     std::cout << " test nnue uncertainty_head_selftest" << std::endl;
+#endif
+#if defined(ENABLE_NNUE_POLICY_SHADOW)
+    std::cout << " test nnue policy_probe_selftest <packed.bin> <output.csv> [count]" << std::endl;
 #endif
 #if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
     std::cout << " test nnue hao_risk_head_selftest" << std::endl;

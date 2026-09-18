@@ -87,6 +87,14 @@ struct NnueSignalSnapshot {
     float lca_mean_abs_delta = 0.0f;
     std::int32_t lca_max_abs_delta = 0;
     std::int32_t lca_abs_delta_sum = 0;
+#if defined(ENABLE_NNUE_POLICY_SHADOW)
+    // Frozen Experiment-51 L2->query projections. Move scoring remains in the
+    // shadow logger and never changes MovePicker ordering or search decisions.
+    float policy_query16[16]{};
+    float policy_query32[32]{};
+    std::uint32_t policy_query16_projection_ns = 0;
+    std::uint32_t policy_query32_projection_ns = 0;
+#endif
 #if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
     // Frozen DLS/Fuka disagreement probe.  These fields are diagnostic only;
     // uncertainty_q8 is the scalar intended for later search logging.

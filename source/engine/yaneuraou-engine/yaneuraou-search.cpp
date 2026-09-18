@@ -35,6 +35,9 @@
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
 #include "nnue_signal_logger.h"
 #endif
+#if defined(ENABLE_NNUE_POLICY_SHADOW)
+#include "nnue_policy_shadow.h"
+#endif
 #if defined(USE_NNUE_ROUTER_LMR) && !defined(ENABLE_NNUE_SIGNAL_LOG)
 #include "../../eval/nnue/nnue_signal.h"
 #endif
@@ -3238,6 +3241,11 @@ moves_loop:  // When in check, search starts here
       (ss - 1)->continuationHistory, (ss - 2)->continuationHistory, (ss - 3)->continuationHistory,
       (ss - 4)->continuationHistory, (ss - 5)->continuationHistory, (ss - 6)->continuationHistory};
 
+#if defined(ENABLE_NNUE_POLICY_SHADOW)
+    NnuePolicyShadow::NodeObservation nnuePolicyObservation(
+      pos, ttData.move, Eval::NNUE::LastNnueSignalAccess());
+#endif
+
 
     MovePicker mp(pos, ttData.move, depth, &mainHistory, &lowPlyHistory, &captureHistory, contHist,
                   &sharedHistory, ss->ply
@@ -3753,6 +3761,12 @@ moves_loop:  // When in check, search starts here
                           + (*contHist[0])[movedPiece][move.to_sq()]
                           + (*contHist[1])[movedPiece][move.to_sq()];
 
+#if defined(ENABLE_NNUE_POLICY_SHADOW)
+        nnuePolicyObservation.ObserveMove(
+          move, moveCount, ss->statScore,
+          depth >= 2 && moveCount > 1 && !capture);
+#endif
+
         // Decrease/increase reduction for moves with a good/bad history
         // 良い/悪い履歴を持つ手に対して、reductionを減らす/増やす
 
@@ -4049,6 +4063,9 @@ moves_loop:  // When in check, search starts here
                 newDepth += doDeeperSearch - doShallowerSearch;
 
                 if (newDepth > d) {
+#if defined(ENABLE_NNUE_POLICY_SHADOW)
+                    nnuePolicyObservation.MarkLmrResearch(move);
+#endif
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
                     nnueSignalObservation.MarkLmrResearch();
                     nnueSignalLmrResearched = true;
@@ -4527,6 +4544,9 @@ moves_loop:  // When in check, search starts here
 
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
     nnueSignalObservation.SetMoveCount(moveCount);
+#endif
+#if defined(ENABLE_NNUE_POLICY_SHADOW)
+    nnuePolicyObservation.RecordResult(bestMove, bestValue >= beta);
 #endif
     const Value nnueSignalReturnValue = NNUE_SIGNAL_RETURN(bestValue);
 #undef NNUE_SIGNAL_EVALUATE

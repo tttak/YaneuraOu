@@ -5,6 +5,9 @@
 #include "../features/half_ka.h"
 #include "../features/king_safety3_distinguishgolds.h"
 #include "../nnue_signal.h"
+#if defined(ENABLE_NNUE_POLICY_SHADOW)
+#include "../nnue_policy_probe.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -58,6 +61,12 @@ constexpr IndexType kHidden1Dims = 31;
 #endif
 #if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL) && defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
 #error Hao search-risk and legacy teacher-disagreement diagnostic formats are mutually exclusive
+#endif
+#if defined(ENABLE_NNUE_POLICY_SHADOW) && !defined(ENABLE_NNUE_SIGNAL_LOG)
+#error ENABLE_NNUE_POLICY_SHADOW requires ENABLE_NNUE_SIGNAL_LOG
+#endif
+#if defined(ENABLE_NNUE_POLICY_SHADOW) && !defined(USE_NNUE_L2_PHYSICAL_128)
+#error ENABLE_NNUE_POLICY_SHADOW requires the compact physical-128 L2 architecture
 #endif
 #if defined(USE_NNUE_CROSS_WIDTH_24) \
 	&& (!defined(NNUE_COMPACT_PHASE5) || !defined(USE_NNUE_FC1_WIDTH_64))
@@ -1390,6 +1399,24 @@ struct Network {
 			AssembleL2Channel<CROSS_OUTPUT_SIZE>(buf.cross_feat, &buf.l2_input[L2_CROSS_OFFSET], cross_scale);
 		}
 		std::memset(buf.l2_input + L2_REAL_SIZE, 0, L2_PADDING_SIZE);
+
+#if defined(ENABLE_NNUE_POLICY_SHADOW)
+		if (signal) {
+			const auto policy_query16_started = std::chrono::steady_clock::now();
+			PolicyProbe::ProjectQuery<16>(buf.l2_input, signal->policy_query16);
+			const auto policy_query16_ended = std::chrono::steady_clock::now();
+			PolicyProbe::ProjectQuery<32>(buf.l2_input, signal->policy_query32);
+			const auto policy_query32_ended = std::chrono::steady_clock::now();
+			const auto elapsed16 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+				policy_query16_ended - policy_query16_started).count();
+			const auto elapsed32 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+				policy_query32_ended - policy_query16_ended).count();
+			signal->policy_query16_projection_ns = static_cast<std::uint32_t>(
+				std::clamp<std::int64_t>(elapsed16, 0, UINT32_MAX));
+			signal->policy_query32_projection_ns = static_cast<std::uint32_t>(
+				std::clamp<std::int64_t>(elapsed32, 0, UINT32_MAX));
+		}
+#endif
 
 
 		// --- 7. Deep Path 推論 ---
