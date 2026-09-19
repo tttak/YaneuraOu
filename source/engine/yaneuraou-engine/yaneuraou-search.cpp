@@ -41,6 +41,12 @@
 #if defined(USE_NNUE_ROUTER_LMR) && !defined(ENABLE_NNUE_SIGNAL_LOG)
 #include "../../eval/nnue/nnue_signal.h"
 #endif
+#if defined(USE_NNUE_DECISION_RISK_LMR)
+#include "nnue_decision_risk_predictor.h"
+#if defined(ENABLE_NNUE_DECISION_RISK_LMR_COUNTERS)
+#include "nnue_decision_risk_lmr_counters.h"
+#endif
+#endif
 
 #if defined(USE_NNUE_ROUTER_LMR)
 #ifndef NNUE_ROUTER_LMR_VARIANT
@@ -2068,10 +2074,20 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
 	//     nodeの初期化
 
     ss->inCheck        = pos.checkers();
+#if defined(USE_NNUE_DECISION_RISK_LMR) || defined(USE_NNUE_RFP_OSCILLATION_RULE)
+    // Trace calibration used the depth at node entry, before hindsight adjustment.
+    const Depth nnueDecisionOriginalDepth = depth;
+#endif
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
     NnueSignalLog::NodeObservation nnueSignalObservation(
       PvNode, ss->inCheck, depth, static_cast<int>(alpha), static_cast<int>(beta),
-      pos.state()->materialValue, ss->ply);
+      pos.state()->materialValue, ss->ply, false, cutNode, rootNode);
+#if defined(ENABLE_NNUE_DECISION_TRACE)
+    // Capture the position at node entry so in-check nodes (which do not call
+    // evaluate()) can still contribute LMR decision records.  CapturePosition
+    // is a no-op unless an explicit diagnostic trace session is active.
+    nnueSignalObservation.SetPosition(pos);
+#endif
 #define NNUE_SIGNAL_RETURN(value) nnueSignalObservation.Return(value)
 #else
 #define NNUE_SIGNAL_RETURN(value) (value)
@@ -2868,6 +2884,16 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
 
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
     nnueSignalObservation.SetStaticEval(static_cast<int>(ss->staticEval));
+#if defined(ENABLE_NNUE_EVAL_HISTORY_DIAGNOSTIC)
+    nnueSignalObservation.SetEvalHistory(
+      static_cast<int>(ss->staticEval),
+      static_cast<int>((ss - 1)->staticEval),
+      static_cast<int>((ss - 2)->staticEval),
+      static_cast<int>((ss - 3)->staticEval));
+#endif
+#if defined(ENABLE_NNUE_DECISION_TRACE)
+    nnueSignalObservation.SetBucket();
+#endif
 #endif
 
 	// -----------------------
@@ -2920,6 +2946,9 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
 	*/
 
     improving = ss->staticEval > (ss - 2)->staticEval;
+#if defined(ENABLE_NNUE_SIGNAL_LOG) && defined(ENABLE_NNUE_DECISION_TRACE)
+    nnueSignalObservation.SetImproving(improving);
+#endif
 
 	/*
 		📝 opponentWorseningは、相手の状況が悪化しているかのフラグ。
@@ -3012,6 +3041,24 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
             // through the unmodified remainder of search(), and NodeObservation
             // compares that node's eventual return with the original beta.
             if (!nnueSignalObservation.SelectReverseFutilityShadowSample())
+                return NNUE_SIGNAL_RETURN((2 * beta + eval) / 3);
+#elif defined(USE_NNUE_RFP_OSCILLATION_RULE)
+            // Protect only the Experiment-53 high-miscut cohort. Stack evals are
+            // side-to-move relative, so normalize the parent sign first.
+            const bool parentValid = (ss - 1)->staticEval != VALUE_NONE
+                                  && std::abs((ss - 1)->staticEval) < 30000;
+            const bool grandparentValid = (ss - 2)->staticEval != VALUE_NONE
+                                       && std::abs((ss - 2)->staticEval) < 30000;
+            const int parentEval = -(ss - 1)->staticEval;
+            const int grandparentEval = (ss - 2)->staticEval;
+            const int d01 = ss->staticEval - parentEval;
+            const int d12 = parentEval - grandparentEval;
+            const bool oscillation2 = parentValid && grandparentValid
+                                   && d01 != 0 && d12 != 0
+                                   && std::int64_t(d01) * d12 < 0;
+            const bool protect = oscillation2 && nnueDecisionOriginalDepth <= 6
+                              && !improving;
+            if (!protect)
                 return NNUE_SIGNAL_RETURN((2 * beta + eval) / 3);
 #else
             return NNUE_SIGNAL_RETURN((2 * beta + eval) / 3);
@@ -3425,7 +3472,9 @@ moves_loop:  // When in check, search starts here
 #endif
 #if defined(ENABLE_NNUE_FUTILITY_SHADOW)
                         nnueForwardFutilityShadow =
-                          nnueSignalObservation.SelectForwardFutilityShadowSample();
+                          nnueSignalObservation.SelectForwardFutilityShadowSample(
+                            move.to_u16(), moveCount, capture, givesCheck,
+                            static_cast<int>(futilityValue - alpha), captHist);
                         if (!nnueForwardFutilityShadow)
                             continue;
 #else
@@ -3496,7 +3545,9 @@ moves_loop:  // When in check, search starts here
 #endif
 #if defined(ENABLE_NNUE_FUTILITY_SHADOW)
                     nnueForwardFutilityShadow =
-                      nnueSignalObservation.SelectForwardFutilityShadowSample();
+                      nnueSignalObservation.SelectForwardFutilityShadowSample(
+                        move.to_u16(), moveCount, capture, givesCheck,
+                        static_cast<int>(futilityValue - alpha), history);
                     if (!nnueForwardFutilityShadow) {
 #endif
                     if (bestValue <= futilityValue && !is_decisive(bestValue) && !is_win(futilityValue))
@@ -3814,7 +3865,8 @@ moves_loop:  // When in check, search starts here
         if (depth >= 2 && moveCount > 1)
         {
 #if defined(ENABLE_NNUE_SIGNAL_LOG) || defined(USE_NNUE_PHASE_FM_LMR) \
- || defined(USE_NNUE_LCA_LMR) || defined(USE_NNUE_CROSS_LMR)
+ || defined(USE_NNUE_LCA_LMR) || defined(USE_NNUE_CROSS_LMR) \
+ || defined(USE_NNUE_DECISION_RISK_LMR)
             bool nnueRouterLmrActuallyAdjusted = false;
 #endif
 #if defined(USE_NNUE_CROSS_LMR)
@@ -3936,6 +3988,92 @@ moves_loop:  // When in check, search starts here
             }
 #endif
 
+#if defined(USE_NNUE_DECISION_RISK_LMR)
+#if NNUE_DECISION_RISK_LMR_Q8_THRESHOLD != 56
+#error "Experiment 56 restricted cohort requires q8 threshold 56"
+#endif
+            // Reproduce the baseline Router/LCA/Cross decisions before applying the
+            // experimental head.  A cohort hit that overlaps any existing signal is
+            // skipped, leaving that baseline signal to modify d in its normal block.
+            const bool nnueDecisionLcaWouldAdjust =
+              !nnueRouterLmrActuallyAdjusted && nnueRouterLmrSignal.valid
+              && nnueRouterLmrSignal.lca_abs_delta_sum
+#if defined(NNUE_LCA_LMR_FIXED_THRESHOLD)
+                   >= NNUE_LCA_LMR_FIXED_THRESHOLD
+#else
+                   >= search_options.nnue_lca_lmr_threshold
+#endif
+              && d < newDepth;
+            const bool nnueDecisionCrossWouldAdjust =
+              !nnueRouterLmrActuallyAdjusted && !nnueDecisionLcaWouldAdjust
+              && nnueRouterLmrSignal.valid
+              && nnueRouterLmrSignal.cross_abs_max >= NNUE_CROSS_LMR_MAX_THRESHOLD
+              && depth >= 3 && depth <= 8 && moveCount <= 8 && d < newDepth;
+
+            // Experiment 55 was trained/analyzed with the final baseline reduction.
+            // Simulate the later LCA/Cross +1 here so q8 and the >=2 condition use
+            // exactly that definition even though this block precedes those paths.
+            const Depth nnueDecisionBaselineDepth =
+              d + (nnueDecisionLcaWouldAdjust || nnueDecisionCrossWouldAdjust);
+            NnueDecisionRiskPredictor::Input riskInput{};
+            riskInput.depth = nnueDecisionOriginalDepth;
+            riskInput.ply = ss->ply;
+            riskInput.static_eval = ss->staticEval;
+            riskInput.alpha = alpha;
+            riskInput.beta = beta;
+            riskInput.material = pos.state()->materialValue;
+            riskInput.move_count = moveCount;
+            riskInput.reduction = newDepth - nnueDecisionBaselineDepth;
+            riskInput.history = ss->statScore;
+            riskInput.parent_eval = (ss - 1)->staticEval;
+            riskInput.grandparent_eval = (ss - 2)->staticEval;
+            riskInput.great_grandparent_eval = (ss - 3)->staticEval;
+            riskInput.node_kind = rootNode ? 0 : (PvNode ? 1 : (cutNode ? 2 : 3));
+            riskInput.bucket = nnueRouterLmrSignal.valid
+                             ? nnueRouterLmrSignal.selected_bucket : -1;
+            riskInput.improving = improving;
+            riskInput.in_check = ss->inCheck;
+            riskInput.capture = capture;
+            riskInput.check = givesCheck;
+            riskInput.tt_move = move == ttData.move;
+
+            const auto nnueDecisionRiskQ8 = NnueDecisionRiskPredictor::LmrQ8(riskInput);
+            const bool nnueDecisionQ8High = riskInput.reduction >= 1
+                                         && nnueDecisionRiskQ8 >= 56;
+            const bool nnueDecisionCohort = nnueDecisionQ8High
+                                         && riskInput.reduction >= 2
+                                         && moveCount <= 3 && ss->statScore >= 8000;
+            const bool nnueDecisionOverlap = nnueRouterLmrActuallyAdjusted
+                                          || nnueDecisionLcaWouldAdjust
+                                          || nnueDecisionCrossWouldAdjust;
+#if defined(ENABLE_NNUE_DECISION_RISK_LMR_COUNTERS)
+            using namespace NnueDecisionRiskLmrCounters;
+            ++TotalLmrEvents;
+            if (riskInput.reduction >= 1)
+                ++PositiveReductionEvents;
+            if (nnueDecisionQ8High)
+                ++Q8Ge56Events;
+            if (nnueDecisionCohort) {
+                ++CohortEvents;
+                if (nnueDecisionOverlap) {
+                    ++OverlapSkipEvents;
+                    if (nnueRouterLmrActuallyAdjusted) ++RouterOverlapSkips;
+                    if (nnueDecisionLcaWouldAdjust) ++LcaOverlapSkips;
+                    if (nnueDecisionCrossWouldAdjust) ++CrossOverlapSkips;
+                }
+            }
+#endif
+            if (nnueDecisionCohort && !nnueDecisionOverlap && d < newDepth) {
+                // reduction>=2 above makes this strictly N -> N-1; reduction zero
+                // can never be converted into an extension.
+                ++d;
+                nnueRouterLmrActuallyAdjusted = true;
+#if defined(ENABLE_NNUE_DECISION_RISK_LMR_COUNTERS)
+                ++NnueDecisionRiskLmrCounters::AppliedEvents;
+#endif
+            }
+#endif
+
 #if defined(USE_NNUE_LCA_LMR) && !defined(ENABLE_NNUE_SIGNAL_LOG)
             // The default is the 295/epoch20 fixed-corpus top-1% exact
             // byte-domain sum (1959 over 32 Diff channels). Router moves already
@@ -4032,6 +4170,9 @@ moves_loop:  // When in check, search starts here
 #endif
 
             ss->reduction = newDepth - d;
+#if defined(ENABLE_NNUE_DECISION_TRACE)
+            const int nnueTraceLmrReduction = static_cast<int>(ss->reduction);
+#endif
             value         = -search<NonPV>(pos, ss + 1, -(alpha + 1), -alpha, d, true);
             ss->reduction = 0;
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
@@ -4085,7 +4226,17 @@ moves_loop:  // When in check, search starts here
             else if (value > alpha && value < bestValue + 9)
                 newDepth--;
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
-            nnueSignalObservation.RecordLmrEvent(moveCount, nnueSignalLmrResearched);
+            nnueSignalObservation.RecordLmrEvent(
+              moveCount, nnueSignalLmrResearched,
+              move.to_u16(),
+#if defined(ENABLE_NNUE_DECISION_TRACE)
+              nnueTraceLmrReduction,
+#else
+              0,
+#endif
+              ss->statScore, capture, givesCheck, move == ttData.move,
+              nnueCalibrationPositiveReduction,
+              static_cast<int>(nnuePhaseFmLmrReducedValue), static_cast<int>(value));
             nnuePhaseFmLmrOutcomePending = true;
 #endif
 #if defined(ENABLE_NNUE_ROUTER_LMR_EXPERIMENT)

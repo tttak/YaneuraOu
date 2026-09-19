@@ -19,6 +19,10 @@ namespace YaneuraOu::Eval::NNUE {
 // phase/deep/bypass fields, counters, and report machinery in match binaries.
 struct NnueRouterLmrSignal {
     std::int32_t router_margin = 0;
+#if defined(USE_NNUE_DECISION_RISK_LMR)
+    // Experiment 53 context probeのbucket one-hot用。評価値には影響しない。
+    std::int8_t selected_bucket = -1;
+#endif
 #if defined(USE_NNUE_LCA_LMR)
     // Exact sum of the absolute byte-domain LCA correction over 32 channels.
     // The 295/epoch20 top-1% experiment compares this integer directly.

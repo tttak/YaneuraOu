@@ -380,7 +380,12 @@
 // #define ENABLE_NNUE_RFP_SHADOW  // 成立したreverse futilityの一部をshadow探索
 // #define ENABLE_NNUE_UNCERTAINTY_SIGNAL // frozen teacher-disagreement headを診断ログへ追加
 // #define ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL // Hao static-vs-depth9 probe 4種を診断ログへ追加
+// #define ENABLE_NNUE_EVAL_HISTORY_DIAGNOSTIC // 親/祖父母staticEval差と探索失敗の診断
 // #define ENABLE_NNUE_FUTILITY_SHADOW // uncertainty別のforward-futility誤cut診断(1/256 sampling)
+// #define ENABLE_NNUE_DECISION_TRACE // Experiment 53 chunked LMR/RFP/futility decision trace
+// #define ENABLE_NNUE_DECISION_RISK_SHADOW // Experiment 53 frozen LMR/RFP context probes
+// #define USE_NNUE_DECISION_RISK_LMR // Experiment 54: high-risk LMRだけ1 ply弱める
+// #define USE_NNUE_RFP_OSCILLATION_RULE // Experiment 54: oscillation2 RFP保護rule
 // #define ENABLE_NNUE_CROSS_LMR_EXPERIMENT // Cross maxによるLMR +1 plyの診断A/B
 // #define USE_NNUE_PHASE_FM_LMR   // Router非対象の高評価・低FM relianceを明示的に+1 ply
 // #define USE_NNUE_LCA_WIDTH_24   // optional LCA 24d architecture（32d既定）

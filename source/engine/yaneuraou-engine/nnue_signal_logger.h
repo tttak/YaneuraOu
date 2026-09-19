@@ -82,6 +82,8 @@
 #include "../../eval/nnue/nnue_signal.h"
 #include "nnue_uncertainty_logger.h"
 #include "nnue_hao_risk_logger.h"
+#include "nnue_eval_history_logger.h"
+#include "nnue_decision_trace.h"
 
 #include <algorithm>
 #include <array>
@@ -947,9 +949,15 @@ class NodeObservation {
    public:
     NodeObservation(const bool pv, const bool in_check, const int depth,
                     const int alpha, const int beta, const int material,
-                    const int ply, const bool qsearch = false)
+                    const int ply, const bool qsearch = false,
+                    const bool cut_node = false, const bool root_node = false)
         : pv_(pv), in_check_(in_check), qsearch_(qsearch), depth_(depth), alpha_(alpha), beta_(beta),
-          material_(material), ply_(ply) {}
+          material_(material), ply_(ply) {
+#if defined(ENABLE_NNUE_DECISION_TRACE)
+        trace_context_ = NnueDecisionTrace::BeginNode(
+          ply, depth, alpha, beta, material, pv, cut_node, root_node, qsearch, in_check);
+#endif
+    }
 
     ~NodeObservation() {
         auto& stats = LocalStats();
@@ -1000,6 +1008,29 @@ class NodeObservation {
 #if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
             NnueHaoRiskLog::RecordRfpOutcome(
               reverse_futility_shadow_hao_q8_, result_, beta_, static_eval_);
+#endif
+#if defined(ENABLE_NNUE_EVAL_HISTORY_DIAGNOSTIC)
+            NnueEvalHistoryLog::Record(
+              NnueEvalHistoryLog::Outcome::RfpMiscut, eval_history_, result_ < beta_);
+#endif
+#if defined(ENABLE_NNUE_DECISION_TRACE)
+            if (trace_context_.has_position) {
+                auto record = NnueDecisionTrace::BaseRecord(
+                  trace_context_, NnueDecisionTrace::Decision::Rfp, result_ < beta_);
+                record.flags |= NnueDecisionTrace::Eligible
+                              | NnueDecisionTrace::Applied
+                              | NnueDecisionTrace::ShadowSample;
+                record.margin = reverse_futility_distance_;
+                record.reduced_result = static_eval_;
+                record.full_result = result_;
+#if defined(ENABLE_NNUE_DECISION_RISK_SHADOW)
+                record.risk_q8 = NnueDecisionTrace::RiskQ8(
+                  trace_context_, NnueDecisionTrace::Decision::Rfp);
+#endif
+                if (result_ >= beta_) record.flags |= NnueDecisionTrace::FailHigh;
+                if (result_ <= alpha_) record.flags |= NnueDecisionTrace::FailLow;
+                NnueDecisionTrace::Write(record);
+            }
 #endif
         }
 #endif
@@ -1152,11 +1183,50 @@ class NodeObservation {
     void SetStaticEval(const int value) {
         static_eval_ = value;
         has_static_eval_ = true;
+#if defined(ENABLE_NNUE_DECISION_TRACE)
+        trace_context_.static_eval = value;
+#endif
     }
+#if defined(ENABLE_NNUE_DECISION_TRACE)
+    void SetPosition(Position& pos) {
+        const int bucket = access_.signal.valid ? access_.signal.selected_bucket : -1;
+        NnueDecisionTrace::CapturePosition(trace_context_, pos, bucket);
+    }
+    void SetBucket() {
+        trace_context_.bucket = access_.signal.valid
+          ? access_.signal.selected_bucket : -1;
+    }
+    void SetImproving(const bool value) { trace_context_.improving = value; }
+#endif
+#if defined(ENABLE_NNUE_EVAL_HISTORY_DIAGNOSTIC)
+    void SetEvalHistory(const int current, const int parent,
+                        const int grandparent, const int great_grandparent) {
+        eval_history_ = NnueEvalHistoryLog::MakeSnapshot(
+          current, parent, grandparent, great_grandparent);
+#if defined(ENABLE_NNUE_DECISION_TRACE)
+        using S = NnueEvalHistoryLog::Signal;
+        const auto value = [&](const S signal) {
+            return eval_history_.value[static_cast<std::size_t>(signal)];
+        };
+        trace_context_.parent_abs_delta = value(S::ParentAbsDelta);
+        trace_context_.grandparent_abs_delta = value(S::GrandparentAbsDelta);
+        trace_context_.great_grandparent_abs_delta = value(S::GreatGrandparentAbsDelta);
+        trace_context_.parent_sign_flip = value(S::ParentSignFlip) != 0;
+        trace_context_.any_sign_flip = value(S::AnySignFlip) != 0;
+        trace_context_.oscillation2 = value(S::Oscillation2) != 0;
+        trace_context_.oscillation3 = value(S::Oscillation3) != 0;
+#endif
+    }
+#endif
 
     void MarkFutilityPruned() { futility_pruned_ = true; }
 #if defined(ENABLE_NNUE_FUTILITY_SHADOW)
-    bool SelectForwardFutilityShadowSample() {
+    bool SelectForwardFutilityShadowSample(const std::uint16_t move16 = 0,
+                                           const int move_count = 0,
+                                           const bool capture = false,
+                                           const bool gives_check = false,
+                                           const int margin = 0,
+                                           const int history = 0) {
         if (!access_.signal.valid || !has_static_eval_)
             return false;
 #if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
@@ -1164,8 +1234,19 @@ class NodeObservation {
         return NnueUncertaintyLog::SelectForwardFutilityShadowSample(
           forward_futility_shadow_uncertainty_q8_);
 #elif defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
-        return NnueHaoRiskLog::SelectFutilitySample(
+        const bool selected = NnueHaoRiskLog::SelectFutilitySample(
           access_.signal, forward_futility_shadow_hao_q8_);
+#if defined(ENABLE_NNUE_DECISION_TRACE)
+        if (selected) {
+            forward_futility_trace_move16_ = move16;
+            forward_futility_trace_move_count_ = move_count;
+            forward_futility_trace_capture_ = capture;
+            forward_futility_trace_check_ = gives_check;
+            forward_futility_trace_margin_ = margin;
+            forward_futility_trace_history_ = history;
+        }
+#endif
+        return selected;
 #else
         return false;
 #endif
@@ -1177,6 +1258,31 @@ class NodeObservation {
 #elif defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
         NnueHaoRiskLog::RecordFutilityOutcome(
           forward_futility_shadow_hao_q8_, result, alpha, static_eval_);
+#endif
+#if defined(ENABLE_NNUE_EVAL_HISTORY_DIAGNOSTIC)
+        NnueEvalHistoryLog::Record(
+          NnueEvalHistoryLog::Outcome::FutilityMiscut, eval_history_, result > alpha);
+#endif
+#if defined(ENABLE_NNUE_DECISION_TRACE)
+        if (trace_context_.has_position) {
+            auto record = NnueDecisionTrace::BaseRecord(
+              trace_context_, NnueDecisionTrace::Decision::Futility, result > alpha);
+            record.flags |= NnueDecisionTrace::Eligible
+                          | NnueDecisionTrace::Applied
+                          | NnueDecisionTrace::ShadowSample;
+            record.flags |= forward_futility_trace_capture_
+                          ? NnueDecisionTrace::Capture : NnueDecisionTrace::Quiet;
+            if (forward_futility_trace_check_) record.flags |= NnueDecisionTrace::Check;
+            record.move16 = forward_futility_trace_move16_;
+            record.move_count = std::int16_t(forward_futility_trace_move_count_);
+            record.margin = forward_futility_trace_margin_;
+            record.history = forward_futility_trace_history_;
+            record.reduced_result = static_eval_;
+            record.full_result = result;
+            if (result >= beta_) record.flags |= NnueDecisionTrace::FailHigh;
+            if (result <= alpha) record.flags |= NnueDecisionTrace::FailLow;
+            NnueDecisionTrace::Write(record);
+        }
 #endif
     }
 #endif
@@ -1229,10 +1335,45 @@ class NodeObservation {
         return true;
     }
 #endif
-    void RecordLmrEvent(const int move_count, const bool researched) {
+    void RecordLmrEvent(const int move_count, const bool researched,
+                        const std::uint16_t move16 = 0, const int reduction = 0,
+                        const int history = 0, const bool capture = false,
+                        const bool gives_check = false, const bool tt_move = false,
+                        const bool applied = false, const int reduced_result = 0,
+                        const int full_result = 0) {
         const auto bin = MoveCountBin(move_count);
         ++lmr_events_[bin];
         lmr_researches_[bin] += researched;
+#if defined(ENABLE_NNUE_EVAL_HISTORY_DIAGNOSTIC)
+        NnueEvalHistoryLog::Record(
+          NnueEvalHistoryLog::Outcome::LmrResearch, eval_history_, researched);
+#endif
+#if defined(ENABLE_NNUE_DECISION_TRACE)
+        if (trace_context_.has_position) {
+            auto record = NnueDecisionTrace::BaseRecord(
+              trace_context_, NnueDecisionTrace::Decision::Lmr, researched);
+            record.flags |= NnueDecisionTrace::Eligible;
+            if (applied) record.flags |= NnueDecisionTrace::Applied;
+            record.flags |= capture ? NnueDecisionTrace::Capture : NnueDecisionTrace::Quiet;
+            if (gives_check) record.flags |= NnueDecisionTrace::Check;
+            if (tt_move) record.flags |= NnueDecisionTrace::TtMove;
+            if (full_result >= beta_) record.flags |= NnueDecisionTrace::FailHigh;
+            if (full_result <= alpha_) record.flags |= NnueDecisionTrace::FailLow;
+            record.move16 = move16;
+            record.move_count = std::int16_t(move_count);
+            record.reduction = std::int16_t(reduction);
+            record.margin = static_eval_ - alpha_;
+            record.history = history;
+            record.reduced_result = reduced_result;
+            record.full_result = full_result;
+#if defined(ENABLE_NNUE_DECISION_RISK_SHADOW)
+            record.risk_q8 = NnueDecisionTrace::RiskQ8(
+              trace_context_, NnueDecisionTrace::Decision::Lmr, move_count,
+              reduction, history, capture, gives_check, tt_move);
+#endif
+            NnueDecisionTrace::Write(record);
+        }
+#endif
     }
     void RecordPhaseFmLmrOutcome(const int depth, const int move_count,
                                  const bool router_adjusted, const bool reduced_fail_high,
@@ -1693,9 +1834,24 @@ class NodeObservation {
     bool router_lmr_node_adjusted_ = false;
 #endif
     Eval::NNUE::NnueSignalEvalAccess access_{};
+#if defined(ENABLE_NNUE_EVAL_HISTORY_DIAGNOSTIC)
+    NnueEvalHistoryLog::Snapshot eval_history_{};
+#endif
+#if defined(ENABLE_NNUE_DECISION_TRACE)
+    NnueDecisionTrace::Context trace_context_{};
+    std::uint16_t forward_futility_trace_move16_ = 0;
+    int forward_futility_trace_move_count_ = 0;
+    int forward_futility_trace_margin_ = 0;
+    int forward_futility_trace_history_ = 0;
+    bool forward_futility_trace_capture_ = false;
+    bool forward_futility_trace_check_ = false;
+#endif
 };
 
 inline void Reset() {
+#if defined(ENABLE_NNUE_EVAL_HISTORY_DIAGNOSTIC)
+    NnueEvalHistoryLog::Reset();
+#endif
 #if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
     NnueUncertaintyLog::Reset();
 #endif

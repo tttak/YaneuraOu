@@ -16,6 +16,9 @@
 #if defined(ENABLE_NNUE_POLICY_SHADOW)
 #include "../../engine/yaneuraou-engine/nnue_policy_shadow.h"
 #endif
+#if defined(ENABLE_NNUE_DECISION_RISK_LMR_COUNTERS)
+#include "../../engine/yaneuraou-engine/nnue_decision_risk_lmr_counters.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -29,12 +32,14 @@
 #include <functional>
 #include <iomanip>
 #include <limits>
+#include <numeric>
 #include <set>
 #include <sstream>
 #include <streambuf>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 
 #if defined(ENABLE_NNUE_TRACE) || defined(ENABLE_NNUE_BENCH)
@@ -1338,6 +1343,87 @@ struct NnueBenchTiming {
   std::uint64_t calls = 0;
   double nanoseconds = 0.0;
 };
+
+#if defined(ENABLE_NNUE_DECISION_TRACE)
+std::uint64_t TraceSplitMix64(std::uint64_t& state) {
+  std::uint64_t value = (state += 0x9e3779b97f4a7c15ULL);
+  value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+  return value ^ (value >> 31);
+}
+
+void ExtractDecisionTraceRoots(std::istream& stream) {
+  std::string input_name, output_name, metadata_name;
+  std::uint64_t count = 0, seed = 0;
+  stream >> std::quoted(input_name) >> std::quoted(output_name)
+         >> count >> seed >> std::quoted(metadata_name);
+  std::ifstream input(input_name, std::ios::binary);
+  std::ofstream output(output_name, std::ios::out | std::ios::trunc);
+  std::ofstream metadata;
+  if (!metadata_name.empty())
+    metadata.open(metadata_name, std::ios::out | std::ios::trunc);
+  if (!input || !output || (!metadata_name.empty() && !metadata) || count == 0) {
+    std::cout << "error: trace_extract_roots input/output/count" << std::endl;
+    return;
+  }
+  input.seekg(0, std::ios::end);
+  const auto bytes = input.tellg();
+  if (bytes <= 0 || std::uint64_t(bytes) % sizeof(MoveAccuracyRecord)) {
+    std::cout << "error: invalid 40-byte PackedSfenValue stream" << std::endl;
+    return;
+  }
+  const std::uint64_t records = std::uint64_t(bytes) / sizeof(MoveAccuracyRecord);
+  if (count > records) {
+    std::cout << "error: requested root count exceeds record count" << std::endl;
+    return;
+  }
+  metadata << "root_order,source_record,root_hash,game_ply,score\n";
+  std::unordered_set<std::uint64_t> selected;
+  std::unordered_set<std::uint64_t> packed_hashes;
+  selected.reserve(std::size_t(count * 2));
+  packed_hashes.reserve(std::size_t(count * 2));
+  std::uint64_t state = seed;
+  std::uint64_t attempts = 0, decode_errors = 0, duplicates = 0, terminal = 0;
+  while (packed_hashes.size() < count && attempts < count * 100) {
+    ++attempts;
+    const std::uint64_t index = TraceSplitMix64(state) % records;
+    if (!selected.insert(index).second)
+      continue;
+    MoveAccuracyRecord record{};
+    input.clear();
+    input.seekg(std::streamoff(index * sizeof(record)), std::ios::beg);
+    if (!input.read(reinterpret_cast<char*>(&record), sizeof(record)))
+      break;
+    Position position;
+    StateInfo position_state;
+    if (position.set_from_packed_sfen(
+          record.sfen, &position_state, false, record.game_ply).is_not_ok()) {
+      ++decode_errors;
+      continue;
+    }
+    if (MoveList<LEGAL_ALL>(position).size() == 0) {
+      ++terminal;
+      continue;
+    }
+    const auto hash = Search::NnueDecisionTrace::Fnv1a(&record.sfen, sizeof(record.sfen));
+    if (!packed_hashes.insert(hash).second) {
+      ++duplicates;
+      continue;
+    }
+    const auto order = packed_hashes.size() - 1;
+    output << position.sfen() << '\n';
+    metadata << order << ',' << index << ',' << hash << ','
+             << record.game_ply << ',' << record.score << '\n';
+  }
+  output.flush(); metadata.flush();
+  std::cout << "trace_extract_roots requested=" << count
+            << " written=" << packed_hashes.size()
+            << " attempts=" << attempts
+            << " decode_errors=" << decode_errors
+            << " duplicate_positions=" << duplicates
+            << " terminal=" << terminal << std::endl;
+}
+#endif
 
 struct NnueBenchSummary {
   double median = 0.0;
@@ -11095,6 +11181,13 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     TestAccumulator(pos);
   } else if (sub_command == "incremental_eval_checksum") {
     TestIncrementalEvalChecksum();
+#if defined(ENABLE_NNUE_DECISION_RISK_LMR_COUNTERS)
+  } else if (sub_command == "decision_risk_lmr_counters_reset") {
+    Search::NnueDecisionRiskLmrCounters::Reset();
+    std::cout << "NNUE decision-risk restricted LMR counters reset." << std::endl;
+  } else if (sub_command == "decision_risk_lmr_counters_report") {
+    Search::NnueDecisionRiskLmrCounters::Report(std::cout);
+#endif
   } else if (sub_command == "info") {
     PrintInfo(stream);
   } else if (sub_command == "accuracy") {
@@ -11158,6 +11251,49 @@ void TestCommand(IEngine& engine, std::istream& stream) {
         std::cout << "NNUE signal calibration JSON written: " << json_file << std::endl;
       }
     }
+#if defined(ENABLE_NNUE_EVAL_HISTORY_DIAGNOSTIC)
+  } else if (sub_command == "eval_history_report") {
+    std::string text_file;
+    std::string csv_file;
+    stream >> std::quoted(text_file) >> std::quoted(csv_file);
+    Search::NnueEvalHistoryLog::Report(std::cout);
+    if (!text_file.empty()) {
+      std::ofstream output(text_file);
+      if (!output)
+        std::cout << "Failed to open eval-history report: " << text_file << std::endl;
+      else
+        Search::NnueEvalHistoryLog::Report(output);
+    }
+    if (!csv_file.empty()) {
+      std::ofstream output(csv_file);
+      if (!output)
+        std::cout << "Failed to open eval-history CSV: " << csv_file << std::endl;
+      else
+        Search::NnueEvalHistoryLog::ReportCsv(output);
+    }
+#endif
+#if defined(ENABLE_NNUE_DECISION_TRACE)
+  } else if (sub_command == "trace_extract_roots") {
+    ExtractDecisionTraceRoots(stream);
+  } else if (sub_command == "decision_trace_start") {
+    std::string prefix;
+    std::uint64_t chunk_records = 16384;
+    stream >> std::quoted(prefix) >> chunk_records;
+    const bool started = Search::NnueDecisionTrace::Start(
+      prefix, static_cast<std::size_t>(chunk_records));
+    std::cout << "NNUE decision trace start: "
+              << (started ? "ok" : "failed") << std::endl;
+  } else if (sub_command == "decision_trace_stop") {
+    const bool stopped = Search::NnueDecisionTrace::Stop();
+    std::cout << "NNUE decision trace stop: "
+              << (stopped ? "ok" : "failed") << std::endl;
+  } else if (sub_command == "decision_trace_report") {
+    Search::NnueDecisionTrace::Report(std::cout);
+#if defined(ENABLE_NNUE_DECISION_RISK_SHADOW)
+  } else if (sub_command == "decision_risk_selftest") {
+    Search::NnueDecisionTrace::RiskSelftest(std::cout);
+#endif
+#endif
 #endif
 #if defined(ENABLE_NNUE_POLICY_SHADOW)
   } else if (sub_command == "policy_shadow_reset") {
@@ -11302,6 +11438,10 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << " test nnue test_features" << std::endl;
     std::cout << " test nnue test_accumulator" << std::endl;
     std::cout << " test nnue incremental_eval_checksum" << std::endl;
+#if defined(ENABLE_NNUE_DECISION_RISK_LMR_COUNTERS)
+    std::cout << " test nnue decision_risk_lmr_counters_reset" << std::endl;
+    std::cout << " test nnue decision_risk_lmr_counters_report" << std::endl;
+#endif
     std::cout << " test nnue accuracy <sfenpack file>" << std::endl;
     std::cout << " test nnue accuracy_detail <sfenpack file> <output.csv>"
               << std::endl;

@@ -545,6 +545,9 @@ namespace {
             if (router_lmr_signal) {
                 router_lmr_signal->router_margin = static_cast<std::int32_t>(
                   std::min<std::int64_t>(margin, std::numeric_limits<std::int32_t>::max()));
+#if defined(USE_NNUE_DECISION_RISK_LMR)
+                router_lmr_signal->selected_bucket = static_cast<std::int8_t>(chosen_bucket);
+#endif
             }
 #endif
         }
