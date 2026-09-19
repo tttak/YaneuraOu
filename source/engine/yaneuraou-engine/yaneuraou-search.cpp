@@ -47,6 +47,12 @@
 #include "nnue_decision_risk_lmr_counters.h"
 #endif
 #endif
+#if defined(ENABLE_NNUE_ASPIRATION_DIAGNOSTIC)
+#include "nnue_aspiration_logger.h"
+#endif
+#if defined(ENABLE_NNUE_ADAPTIVE_ASPIRATION_COUNTERS)
+#include "adaptive_aspiration_counters.h"
+#endif
 
 #if defined(USE_NNUE_ROUTER_LMR)
 #ifndef NNUE_ROUTER_LMR_VARIANT
@@ -1206,6 +1212,16 @@ void Search::YaneuraOuWorker::iterative_deepening() {
     // 自分がサブスレッドのときは、これはnullptrになる。
     SearchManager* mainThread = (is_mainthread() ? main_manager() : nullptr);
 
+#if defined(ENABLE_NNUE_ASPIRATION_DIAGNOSTIC)
+    const auto nnueAspirationRoot = mainThread
+      ? NnueAspirationLog::BeginRoot(rootPos) : NnueAspirationLog::RootContext{};
+    std::array<int, 3> nnueAspirationScoreHistory{
+      NnueAspirationLog::InvalidScore, NnueAspirationLog::InvalidScore,
+      NnueAspirationLog::InvalidScore};
+    Move nnueAspirationPreviousBestMove = rootMoves.empty() || rootMoves[0].pv.empty()
+      ? Move::none() : rootMoves[0].pv[0];
+#endif
+
 #if STOCKFISH
 #else
     // やねうら王では探索オプションは、main_managerが持っている。
@@ -1458,8 +1474,97 @@ void Search::YaneuraOuWorker::iterative_deepening() {
             // aspiration windowの開始サイズをリセットする。
             delta     = 5 + threadIdx % 8 + std::abs(rootMoves[pvIdx].meanSquaredScore) / 9000;
             Value avg = rootMoves[pvIdx].averageScore;
+#if defined(USE_NNUE_ADAPTIVE_ASPIRATION_BALANCED_X2)
+            const bool adaptiveAspirationTriggered =
+              std::abs(rootMoves[pvIdx].previousScore) < 300;
+            if (adaptiveAspirationTriggered)
+                delta *= 2;
+#else
+            constexpr bool adaptiveAspirationTriggered = false;
+#endif
             alpha     = std::max(avg - delta, -VALUE_INFINITE);
             beta      = std::min(avg + delta,  VALUE_INFINITE);
+
+#if defined(ENABLE_NNUE_ADAPTIVE_ASPIRATION_COUNTERS)
+            int adaptiveAspirationSearchCount = 0;
+            int adaptiveAspirationFailLow = 0;
+            int adaptiveAspirationFailHigh = 0;
+            const auto adaptiveAspirationNodesBefore = nodes.load(std::memory_order_relaxed);
+            std::uint64_t adaptiveAspirationNodesAfterFirst = adaptiveAspirationNodesBefore;
+            if (mainThread && pvIdx == 0)
+                AdaptiveAspirationCounters::Begin(
+                  rootDepth, rootMoves[pvIdx].previousScore != -VALUE_INFINITE,
+                  adaptiveAspirationTriggered);
+#endif
+
+#if defined(ENABLE_NNUE_ASPIRATION_DIAGNOSTIC)
+            NnueAspirationLog::Event nnueAspirationEvent{};
+            int nnueAspirationSearchCount = 0;
+            const auto nnueAspirationNodesBefore = nodes.load(std::memory_order_relaxed);
+            std::uint64_t nnueAspirationNodesAfterFirst = nnueAspirationNodesBefore;
+            const Move nnueAspirationInitialMove = rootMoves[pvIdx].pv.empty()
+              ? Move::none() : rootMoves[pvIdx].pv[0];
+            if (mainThread && pvIdx == 0) {
+                nnueAspirationEvent.root_id = nnueAspirationRoot.root_id;
+                nnueAspirationEvent.packed_sfen_hash = nnueAspirationRoot.packed_sfen_hash;
+                nnueAspirationEvent.depth = rootDepth;
+                nnueAspirationEvent.pv_index = static_cast<int>(pvIdx);
+                nnueAspirationEvent.previous_iteration_score = rootMoves[pvIdx].previousScore;
+                nnueAspirationEvent.average_score = avg;
+                nnueAspirationEvent.score_d1 = nnueAspirationScoreHistory[0];
+                nnueAspirationEvent.score_d2 = nnueAspirationScoreHistory[1];
+                nnueAspirationEvent.score_d3 = nnueAspirationScoreHistory[2];
+                nnueAspirationEvent.initial_alpha = alpha;
+                nnueAspirationEvent.initial_beta = beta;
+                nnueAspirationEvent.initial_window_width = beta - alpha;
+                nnueAspirationEvent.material = rootPos.state()->materialValue;
+                nnueAspirationEvent.in_check = rootPos.checkers() ? 1 : 0;
+                nnueAspirationEvent.root_move_count = static_cast<int>(rootMoves.size());
+                nnueAspirationEvent.previous_pv_length =
+                  static_cast<int>(rootMoves[pvIdx].pv.size());
+                nnueAspirationEvent.previous_bestmove_changed =
+                  nnueAspirationInitialMove != nnueAspirationPreviousBestMove;
+                const auto signalStart = std::chrono::steady_clock::now();
+                nnueAspirationEvent.static_eval = Eval::evaluate(rootPos);
+                const auto signalEnd = std::chrono::steady_clock::now();
+                nnueAspirationEvent.signal_compute_ns =
+                  std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    signalEnd - signalStart).count();
+#if defined(USE_NNUE_ROUTER_LMR)
+                const auto& signal = Eval::NNUE::LastNnueRouterLmrSignal();
+                if (signal.valid) {
+                    nnueAspirationEvent.bucket = signal.selected_bucket;
+                    nnueAspirationEvent.router_margin = signal.router_margin;
+                    nnueAspirationEvent.lca_abs_delta_sum = signal.lca_abs_delta_sum;
+                    nnueAspirationEvent.cross_abs_max = signal.cross_abs_max;
+                }
+#endif
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+                const auto& fullAccess = Eval::NNUE::LastNnueSignalAccess();
+                if (fullAccess.signal.valid) {
+                    const auto& full = fullAccess.signal;
+                    nnueAspirationEvent.bucket = full.selected_bucket;
+                    nnueAspirationEvent.router_margin = full.router_margin;
+                    nnueAspirationEvent.router_top1_logit = full.router_top1_logit;
+                    nnueAspirationEvent.router_top2_logit = full.router_top2_logit;
+                    nnueAspirationEvent.lca_abs_delta_sum = full.lca_abs_delta_sum;
+                    nnueAspirationEvent.lca_abs_delta_max = full.lca_max_abs_delta;
+                    nnueAspirationEvent.cross_abs_sum = full.cross_abs_sum;
+                    nnueAspirationEvent.cross_abs_max = full.cross_abs_max;
+                    nnueAspirationEvent.main_gate_sum = full.main_gate_sum;
+                    nnueAspirationEvent.main_gate_min = full.main_gate_min;
+                    nnueAspirationEvent.main_gate_max = full.main_gate_max;
+                    nnueAspirationEvent.fm_diff_activity_sum = full.fm_diff_activity_sum;
+                    nnueAspirationEvent.fm_diff_activity_max = full.fm_diff_activity_max;
+                    nnueAspirationEvent.fm_abs_activity_sum = full.fm_abs_activity_sum;
+                    nnueAspirationEvent.fm_abs_activity_max = full.fm_abs_activity_max;
+                    nnueAspirationEvent.phase_main_reliance = full.main_reliance;
+                    nnueAspirationEvent.phase_fm_reliance = full.fm_reliance;
+                    nnueAspirationEvent.phase_cross_reliance = full.cross_reliance;
+                }
+#endif
+            }
+#endif
 
 #if 0
             // Adjust optimism based on root move's averageScore
@@ -1496,6 +1601,18 @@ void Search::YaneuraOuWorker::iterative_deepening() {
                   std::max(1, rootDepth - failedHighCnt - 3 * (searchAgainCounter + 1) / 4);
                 rootDelta = beta - alpha;
                 bestValue = search<Root>(rootPos, ss, alpha, beta, adjustedDepth, false);
+#if defined(ENABLE_NNUE_ADAPTIVE_ASPIRATION_COUNTERS)
+                ++adaptiveAspirationSearchCount;
+                if (adaptiveAspirationSearchCount == 1)
+                    adaptiveAspirationNodesAfterFirst = nodes.load(std::memory_order_relaxed);
+#endif
+#if defined(ENABLE_NNUE_ASPIRATION_DIAGNOSTIC)
+                ++nnueAspirationSearchCount;
+                if (nnueAspirationSearchCount == 1) {
+                    nnueAspirationNodesAfterFirst = nodes.load(std::memory_order_relaxed);
+                    nnueAspirationEvent.first_search_score = bestValue;
+                }
+#endif
 
                 // Bring the best move to the front. It is critical that sorting
                 // is done with a stable algorithm because all the values but the
@@ -1565,6 +1682,12 @@ void Search::YaneuraOuWorker::iterative_deepening() {
                 // otherwise exit the loop.
                 if (bestValue <= alpha)
                 {
+#if defined(ENABLE_NNUE_ADAPTIVE_ASPIRATION_COUNTERS)
+                    ++adaptiveAspirationFailLow;
+#endif
+#if defined(ENABLE_NNUE_ASPIRATION_DIAGNOSTIC)
+                    ++nnueAspirationEvent.fail_low_count;
+#endif
                     beta  = alpha;
                     alpha = std::max(bestValue - delta, -VALUE_INFINITE);
 
@@ -1574,6 +1697,12 @@ void Search::YaneuraOuWorker::iterative_deepening() {
                 }
                 else if (bestValue >= beta)
                 {
+#if defined(ENABLE_NNUE_ADAPTIVE_ASPIRATION_COUNTERS)
+                    ++adaptiveAspirationFailHigh;
+#endif
+#if defined(ENABLE_NNUE_ASPIRATION_DIAGNOSTIC)
+                    ++nnueAspirationEvent.fail_high_count;
+#endif
                     alpha = std::max(beta - delta, alpha);
                     beta  = std::min(bestValue + delta, VALUE_INFINITE);
                     ++failedHighCnt;
@@ -1585,6 +1714,47 @@ void Search::YaneuraOuWorker::iterative_deepening() {
 
                 assert(alpha >= -VALUE_INFINITE && beta <= VALUE_INFINITE);
             }
+
+#if defined(ENABLE_NNUE_ADAPTIVE_ASPIRATION_COUNTERS)
+            if (mainThread && pvIdx == 0) {
+                const auto adaptiveAspirationNodesAfter = nodes.load(std::memory_order_relaxed);
+                AdaptiveAspirationCounters::End(
+                  adaptiveAspirationTriggered,
+                  adaptiveAspirationFailLow,
+                  adaptiveAspirationFailHigh,
+                  std::max(0, adaptiveAspirationSearchCount - 1),
+                  adaptiveAspirationNodesAfter - adaptiveAspirationNodesBefore,
+                  adaptiveAspirationNodesAfter - adaptiveAspirationNodesAfterFirst);
+            }
+#endif
+
+#if defined(ENABLE_NNUE_ASPIRATION_DIAGNOSTIC)
+            if (mainThread && pvIdx == 0) {
+                const auto nnueAspirationNodesAfter = nodes.load(std::memory_order_relaxed);
+                nnueAspirationEvent.final_score = bestValue;
+                nnueAspirationEvent.re_search_count =
+                  std::max(0, nnueAspirationSearchCount - 1);
+                nnueAspirationEvent.total_nodes =
+                  nnueAspirationNodesAfter - nnueAspirationNodesBefore;
+                nnueAspirationEvent.first_search_nodes =
+                  nnueAspirationNodesAfterFirst - nnueAspirationNodesBefore;
+                nnueAspirationEvent.extra_nodes =
+                  nnueAspirationNodesAfter - nnueAspirationNodesAfterFirst;
+                const Move finalMove = rootMoves[pvIdx].pv.empty()
+                  ? Move::none() : rootMoves[pvIdx].pv[0];
+                nnueAspirationEvent.pv_move_changed = finalMove != nnueAspirationInitialMove;
+                nnueAspirationEvent.final_bestmove_changed =
+                  finalMove != nnueAspirationPreviousBestMove;
+                nnueAspirationEvent.stopped = threads.stop;
+                NnueAspirationLog::Record(nnueAspirationEvent);
+                if (!threads.stop) {
+                    nnueAspirationScoreHistory[2] = nnueAspirationScoreHistory[1];
+                    nnueAspirationScoreHistory[1] = nnueAspirationScoreHistory[0];
+                    nnueAspirationScoreHistory[0] = bestValue;
+                    nnueAspirationPreviousBestMove = finalMove;
+                }
+            }
+#endif
 
             // Sort the PV lines searched so far and update the GUI
             // これまでに探索したPVラインをソートし、GUIを更新する

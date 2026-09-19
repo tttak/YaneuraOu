@@ -19,7 +19,7 @@ namespace YaneuraOu::Eval::NNUE {
 // phase/deep/bypass fields, counters, and report machinery in match binaries.
 struct NnueRouterLmrSignal {
     std::int32_t router_margin = 0;
-#if defined(USE_NNUE_DECISION_RISK_LMR)
+#if defined(USE_NNUE_DECISION_RISK_LMR) || defined(ENABLE_NNUE_ASPIRATION_DIAGNOSTIC)
     // Experiment 53 context probeのbucket one-hot用。評価値には影響しない。
     std::int8_t selected_bucket = -1;
 #endif

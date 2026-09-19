@@ -19,6 +19,12 @@
 #if defined(ENABLE_NNUE_DECISION_RISK_LMR_COUNTERS)
 #include "../../engine/yaneuraou-engine/nnue_decision_risk_lmr_counters.h"
 #endif
+#if defined(ENABLE_NNUE_ASPIRATION_DIAGNOSTIC)
+#include "../../engine/yaneuraou-engine/nnue_aspiration_logger.h"
+#endif
+#if defined(ENABLE_NNUE_ADAPTIVE_ASPIRATION_COUNTERS)
+#include "../../engine/yaneuraou-engine/adaptive_aspiration_counters.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -11188,6 +11194,28 @@ void TestCommand(IEngine& engine, std::istream& stream) {
   } else if (sub_command == "decision_risk_lmr_counters_report") {
     Search::NnueDecisionRiskLmrCounters::Report(std::cout);
 #endif
+#if defined(ENABLE_NNUE_ASPIRATION_DIAGNOSTIC)
+  } else if (sub_command == "aspiration_log_reset") {
+    Search::NnueAspirationLog::Reset();
+    std::cout << "NNUE aspiration diagnostics reset." << std::endl;
+  } else if (sub_command == "aspiration_log_report") {
+    std::string csv_file;
+    stream >> std::quoted(csv_file);
+    Search::NnueAspirationLog::Report(std::cout);
+    if (!csv_file.empty()) {
+      if (Search::NnueAspirationLog::WriteCsv(csv_file.c_str()))
+        std::cout << "NNUE aspiration CSV written: " << csv_file << std::endl;
+      else
+        std::cout << "Failed to write aspiration CSV: " << csv_file << std::endl;
+    }
+#endif
+#if defined(ENABLE_NNUE_ADAPTIVE_ASPIRATION_COUNTERS)
+  } else if (sub_command == "adaptive_aspiration_counters_reset") {
+    Search::AdaptiveAspirationCounters::Reset();
+    std::cout << "Adaptive aspiration counters reset." << std::endl;
+  } else if (sub_command == "adaptive_aspiration_counters_report") {
+    Search::AdaptiveAspirationCounters::Report(std::cout);
+#endif
   } else if (sub_command == "info") {
     PrintInfo(stream);
   } else if (sub_command == "accuracy") {
@@ -11441,6 +11469,14 @@ void TestCommand(IEngine& engine, std::istream& stream) {
 #if defined(ENABLE_NNUE_DECISION_RISK_LMR_COUNTERS)
     std::cout << " test nnue decision_risk_lmr_counters_reset" << std::endl;
     std::cout << " test nnue decision_risk_lmr_counters_report" << std::endl;
+#endif
+#if defined(ENABLE_NNUE_ASPIRATION_DIAGNOSTIC)
+    std::cout << " test nnue aspiration_log_reset" << std::endl;
+    std::cout << " test nnue aspiration_log_report [output csv]" << std::endl;
+#endif
+#if defined(ENABLE_NNUE_ADAPTIVE_ASPIRATION_COUNTERS)
+    std::cout << " test nnue adaptive_aspiration_counters_reset" << std::endl;
+    std::cout << " test nnue adaptive_aspiration_counters_report" << std::endl;
 #endif
     std::cout << " test nnue accuracy <sfenpack file>" << std::endl;
     std::cout << " test nnue accuracy_detail <sfenpack file> <output.csv>"
