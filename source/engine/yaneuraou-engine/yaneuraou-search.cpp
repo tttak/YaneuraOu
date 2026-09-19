@@ -53,6 +53,15 @@
 #if defined(ENABLE_NNUE_ADAPTIVE_ASPIRATION_COUNTERS)
 #include "adaptive_aspiration_counters.h"
 #endif
+#if defined(ENABLE_NNUE_TT_REUSE_DIAGNOSTIC)
+#include "nnue_tt_reuse_logger.h"
+#endif
+#if defined(ENABLE_ROOT_MOVE_HISTORY_DIAGNOSTIC)
+#include "root_move_history_logger.h"
+#endif
+#if defined(ENABLE_ROOT_TIME_RISK_BUDGET)
+#include "root_time_risk_budget.h"
+#endif
 
 #if defined(USE_NNUE_ROUTER_LMR)
 #ifndef NNUE_ROUTER_LMR_VARIANT
@@ -1212,6 +1221,18 @@ void Search::YaneuraOuWorker::iterative_deepening() {
     // 自分がサブスレッドのときは、これはnullptrになる。
     SearchManager* mainThread = (is_mainthread() ? main_manager() : nullptr);
 
+#if defined(ENABLE_ROOT_MOVE_HISTORY_DIAGNOSTIC)
+    auto rootMoveHistoryContext = mainThread
+      ? RootMoveHistoryLog::BeginRoot(rootPos)
+      : RootMoveHistoryLog::RootContext{};
+#endif
+
+#if defined(ENABLE_ROOT_TIME_RISK_BUDGET)
+    auto rootTimeRiskContext = mainThread
+      ? RootTimeRiskBudget::BeginRoot(limits.nodes, limits.movetime)
+      : RootTimeRiskBudget::Context{};
+#endif
+
 #if defined(ENABLE_NNUE_ASPIRATION_DIAGNOSTIC)
     const auto nnueAspirationRoot = mainThread
       ? NnueAspirationLog::BeginRoot(rootPos) : NnueAspirationLog::RootContext{};
@@ -1804,6 +1825,40 @@ void Search::YaneuraOuWorker::iterative_deepening() {
         if (!threads.stop)
             completedDepth = rootDepth;
 
+#if defined(ENABLE_ROOT_MOVE_HISTORY_DIAGNOSTIC)
+        if (mainThread && !threads.stop)
+            RootMoveHistoryLog::RecordDepth(
+              rootMoveHistoryContext, rootDepth, rootMoves,
+              nodes.load(std::memory_order_relaxed));
+#endif
+
+#if defined(ENABLE_ROOT_TIME_RISK_BUDGET)
+        // The predictor runs only at a completed root iteration boundary. It
+        // never runs in the alpha-beta hot path. The original experiment
+        // changes only a fixed-node limit; a separate diagnostic build may
+        // also enable an explicit go-movetime limit.
+        if (mainThread && !threads.stop && multiPV == 1
+            && (limits.nodes
+#if defined(ENABLE_ROOT_TIME_RISK_BUDGET_MOVETIME)
+                || limits.movetime
+#endif
+                )) {
+            const auto decision = RootTimeRiskBudget::OnCompletedIteration(
+              rootTimeRiskContext, rootDepth, rootMoves,
+              nodes.load(std::memory_order_relaxed),
+              static_cast<std::uint64_t>(mainThread->tm.elapsed_time()));
+            if (decision.trigger) {
+                for (auto&& thread : threads) {
+                    auto* worker = toYaneuraOuWorker(thread->worker);
+                    if (rootTimeRiskContext.time_mode)
+                        worker->limits.movetime = decision.extended_limit;
+                    else
+                        worker->limits.nodes = decision.extended_limit;
+                }
+            }
+        }
+#endif
+
         // We make sure not to pick an unproven mated-in score,
         // in case this thread prematurely stopped search (aborted-search).
 
@@ -1995,6 +2050,12 @@ void Search::YaneuraOuWorker::iterative_deepening() {
 
     if (!mainThread)
         return;
+
+#if defined(ENABLE_ROOT_TIME_RISK_BUDGET)
+    RootTimeRiskBudget::Finish(rootTimeRiskContext, rootMoves,
+                               threads.nodes_searched(),
+                               static_cast<std::uint64_t>(mainThread->tm.elapsed_time()));
+#endif
 
     mainThread->previousTimeReduction = timeReduction;
 
@@ -2599,7 +2660,7 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
         && is_valid(ttData.value)   // Can happen when !ttHit or when access race in probe()
 							        // !ttHitの場合やprobe()でのアクセス競合時に発生する可能性がありうる。
         && (ttData.bound & (ttData.value >= beta ? BOUND_LOWER : BOUND_UPPER))
-        && (cutNode == (ttData.value >= beta) || depth > 5))
+		&& (cutNode == (ttData.value >= beta) || depth > 5))
 
 		/*
 		📝 解説
@@ -2610,6 +2671,9 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
 			このままこの値でreturnして良い。
 	*/
     {
+#if defined(ENABLE_NNUE_TT_REUSE_DIAGNOSTIC)
+        NnueTtReuseLog::OnUsefulCutoff(static_cast<std::uint64_t>(posKey));
+#endif
         // If ttMove is quiet, update move sorting heuristics on TT hit
         // ttMoveがquietの指し手である場合、置換表ヒット時に指し手のソート用ヒューリスティクスを更新します。
 

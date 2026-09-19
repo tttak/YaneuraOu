@@ -15,6 +15,9 @@
 // やねうら王独自拡張
 #include "extra/key128.h"
 #include "testcmd/unit_test.h"
+#if defined(ENABLE_NNUE_TT_REUSE_DIAGNOSTIC)
+#include "engine/yaneuraou-engine/nnue_tt_reuse_logger.h"
+#endif
 
 namespace YaneuraOu {
 
@@ -252,6 +255,10 @@ void TTWriter::write(
 #endif
 
     entry->save(k, v, pv, b, d, m, ev, generation8);
+#if defined(ENABLE_NNUE_TT_REUSE_DIAGNOSTIC)
+    Search::NnueTtReuseLog::OnWrite(static_cast<std::uint64_t>(k_), entry, d, pv,
+      static_cast<int>(b), ev, v, true);
+#endif
 }
 #endif
 
@@ -473,7 +480,11 @@ std::tuple<bool, TTData, TTWriter> TranspositionTable::probe(const Key key, cons
 					continue;
 				ttData.move = move;
 			}
-			return { tte[i].is_occupied(), ttData, TTWriter(&tte[i]) };
+			const bool occupied = tte[i].is_occupied();
+#if defined(ENABLE_NNUE_TT_REUSE_DIAGNOSTIC)
+            Search::NnueTtReuseLog::OnProbe(static_cast<std::uint64_t>(key), &tte[i], occupied);
+#endif
+			return { occupied, ttData, TTWriter(&tte[i]) };
 		}
 
 	// Find an entry to be replaced according to the replacement strategy
@@ -485,6 +496,9 @@ std::tuple<bool, TTData, TTWriter> TranspositionTable::probe(const Key key, cons
 			> tte[i].depth8 - tte[i].relative_age(generation8))
 			replace = &tte[i];
 
+#if defined(ENABLE_NNUE_TT_REUSE_DIAGNOSTIC)
+    Search::NnueTtReuseLog::OnProbe(static_cast<std::uint64_t>(key), replace, false);
+#endif
 	return { false,
 			TTData{Move::none(), VALUE_NONE, VALUE_NONE, DEPTH_ENTRY_OFFSET, BOUND_NONE, false},
 			TTWriter(replace) };

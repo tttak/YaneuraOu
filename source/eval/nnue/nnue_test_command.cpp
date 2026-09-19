@@ -25,6 +25,15 @@
 #if defined(ENABLE_NNUE_ADAPTIVE_ASPIRATION_COUNTERS)
 #include "../../engine/yaneuraou-engine/adaptive_aspiration_counters.h"
 #endif
+#if defined(ENABLE_NNUE_TT_REUSE_DIAGNOSTIC)
+#include "../../engine/yaneuraou-engine/nnue_tt_reuse_logger.h"
+#endif
+#if defined(ENABLE_ROOT_MOVE_HISTORY_DIAGNOSTIC)
+#include "../../engine/yaneuraou-engine/root_move_history_logger.h"
+#endif
+#if defined(ENABLE_ROOT_TIME_RISK_BUDGET)
+#include "../../engine/yaneuraou-engine/root_time_risk_budget.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -11216,6 +11225,39 @@ void TestCommand(IEngine& engine, std::istream& stream) {
   } else if (sub_command == "adaptive_aspiration_counters_report") {
     Search::AdaptiveAspirationCounters::Report(std::cout);
 #endif
+#if defined(ENABLE_NNUE_TT_REUSE_DIAGNOSTIC)
+  } else if (sub_command == "tt_reuse_log_reset") {
+    Search::NnueTtReuseLog::Reset();
+    std::cout << "NNUE TT reuse diagnostics reset." << std::endl;
+  } else if (sub_command == "tt_reuse_log_report") {
+    std::string csv_file;
+    stream >> std::quoted(csv_file);
+    Search::NnueTtReuseLog::Report(std::cout);
+    if (!csv_file.empty() && Search::NnueTtReuseLog::WriteCsv(csv_file.c_str()))
+      std::cout << "NNUE TT reuse CSV written: " << csv_file << std::endl;
+#endif
+#if defined(ENABLE_ROOT_MOVE_HISTORY_DIAGNOSTIC)
+  } else if (sub_command == "root_move_history_reset") {
+    Search::RootMoveHistoryLog::Reset();
+    std::cout << "Root move history diagnostics reset." << std::endl;
+  } else if (sub_command == "root_move_history_report") {
+    std::string csv_file;
+    stream >> std::quoted(csv_file);
+    Search::RootMoveHistoryLog::Report(std::cout);
+    if (!csv_file.empty() && Search::RootMoveHistoryLog::WriteCsv(csv_file.c_str()))
+      std::cout << "Root move history CSV written: " << csv_file << std::endl;
+#endif
+#if defined(ENABLE_ROOT_TIME_RISK_BUDGET)
+  } else if (sub_command == "root_time_risk_budget_reset") {
+    Search::RootTimeRiskBudget::Reset();
+    std::cout << "Root time risk budget counters reset." << std::endl;
+  } else if (sub_command == "root_time_risk_budget_report") {
+    std::string csv_file;
+    stream >> std::quoted(csv_file);
+    Search::RootTimeRiskBudget::Report(std::cout);
+    if (!csv_file.empty() && Search::RootTimeRiskBudget::WriteCsv(csv_file.c_str()))
+      std::cout << "Root time risk budget CSV written: " << csv_file << std::endl;
+#endif
   } else if (sub_command == "info") {
     PrintInfo(stream);
   } else if (sub_command == "accuracy") {
@@ -11477,6 +11519,18 @@ void TestCommand(IEngine& engine, std::istream& stream) {
 #if defined(ENABLE_NNUE_ADAPTIVE_ASPIRATION_COUNTERS)
     std::cout << " test nnue adaptive_aspiration_counters_reset" << std::endl;
     std::cout << " test nnue adaptive_aspiration_counters_report" << std::endl;
+#endif
+#if defined(ENABLE_NNUE_TT_REUSE_DIAGNOSTIC)
+    std::cout << " test nnue tt_reuse_log_reset" << std::endl;
+    std::cout << " test nnue tt_reuse_log_report [output csv]" << std::endl;
+#endif
+#if defined(ENABLE_ROOT_MOVE_HISTORY_DIAGNOSTIC)
+    std::cout << " test nnue root_move_history_reset" << std::endl;
+    std::cout << " test nnue root_move_history_report [output csv]" << std::endl;
+#endif
+#if defined(ENABLE_ROOT_TIME_RISK_BUDGET)
+    std::cout << " test nnue root_time_risk_budget_reset" << std::endl;
+    std::cout << " test nnue root_time_risk_budget_report [output csv]" << std::endl;
 #endif
     std::cout << " test nnue accuracy <sfenpack file>" << std::endl;
     std::cout << " test nnue accuracy_detail <sfenpack file> <output.csv>"
