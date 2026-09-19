@@ -2,7 +2,8 @@
 
 #include "../../../config.h"
 
-#if defined(EVAL_NNUE) && defined(LONG_EFFECT_LIBRARY) && defined(USE_BOARD_EFFECT_PREV) && defined(DISTINGUISH_GOLDS)
+#if defined(EVAL_NNUE) && defined(LONG_EFFECT_LIBRARY) && defined(USE_BOARD_EFFECT_PREV) \
+    && (defined(DISTINGUISH_GOLDS) || defined(EXPERIMENT69_MERGE_GOLDS))
 
 #include "king_safety3_distinguishgolds.h"
 #include "index_list.h"
@@ -602,7 +603,9 @@ void AppendKsdg3ChangedProduction(const Position& pos, Color perspective,
 // 盤上の駒のBonaPieceからPieceへの変換配列
 Piece sqBonaPieceToPiece3[] = {B_PAWN, W_PAWN, B_LANCE, W_LANCE, B_KNIGHT, W_KNIGHT, B_SILVER, W_SILVER, B_GOLD, W_GOLD
     , B_BISHOP, W_BISHOP, B_HORSE, W_HORSE, B_ROOK, W_ROOK, B_DRAGON, W_DRAGON
+#if !defined(EXPERIMENT69_MERGE_GOLDS)
     , B_PRO_PAWN, W_PRO_PAWN, B_PRO_LANCE, W_PRO_LANCE, B_PRO_KNIGHT, W_PRO_KNIGHT, B_PRO_SILVER, W_PRO_SILVER
+#endif
     , B_KING, W_KING };
 
 // BonaPieceからSquareとPieceを取得する
@@ -668,6 +671,11 @@ inline Effect24::Direct KingSafety3_DistinguishGolds<AssociatedKing>::Inv(Effect
 // 特徴量のインデックスを求める
 template <Side AssociatedKing>
 inline IndexType KingSafety3_DistinguishGolds<AssociatedKing>::MakeIndex(Color perspective, Effect24::Direct dir, Piece pc, int effect1, int effect2) {
+#if defined(EXPERIMENT69_MERGE_GOLDS)
+  const auto pt = type_of(pc);
+  if (pt == PRO_PAWN || pt == PRO_LANCE || pt == PRO_KNIGHT || pt == PRO_SILVER)
+    pc = make_piece(color_of(pc), GOLD);
+#endif
   if (perspective == WHITE) {
     pc = Inv(pc);
     dir = Inv(dir);

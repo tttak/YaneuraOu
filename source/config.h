@@ -916,7 +916,18 @@ constexpr bool pretty_jp = false;
 // HalfKA-KSDG3 FM 1280型
 #define LONG_EFFECT_LIBRARY
 #define USE_BOARD_EFFECT_PREV
+
+// Optional compact feature layout used by Experiment 69/70 variant D.
+// Default (undefined) remains production variant A: HalfKA + distinguish-golds.
+// Build D with: NNUE_FEATURE_VARIANT=D (Makefile option)
+#if defined(NNUE_FEATURE_VARIANT_D)
+#define EXPERIMENT69_HALFKA_HM1
+#define EXPERIMENT69_MERGE_GOLDS
+#endif
+
+#if !defined(EXPERIMENT69_MERGE_GOLDS)
 #define DISTINGUISH_GOLDS
+#endif
 
 
 // -- 評価関数の種類によりエンジン名に使用する文字列を変更する。

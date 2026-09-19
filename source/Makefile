@@ -130,6 +130,16 @@ EXTRA_LDFLAGS  =
 CPPFLAGS += $(EXTRA_CPPFLAGS)
 LDFLAGS  += $(EXTRA_LDFLAGS)
 
+# Optional Experiment 69/70 input-feature layout.
+# A (default): HalfKA + distinguish-golds, production-compatible.
+# D          : HalfKA_hm1 + merged gold/promoted-minor indices.
+NNUE_FEATURE_VARIANT ?= A
+ifeq ($(NNUE_FEATURE_VARIANT),D)
+	CPPFLAGS += -DNNUE_FEATURE_VARIANT_D
+else ifneq ($(NNUE_FEATURE_VARIANT),A)
+	$(error NNUE_FEATURE_VARIANT must be A or D)
+endif
+
 # YANEURAOU_EDITION = YANEURAOU_ENGINE_MATERIALのときに指定できる、評価関数の通し番号
 #  1 : 普通の駒得のみの評価関数
 #  2 : …

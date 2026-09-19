@@ -3,6 +3,7 @@
 
 #include "../features/feature_set.h"
 #include "../features/half_ka.h"
+#include "../features/half_ka_hm1.h"
 #include "../features/king_safety3_distinguishgolds.h"
 #include "../nnue_signal.h"
 #if defined(ENABLE_NNUE_POLICY_SHADOW)
@@ -28,8 +29,13 @@ namespace Eval::NNUE {
 
 // Input features used in evaluation function
 // 入力特徴量: HalfKA と KingSafety3 の組み合わせ
+#if defined(EXPERIMENT69_HALFKA_HM1)
+using Experiment69HalfKa = Features::HalfKA_hm1<Features::Side::kFriend>;
+#else
+using Experiment69HalfKa = Features::HalfKA<Features::Side::kFriend>;
+#endif
 using RawFeatures = Features::FeatureSet<
-	Features::HalfKA<Features::Side::kFriend>, Features::KingSafety3_DistinguishGolds<Features::Side::kFriend>>;
+	Experiment69HalfKa, Features::KingSafety3_DistinguishGolds<Features::Side::kFriend>>;
 
 // Number of input feature dimensions after conversion
 // 変換後の入力特徴量の次元数

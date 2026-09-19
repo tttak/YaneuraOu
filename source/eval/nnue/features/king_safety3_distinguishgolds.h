@@ -46,10 +46,18 @@ class KingSafety3_DistinguishGolds {
  public:
   // 特徴量名
   static constexpr const char* kName =
+#if defined(EXPERIMENT69_MERGE_GOLDS)
+      (AssociatedKing == Side::kFriend) ? "KingSafety3_MergedGolds(Friend)" : "KingSafety3_MergedGolds(Enemy)";
+#else
       (AssociatedKing == Side::kFriend) ? "KingSafety3_DistinguishGolds(Friend)" : "KingSafety3_DistinguishGolds(Enemy)";
+#endif
   // 評価関数ファイルに埋め込むハッシュ値
   static constexpr std::uint32_t kHashValue =
+#if defined(EXPERIMENT69_MERGE_GOLDS)
+      0x4A6B2375u ^ (AssociatedKing == Side::kFriend);
+#else
       0x596B2375u ^ (AssociatedKing == Side::kFriend);
+#endif
 
   // 壁のPiece値を定義
   static constexpr Piece PIECE_WALL = PIECE_NB;
