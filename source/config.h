@@ -384,6 +384,8 @@
 // #define ENABLE_NNUE_FUTILITY_SHADOW // uncertainty別のforward-futility誤cut診断(1/256 sampling)
 // #define ENABLE_NNUE_DECISION_TRACE // Experiment 53 chunked LMR/RFP/futility decision trace
 // #define ENABLE_NNUE_DECISION_RISK_SHADOW // Experiment 53 frozen LMR/RFP context probes
+// #define ENABLE_QSEARCH_CORRECTION_PROBE // Experiment 63 batch qsearch labels (diagnostic only)
+// #define ENABLE_QSEARCH_CORRECTION_SHADOW // Experiment 64 frozen L2 probe logging (diagnostic only)
 // #define USE_NNUE_DECISION_RISK_LMR // Experiment 54: high-risk LMRだけ1 ply弱める
 // #define USE_NNUE_RFP_OSCILLATION_RULE // Experiment 54: oscillation2 RFP保護rule
 // #define ENABLE_NNUE_CROSS_LMR_EXPERIMENT // Cross maxによるLMR +1 plyの診断A/B

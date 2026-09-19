@@ -436,6 +436,22 @@ class YaneuraOuWorker: public Worker {
     // 評価関数のパラメーターが各NUMAにコピーされているようにする。
     virtual void ensure_network_replicated() override;
 
+#if defined(ENABLE_QSEARCH_CORRECTION_PROBE)
+    // Run the unmodified production PV qsearch with a full window.  This is
+    // available only in the Experiment-63 diagnostic binary.
+    Value diagnostic_qsearch(Position& pos, std::uint64_t& searched_nodes,
+                             int& qsearch_sel_depth,
+                             Value* qsearch_raw_static = nullptr,
+                             Value* corrected_static = nullptr,
+                             bool* stand_pat_observed = nullptr);
+
+    // Root-qsearch observations. They are written only by the diagnostic
+    // wrapper and are absent from production builds.
+    Value diagnosticQsearchRawStatic = VALUE_NONE;
+    Value diagnosticQsearchCorrectedStatic = VALUE_NONE;
+    bool  diagnosticQsearchStandPatObserved = false;
+#endif
+
     // 📌 Stockfishのsearch.hで定義されているWorkerが持っているメンバ変数 📌
 
 	// Public because they need to be updatable by the stats

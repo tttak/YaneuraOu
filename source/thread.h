@@ -132,6 +132,12 @@ public:
 	// 配置されていなければ、評価関数パラメーターをコピーする。
 	void ensure_network_replicated();
 
+#if defined(ENABLE_QSEARCH_CORRECTION_PROBE)
+	// Diagnostic-only access. The production interface deliberately does not
+	// expose Worker because search normally owns its lifetime and thread.
+	Search::Worker* diagnostic_worker() const { return worker.get(); }
+#endif
+
 	// Thread has been slightly altered to allow running custom jobs, so
 	// this name is no longer correct. However, this class (and ThreadPool)
 	// require further work to make them properly generic while maintaining

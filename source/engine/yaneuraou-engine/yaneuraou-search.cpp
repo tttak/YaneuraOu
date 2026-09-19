@@ -5340,6 +5340,16 @@ Value Search::YaneuraOuWorker::qsearch(Position& pos, Stack* ss, Value alpha, Va
         nnueQSignalObservation.SetStaticEval(ss->staticEval);
 #endif
 
+#if defined(ENABLE_QSEARCH_CORRECTION_PROBE)
+        if (ss->ply == 0)
+        {
+            diagnosticQsearchRawStatic = unadjustedStaticEval;
+            diagnosticQsearchCorrectedStatic = ss->staticEval;
+            diagnosticQsearchStandPatObserved = is_valid(unadjustedStaticEval)
+                                              && is_valid(ss->staticEval);
+        }
+#endif
+
         // Stand pat. Return immediately if static value is at least beta
         // Stand pat。静的評価値が少なくともベータ値に達している場合は直ちに返します
 
@@ -5685,6 +5695,50 @@ Value Search::YaneuraOuWorker::qsearch(Position& pos, Stack* ss, Value alpha, Va
 #undef NNUE_QSIGNAL_EVALUATE
     return bestValue;
 }
+
+#if defined(ENABLE_QSEARCH_CORRECTION_PROBE)
+Value Search::YaneuraOuWorker::diagnostic_qsearch(
+  Position& pos, std::uint64_t& searched_nodes, int& qsearch_sel_depth,
+  Value* qsearch_raw_static, Value* corrected_static,
+  bool* stand_pat_observed) {
+    // Match iterative_deepening()'s stack invariants.  The search itself is
+    // exactly qsearch<PV>; only the standalone root setup lives here.
+    Stack stack[MAX_PLY + 10] = {};
+    Stack* ss = stack + 7;
+    Move pv[MAX_PLY + 1]{};
+    for (int i = 7; i > 0; --i) {
+        (ss - i)->continuationHistory =
+          &continuationHistory[0][0][NO_PIECE][0];
+        (ss - i)->continuationCorrectionHistory =
+          &continuationCorrectionHistory[NO_PIECE][0];
+        (ss - i)->staticEval = VALUE_NONE;
+    }
+    for (int i = 0; i <= MAX_PLY + 2; ++i)
+        (ss + i)->ply = i;
+    ss->pv = pv;
+    ss->currentMove = Move::none();
+    ss->continuationHistory = &continuationHistory[0][0][NO_PIECE][0];
+    ss->continuationCorrectionHistory = &continuationCorrectionHistory[NO_PIECE][0];
+    selDepth = 0;
+    nodes = 0;
+    diagnosticQsearchRawStatic = VALUE_NONE;
+    diagnosticQsearchCorrectedStatic = VALUE_NONE;
+    diagnosticQsearchStandPatObserved = false;
+#if defined(USE_SFNN)
+    accumulatorStack.reset();
+#endif
+    const Value result = qsearch<PV>(pos, ss, -VALUE_INFINITE, VALUE_INFINITE);
+    searched_nodes = nodes.load(std::memory_order_relaxed);
+    qsearch_sel_depth = selDepth;
+    if (qsearch_raw_static)
+        *qsearch_raw_static = diagnosticQsearchRawStatic;
+    if (corrected_static)
+        *corrected_static = diagnosticQsearchCorrectedStatic;
+    if (stand_pat_observed)
+        *stand_pat_observed = diagnosticQsearchStandPatObserved;
+    return result;
+}
+#endif
 
 // LMRのreductionの値を計算する。
 Depth Search::YaneuraOuWorker::reduction(bool i, Depth d, int mn, int delta) const {

@@ -1400,6 +1400,11 @@ struct Network {
 		}
 		std::memset(buf.l2_input + L2_REAL_SIZE, 0, L2_PADDING_SIZE);
 
+#if defined(ENABLE_NNUE_SIGNAL_LOG) && defined(ENABLE_QSEARCH_CORRECTION_SHADOW)
+		if (signal)
+			std::memcpy(signal->qsearch_correction_l2_input, buf.l2_input, 128);
+#endif
+
 #if defined(ENABLE_NNUE_POLICY_SHADOW)
 		if (signal) {
 			const auto policy_query16_started = std::chrono::steady_clock::now();

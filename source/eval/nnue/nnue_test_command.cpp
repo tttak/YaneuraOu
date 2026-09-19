@@ -9,6 +9,9 @@
 #include "../../evaluate.h"
 #include "evaluate_nnue.h"
 #include "nnue_test_command.h"
+#if defined(ENABLE_QSEARCH_CORRECTION_SHADOW)
+#include "qsearch_correction_shadow.h"
+#endif
 
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
 #include "../../engine/yaneuraou-engine/nnue_signal_logger.h"
@@ -33,6 +36,9 @@
 #endif
 #if defined(ENABLE_ROOT_TIME_RISK_BUDGET)
 #include "../../engine/yaneuraou-engine/root_time_risk_budget.h"
+#endif
+#if defined(ENABLE_QSEARCH_CORRECTION_PROBE)
+#include "../../engine/yaneuraou-engine/yaneuraou-search.h"
 #endif
 
 #include <algorithm>
@@ -85,6 +91,11 @@ struct MoveAccuracyRecord {
   s8 game_result;
   u8 padding;
 };
+
+#if defined(ENABLE_QSEARCH_CORRECTION_PROBE)
+#include "qsearch_correction_tool.inc"
+#include "qsearch_correction_decomposition_tool.inc"
+#endif
 
 #if defined(ENABLE_STATIC_EVAL_BIN_TOOL)
 static_assert(sizeof(MoveAccuracyRecord) == 40,
@@ -1358,6 +1369,7 @@ struct NnueBenchTiming {
   std::uint64_t calls = 0;
   double nanoseconds = 0.0;
 };
+
 
 #if defined(ENABLE_NNUE_DECISION_TRACE)
 std::uint64_t TraceSplitMix64(std::uint64_t& state) {
@@ -11387,6 +11399,12 @@ void TestCommand(IEngine& engine, std::istream& stream) {
   } else if (sub_command == "make_static_eval_bin") {
     MakeStaticEvalBin(stream);
 #endif
+#if defined(ENABLE_QSEARCH_CORRECTION_PROBE)
+  } else if (sub_command == "qsearch_correction_corpus") {
+    MakeQsearchCorrectionCorpus(engine, stream);
+  } else if (sub_command == "qsearch_correction_decomposition") {
+    MakeQsearchCorrectionDecompositionCorpus(engine, stream);
+#endif
 #if defined(ENABLE_NNUE_BENCH)
   } else if (sub_command == "inspect_packed_sfen_sample") {
     InspectPackedSfenSample(stream);
@@ -11539,6 +11557,12 @@ void TestCommand(IEngine& engine, std::istream& stream) {
 #if defined(ENABLE_STATIC_EVAL_BIN_TOOL)
     std::cout << " test nnue make_static_eval_bin <input> <output> <start>"
                  " <count> <csv> <csv_count> [metadata]" << std::endl;
+#endif
+#if defined(ENABLE_QSEARCH_CORRECTION_PROBE)
+    std::cout << " test nnue qsearch_correction_corpus <input> <csv> <corpus>"
+                 " <start> <count>" << std::endl;
+    std::cout << " test nnue qsearch_correction_decomposition <input> <csv> <corpus>"
+                 " <start> <count>" << std::endl;
 #endif
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
     std::cout << " test nnue signal_log_reset" << std::endl;

@@ -99,6 +99,10 @@ struct NnueSignalSnapshot {
     std::uint32_t policy_query16_projection_ns = 0;
     std::uint32_t policy_query32_projection_ns = 0;
 #endif
+#if defined(ENABLE_QSEARCH_CORRECTION_SHADOW)
+    // Exact L2 byte input consumed by Experiment 64's frozen probes.
+    std::uint8_t qsearch_correction_l2_input[128]{};
+#endif
 #if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
     // Frozen DLS/Fuka disagreement probe.  These fields are diagnostic only;
     // uncertainty_q8 is the scalar intended for later search logging.
