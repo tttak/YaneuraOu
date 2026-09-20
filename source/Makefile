@@ -150,6 +150,40 @@ else ifneq ($(NNUE_SIDE_INPUT),NONE)
   $(error NNUE_SIDE_INPUT must be NONE or SAFE_ESCAPE)
 endif
 
+# Diagnostic-only concurrent Lazy SMP duplicate measurement.  OFF leaves no
+# hot-path branch, load, store, or counter.  SAMPLE_LOG2=3 means 1/8 of keys
+# touch the shared active table while all search() entries are counted locally.
+MEASURE_LAZY_SMP_DUPLICATION ?= NO
+LAZY_SMP_DUP_SAMPLE_LOG2 ?= 3
+ifeq ($(MEASURE_LAZY_SMP_DUPLICATION),YES)
+  CPPFLAGS += -DMEASURE_LAZY_SMP_DUPLICATION
+  CPPFLAGS += -DLAZY_SMP_DUP_SAMPLE_LOG2=$(LAZY_SMP_DUP_SAMPLE_LOG2)
+else ifneq ($(MEASURE_LAZY_SMP_DUPLICATION),NO)
+  $(error MEASURE_LAZY_SMP_DUPLICATION must be YES or NO)
+endif
+
+# Experiment 81: minimal ABDADA-lite intervention.  Only deep search frames are
+# published; a matching active key can add one ply of LMR reduction at NonPV
+# nodes.  Default OFF leaves no table, branch, counter, or logging in the binary.
+USE_LAZY_SMP_DUPLICATE_LMR ?= NO
+LAZY_SMP_DUP_LMR_DEPTH_THRESHOLD ?= 12
+LAZY_SMP_DUP_LMR_MAX_DEPTH_DIFF ?= 1
+LAZY_SMP_DUP_LMR_APPLY ?= YES
+ifeq ($(USE_LAZY_SMP_DUPLICATE_LMR),YES)
+  CPPFLAGS += -DUSE_LAZY_SMP_DUPLICATE_LMR
+  CPPFLAGS += -DLAZY_SMP_DUP_LMR_DEPTH_THRESHOLD=$(LAZY_SMP_DUP_LMR_DEPTH_THRESHOLD)
+  CPPFLAGS += -DLAZY_SMP_DUP_LMR_MAX_DEPTH_DIFF=$(LAZY_SMP_DUP_LMR_MAX_DEPTH_DIFF)
+  ifeq ($(LAZY_SMP_DUP_LMR_APPLY),YES)
+    CPPFLAGS += -DLAZY_SMP_DUP_LMR_APPLY=1
+  else ifeq ($(LAZY_SMP_DUP_LMR_APPLY),NO)
+    CPPFLAGS += -DLAZY_SMP_DUP_LMR_APPLY=0
+  else
+    $(error LAZY_SMP_DUP_LMR_APPLY must be YES or NO)
+  endif
+else ifneq ($(USE_LAZY_SMP_DUPLICATE_LMR),NO)
+  $(error USE_LAZY_SMP_DUPLICATE_LMR must be YES or NO)
+endif
+
 # YANEURAOU_EDITION = YANEURAOU_ENGINE_MATERIALのときに指定できる、評価関数の通し番号
 #  1 : 普通の駒得のみの評価関数
 #  2 : …

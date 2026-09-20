@@ -59,6 +59,12 @@
 #if defined(ENABLE_ROOT_MOVE_HISTORY_DIAGNOSTIC)
 #include "root_move_history_logger.h"
 #endif
+#if defined(MEASURE_LAZY_SMP_DUPLICATION)
+#include "lazy_smp_duplicate_stats.h"
+#endif
+#if defined(USE_LAZY_SMP_DUPLICATE_LMR)
+#include "lazy_smp_duplicate_lmr.h"
+#endif
 #if defined(ENABLE_ROOT_TIME_RISK_BUDGET)
 #include "root_time_risk_budget.h"
 #endif
@@ -966,6 +972,13 @@ void Search::YaneuraOuWorker::start_searching() {
     //    通常の思考処理
     // ---------------------
 
+#if defined(MEASURE_LAZY_SMP_DUPLICATION)
+    Search::LazySmpDuplicateStats::reset(threads.size());
+#endif
+#if defined(USE_LAZY_SMP_DUPLICATE_LMR)
+    Search::LazySmpDuplicateLmr::reset(threads.size());
+#endif
+
     threads.start_searching();  // start non-main threads
     // 📝 main以外のすべてのthreadを開始する。
     //    main以外のthreadがstart_searching()を開始する。
@@ -1043,6 +1056,15 @@ SKIP_SEARCH:
     // 💡 開始していなければいないで構わない。
 
     threads.wait_for_search_finished();
+
+#if defined(MEASURE_LAZY_SMP_DUPLICATION)
+    if (!search_skipped)
+        sync_cout << Search::LazySmpDuplicateStats::report(threads.nodes_searched()) << sync_endl;
+#endif
+#if defined(USE_LAZY_SMP_DUPLICATE_LMR)
+    if (!search_skipped)
+        sync_cout << Search::LazySmpDuplicateLmr::report(threads.nodes_searched()) << sync_endl;
+#endif
 
 // 💡 やねうら王では、npmsecをサポートしない。
 #if STOCKFISH
@@ -2212,6 +2234,15 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
     // 拡張によって深さが大きくなりすぎた場合、深さを制限します
 
     depth = std::min(depth, MAX_PLY - 1);
+
+#if defined(MEASURE_LAZY_SMP_DUPLICATION)
+    Search::LazySmpDuplicateStats::ActiveGuard lazySmpDuplicateGuard(pos.key(), depth, threadIdx,
+                                                                     nodes);
+#endif
+#if defined(USE_LAZY_SMP_DUPLICATE_LMR)
+    Search::LazySmpDuplicateLmr::ActiveGuard lazySmpDuplicateLmrGuard(
+      pos.key(), depth, threadIdx, !PvNode);
+#endif
 
 	// 📝 次の指し手で引き分けに持ち込めてかつ、betaが引き分けのスコアより低いなら
     //     早期枝刈りが実施できる。
@@ -4182,6 +4213,20 @@ moves_loop:  // When in check, search starts here
 
 			Depth d = std::max(1, std::min(newDepth - r / 1024, newDepth + 2)) + PvNode;
 
+#if defined(USE_LAZY_SMP_DUPLICATE_LMR)
+            Search::LazySmpDuplicateLmr::record_lmr_event(threadIdx);
+            bool lazySmpDuplicateLmrAdjusted = false;
+            if (LAZY_SMP_DUP_LMR_APPLY && lazySmpDuplicateLmrGuard.should_reduce()) {
+                const Depth originalD = d;
+                // Change only the reduced search depth.  In particular, do not
+                // modify r: earlier futility/SEE thresholds remain baseline-identical.
+                d = std::max(1, d - 1);
+                lazySmpDuplicateLmrAdjusted = d < originalD;
+                if (lazySmpDuplicateLmrAdjusted)
+                    Search::LazySmpDuplicateLmr::record_adjusted(threadIdx);
+            }
+#endif
+
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
             // Snapshot the unmodified LMR depth before any NNUE signal can add
             // a ply. Calibration uses this to exclude reduction-zero moves.
@@ -4409,6 +4454,10 @@ moves_loop:  // When in check, search starts here
 #endif
             value         = -search<NonPV>(pos, ss + 1, -(alpha + 1), -alpha, d, true);
             ss->reduction = 0;
+#if defined(USE_LAZY_SMP_DUPLICATE_LMR)
+            if (lazySmpDuplicateLmrAdjusted && value > alpha)
+                Search::LazySmpDuplicateLmr::record_fail_high(threadIdx);
+#endif
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
             nnuePhaseFmLmrReducedFailHigh = value > alpha;
             nnuePhaseFmLmrReducedValue = value;
@@ -4438,6 +4487,10 @@ moves_loop:  // When in check, search starts here
                 newDepth += doDeeperSearch - doShallowerSearch;
 
                 if (newDepth > d) {
+#if defined(USE_LAZY_SMP_DUPLICATE_LMR)
+                    if (lazySmpDuplicateLmrAdjusted)
+                        Search::LazySmpDuplicateLmr::record_research(threadIdx);
+#endif
 #if defined(ENABLE_NNUE_POLICY_SHADOW)
                     nnuePolicyObservation.MarkLmrResearch(move);
 #endif
