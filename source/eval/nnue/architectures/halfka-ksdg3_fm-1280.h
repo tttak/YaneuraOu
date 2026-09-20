@@ -226,6 +226,33 @@ struct Network {
 	// Bypassパスと DeepPath のブレンド係数 (バケットごとに学習)
 	int32_t bucket_blend_alpha;
 
+#if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
+	static constexpr IndexType kSideInputDimensions = 8;
+	std::array<float, kSideInputDimensions * 16> side_input_encode_weight{};
+	std::array<float, kSideInputDimensions> side_input_encode_bias{};
+	std::array<float, L2_INPUT_SIZE * kSideInputDimensions>
+		side_input_residual_weight{};
+	std::array<float, L2_INPUT_SIZE> side_input_residual_bias{};
+
+	void ComputeSideInputResidual(const std::uint16_t mask,
+		float* encoded, float* residual) const {
+		for (IndexType row = 0; row < kSideInputDimensions; ++row) {
+			float value = side_input_encode_bias[row];
+			for (IndexType column = 0; column < 16; ++column)
+				if ((mask >> column) & 1u)
+					value += side_input_encode_weight[row * 16 + column];
+			encoded[row] = value / (1.0f + std::exp(-value));
+		}
+		for (IndexType row = 0; row < L2_INPUT_SIZE; ++row) {
+			float value = side_input_residual_bias[row];
+			for (IndexType column = 0; column < kSideInputDimensions; ++column)
+				value += side_input_residual_weight[
+					row * kSideInputDimensions + column] * encoded[column];
+			residual[row] = value;
+		}
+	}
+#endif
+
 #if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
 	// Diagnostic-only frozen bucket-specific Linear(64,1) head.  Float32 is
 	// intentional: it preserves the Python probe parameters without changing
@@ -381,6 +408,8 @@ struct Network {
 	static constexpr std::uint32_t GetHashValue() {
 #if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
 		return GetBaseHashValue() ^ 0x48414F52u;
+#elif defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
+		return GetBaseHashValue() ^ 0x53414645u;
 #elif defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
 		return GetBaseHashValue() ^ 0x00554E43u;
 #else
@@ -422,6 +451,9 @@ struct Network {
 #if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
 		result += "-HaoSearchRiskContextFc1V1";
 #endif
+#if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
+		result += "-SideSafe8";
+#endif
 		return result;
 	}
 
@@ -440,6 +472,18 @@ struct Network {
 		fc_2.ReadParameters(stream).is_ok();
 		stream.read(reinterpret_cast<char*>(&bucket_blend_alpha), sizeof(int32_t));
 		std::cout << "Read Alpha: " << bucket_blend_alpha << " / 16384" << std::endl;
+#if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
+		stream.read(reinterpret_cast<char*>(side_input_encode_weight.data()),
+		            sizeof(side_input_encode_weight));
+		stream.read(reinterpret_cast<char*>(side_input_encode_bias.data()),
+		            sizeof(side_input_encode_bias));
+		stream.read(reinterpret_cast<char*>(side_input_residual_weight.data()),
+		            sizeof(side_input_residual_weight));
+		stream.read(reinterpret_cast<char*>(side_input_residual_bias.data()),
+		            sizeof(side_input_residual_bias));
+		if (!stream)
+			return Tools::ResultCode::FileMismatch;
+#endif
 #if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
 		stream.read(reinterpret_cast<char*>(uncertainty_head_weight.data()),
 		            sizeof(float) * uncertainty_head_weight.size());
@@ -1052,6 +1096,9 @@ struct Network {
 	&& !defined(ENABLE_NNUE_SIGNAL_LOG)
 		, NnueRouterLmrSignal* lmr_signal = nullptr
 #endif
+#if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
+		, const std::uint16_t side_input_mask = 0
+#endif
 	) const {
 		auto& buf = *reinterpret_cast<Buffer*>(buffer);
 
@@ -1405,6 +1452,22 @@ struct Network {
 			AssembleL2Channel<CROSS_OUTPUT_SIZE>(buf.cross_feat, &buf.l2_input[L2_CROSS_OFFSET], cross_scale);
 		}
 		std::memset(buf.l2_input + L2_REAL_SIZE, 0, L2_PADDING_SIZE);
+
+#if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
+		// Experiment-only mixed-float side projection.  Python trains in the
+		// normalized [0,1] L2 domain; round(residual*127) converts back to the
+		// existing byte domain before the unchanged fc_1 fixed-point path.
+		float side_hidden[kSideInputDimensions];
+		float side_residual[L2_INPUT_SIZE];
+		ComputeSideInputResidual(
+			side_input_mask, side_hidden, side_residual);
+		for (IndexType row = 0; row < L2_INPUT_SIZE; ++row) {
+			const int adjusted = static_cast<int>(buf.l2_input[row])
+				+ static_cast<int>(std::round(side_residual[row] * 127.0f));
+			buf.l2_input[row] = static_cast<std::uint8_t>(
+				std::clamp(adjusted, 0, 127));
+		}
+#endif
 
 #if defined(ENABLE_NNUE_SIGNAL_LOG) && defined(ENABLE_QSEARCH_CORRECTION_SHADOW)
 		if (signal)

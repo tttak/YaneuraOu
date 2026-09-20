@@ -140,6 +140,16 @@ else ifneq ($(NNUE_FEATURE_VARIANT),A)
 	$(error NNUE_FEATURE_VARIANT must be A or D)
 endif
 
+# Optional dense/context input, independent of the sparse A/D feature variant.
+# The default NONE does not define a macro and therefore preserves the legacy
+# binary, network hash, and nn.bin layout.
+NNUE_SIDE_INPUT ?= NONE
+ifeq ($(NNUE_SIDE_INPUT),SAFE_ESCAPE)
+  CPPFLAGS += -DENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE
+else ifneq ($(NNUE_SIDE_INPUT),NONE)
+  $(error NNUE_SIDE_INPUT must be NONE or SAFE_ESCAPE)
+endif
+
 # YANEURAOU_EDITION = YANEURAOU_ENGINE_MATERIALのときに指定できる、評価関数の通し番号
 #  1 : 普通の駒得のみの評価関数
 #  2 : …

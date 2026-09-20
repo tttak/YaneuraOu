@@ -24,6 +24,15 @@
 #endif
 
 #include "evaluate_nnue.h"
+#if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
+#define NNUE_SIDE_INPUT_KING_SQUARE(pos, color) (pos).square<KING>(color)
+#define NNUE_SIDE_INPUT_NAMESPACE_BEGIN namespace YaneuraOu {
+#define NNUE_SIDE_INPUT_NAMESPACE_END }
+#include "nnue_side_input.h"
+#undef NNUE_SIDE_INPUT_NAMESPACE_END
+#undef NNUE_SIDE_INPUT_NAMESPACE_BEGIN
+#undef NNUE_SIDE_INPUT_KING_SQUARE
+#endif
 
 namespace YaneuraOu::Eval::NNUE {
 extern int FV_SCALE;
@@ -628,6 +637,9 @@ namespace {
 #if (defined(USE_NNUE_PHASE_FM_LMR) || defined(USE_NNUE_LCA_LMR)) \
           && !defined(ENABLE_NNUE_SIGNAL_LOG)
           , &router_lmr_signal
+#endif
+#if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
+          , NnueSideInput::safe_escape_mask16(pos)
 #endif
         );
 

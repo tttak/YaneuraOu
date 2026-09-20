@@ -9,6 +9,15 @@
 #include "../../evaluate.h"
 #include "evaluate_nnue.h"
 #include "nnue_test_command.h"
+#if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
+#define NNUE_SIDE_INPUT_KING_SQUARE(pos, color) (pos).square<KING>(color)
+#define NNUE_SIDE_INPUT_NAMESPACE_BEGIN namespace YaneuraOu {
+#define NNUE_SIDE_INPUT_NAMESPACE_END }
+#include "nnue_side_input.h"
+#undef NNUE_SIDE_INPUT_NAMESPACE_END
+#undef NNUE_SIDE_INPUT_NAMESPACE_BEGIN
+#undef NNUE_SIDE_INPUT_KING_SQUARE
+#endif
 #if defined(ENABLE_QSEARCH_CORRECTION_SHADOW)
 #include "qsearch_correction_shadow.h"
 #endif
@@ -586,6 +595,405 @@ void InspectPackedSfenSample(std::istream& stream) {
   std::cout << "inspect_packed_sfen_sample: records=" << sample_index
             << " decode_errors=" << decode_errors
             << " output=" << output_name << std::endl;
+}
+
+// Experiment 73 only: compact shogi-specific tactical features. All legality
+// and pin semantics are delegated to Position/MoveList. This command exists
+// only in ENABLE_NNUE_BENCH diagnostic binaries.
+void ExportShogiTacticalFeatures(std::istream& stream) {
+  std::string input_name, output_name;
+  std::uint64_t max_records = 0;
+  stream >> std::quoted(input_name) >> std::quoted(output_name) >> max_records;
+  std::ifstream input(input_name, std::ios::binary);
+  std::ofstream output(output_name, std::ios::out | std::ios::trunc);
+  if (!input || !output) {
+    std::cout << "error: export_shogi_tactical_features open failed" << std::endl;
+    return;
+  }
+  output << "record,decoded,stm"
+            ",s1_legal_mask_p0,s1_safe_mask_p0,s1_friendly_p0,s1_enemy_p0,s1_enemy_control_p0,s1_friendly_defended_p0"
+            ",s1_legal_mask_p1,s1_safe_mask_p1,s1_friendly_p1,s1_enemy_p1,s1_enemy_control_p1,s1_friendly_defended_p1";
+  for (int p = 0; p < 2; ++p)
+    for (int pt = PAWN; pt < KING; ++pt)
+      output << ",s2_legal_check_p" << p << "_pt" << pt;
+  for (int p = 0; p < 2; ++p)
+    for (int pt = PAWN; pt < KING; ++pt)
+      output << ",s2_hand_p" << p << "_pt" << pt;
+  output << ",s2_pseudo_pawn_check_p0,s2_pseudo_pawn_check_p1"
+            ",s3_count_p0,s3_count_p1,s3_indices_p0,s3_indices_p1\n";
+
+  auto direction_index = [](Square from, Square to, Color c) {
+    if (c == WHITE) { from = Inv(from); to = Inv(to); }
+    const int df = int(file_of(to)) - int(file_of(from));
+    const int dr = int(rank_of(to)) - int(rank_of(from));
+    int index = (df + 1) * 3 + dr + 1;
+    if (index > 4) --index;
+    return index;
+  };
+
+  MoveAccuracyRecord record;
+  std::uint64_t row = 0, decode_errors = 0;
+  while ((max_records == 0 || row < max_records)
+         && input.read(reinterpret_cast<char*>(&record), sizeof(record))) {
+    Position original;
+    StateInfo original_state;
+    const bool decoded = original
+        .set_from_packed_sfen(record.sfen, &original_state, false, record.game_ply)
+        .is_ok();
+    output << row << ',' << (decoded ? 1 : 0);
+    if (!decoded) {
+      ++decode_errors;
+      output << ",0";
+      for (int i = 0; i < 47; ++i) output << ',';
+      output << '\n'; ++row; continue;
+    }
+    const Color stm = original.side_to_move();
+    output << ',' << int(stm);
+    std::array<int, 2> legal_mask{}, safe_mask{}, friendly_mask{}, enemy_mask{},
+                       enemy_control_mask{}, friendly_defended_mask{}, pseudo_pawn{};
+    std::array<std::array<int, 7>, 2> drop_checks{}, hand_counts{};
+
+    const std::string original_sfen = original.sfen();
+    for (int perspective = 0; perspective < 2; ++perspective) {
+      const Color us = perspective == 0 ? stm : ~stm;
+      std::string sfen = original_sfen;
+      const auto side_pos = sfen.find(' ');
+      if (side_pos != std::string::npos && side_pos + 1 < sfen.size())
+        sfen[side_pos + 1] = us == BLACK ? 'b' : 'w';
+      Position pos;
+      StateInfo state;
+      pos.set(sfen, &state);
+      for (int pt = PAWN; pt < KING; ++pt)
+        hand_counts[perspective][pt - 1] = hand_count(pos.hand_of(us), PieceType(pt));
+      const Square king = pos.square<KING>(us);
+      for (const auto& ext_move : MoveList<LEGAL_ALL>(pos)) {
+        const Move move = ext_move;
+        if (type_of(pos.moved_piece_before(move)) == KING) {
+          const int d = direction_index(king, move.to_sq(), us);
+          if (0 <= d && d < 8) legal_mask[perspective] |= 1 << d;
+        }
+        if (move.is_drop() && pos.gives_check(move)) {
+          const int pt = int(move.move_dropped_piece());
+          if (PAWN <= pt && pt < KING) ++drop_checks[perspective][pt - 1];
+        }
+      }
+      safe_mask[perspective] = legal_mask[perspective];
+
+      Square normalized_king = us == BLACK ? king : Inv(king);
+      const int kf = int(file_of(normalized_king));
+      const int kr = int(rank_of(normalized_king));
+      int direction = 0;
+      for (int df = -1; df <= 1; ++df)
+        for (int dr = -1; dr <= 1; ++dr) {
+          if (df == 0 && dr == 0) continue;
+          const int nf = kf + df, nr = kr + dr;
+          if (0 <= nf && nf < 9 && 0 <= nr && nr < 9) {
+            Square to = File(nf) | Rank(nr);
+            if (us == WHITE) to = Inv(to);
+            const Piece piece = pos.piece_on(to);
+            if (piece != NO_PIECE) {
+              if (color_of(piece) == us) friendly_mask[perspective] |= 1 << direction;
+              else enemy_mask[perspective] |= 1 << direction;
+            }
+            if (pos.board_effect[~us].effect(to)) enemy_control_mask[perspective] |= 1 << direction;
+            if (pos.board_effect[us].effect(to)) friendly_defended_mask[perspective] |= 1 << direction;
+          }
+          ++direction;
+        }
+
+      for (const auto& ext_move : MoveList<CHECKS_ALL>(pos)) {
+        const Move move = ext_move;
+        if (move.is_drop() && move.move_dropped_piece() == PAWN)
+          ++pseudo_pawn[perspective];
+      }
+    }
+    for (int p = 0; p < 2; ++p)
+      output << ',' << legal_mask[p] << ',' << safe_mask[p]
+             << ',' << friendly_mask[p] << ',' << enemy_mask[p]
+             << ',' << enemy_control_mask[p] << ',' << friendly_defended_mask[p];
+    for (int p = 0; p < 2; ++p)
+      for (int pt = 0; pt < 7; ++pt) output << ',' << drop_checks[p][pt];
+    for (int p = 0; p < 2; ++p)
+      for (int pt = 0; pt < 7; ++pt) output << ',' << hand_counts[p][pt];
+    output << ',' << pseudo_pawn[0] << ',' << pseudo_pawn[1];
+
+    std::array<std::vector<int>, 2> pin_indices;
+    for (int perspective = 0; perspective < 2; ++perspective) {
+      const Color us = perspective == 0 ? stm : ~stm;
+      const Square king = original.square<KING>(us);
+      Bitboard pinned = original.pinned_pieces(us);
+      Bitboard pinners = original.pinners(~us);
+      while (pinned) {
+        const Square pinned_sq = pinned.pop();
+        Bitboard pp = pinners;
+        while (pp) {
+          const Square pinner_sq = pp.pop();
+          if (!(between_bb(king, pinner_sq) & pinned_sq)) continue;
+          const int pinned_type = int(type_of(original.piece_on(pinned_sq))) - 1;
+          const int pinner_raw = int(type_of(original.piece_on(pinner_sq)));
+          int pinner_type = pinner_raw == LANCE ? 0
+                          : pinner_raw == BISHOP ? 1
+                          : pinner_raw == HORSE ? 2
+                          : pinner_raw == ROOK ? 3 : 4;
+          Square normalized_king = us == BLACK ? king : Inv(king);
+          Square normalized_pinner = us == BLACK ? pinner_sq : Inv(pinner_sq);
+          int df = int(file_of(normalized_pinner)) - int(file_of(normalized_king));
+          int dr = int(rank_of(normalized_pinner)) - int(rank_of(normalized_king));
+          df = (df > 0) - (df < 0); dr = (dr > 0) - (dr < 0);
+          int direction = (df + 1) * 3 + dr + 1;
+          if (direction > 4) --direction;
+          const int distance = dist(king, pinner_sq);
+          const int distance_class = distance <= 2 ? 0 : (distance <= 4 ? 1 : 2);
+          pin_indices[perspective].push_back(
+              (((pinned_type * 5 + pinner_type) * 8 + direction) * 3 + distance_class));
+        }
+      }
+    }
+    output << ',' << pin_indices[0].size() << ',' << pin_indices[1].size();
+    for (int p = 0; p < 2; ++p) {
+      output << ',';
+      for (std::size_t i = 0; i < pin_indices[p].size(); ++i) {
+        if (i) output << ';';
+        output << pin_indices[p][i];
+      }
+    }
+    output << '\n';
+    ++row;
+    if (row % 100000 == 0) std::cout << "tactical_features records=" << row << std::endl;
+  }
+  std::cout << "export_shogi_tactical_features records=" << row
+            << " decode_errors=" << decode_errors << " output=" << output_name << std::endl;
+}
+
+struct CheapEscapeMasks {
+  int onboard = 0;
+  int exact = 0;
+  int c1_effect_only = 0;
+  int c2_occupancy_effect = 0;
+  int c3_capture_xray = 0;
+  int c4_origin_capture_xray = 0;
+  int friendly_occupancy = 0;
+  int enemy_occupancy = 0;
+  int enemy_control = 0;
+};
+
+// Returns whether a slider attack on `to` appears after removing the king
+// origin and/or the captured piece. No legal move generation is used here.
+bool CheapEscapeSliderUnsafe(const Position& pos, Color us, Square king,
+                             Square to, bool remove_origin,
+                             bool remove_capture) {
+  Bitboard occupied = pos.pieces();
+  if (remove_origin)
+    occupied ^= king;
+  if (remove_capture && pos.piece_on(to) != NO_PIECE)
+    occupied ^= to;
+  const Color them = ~us;
+  if (rookEffect(to, occupied) & pos.pieces(them, ROOK, DRAGON))
+    return true;
+  if (bishopEffect(to, occupied) & pos.pieces(them, BISHOP, HORSE))
+    return true;
+  // Reverse the lance direction: squares reached from `to` by our direction
+  // are the enemy lances whose forward ray can reach `to`.
+  if (lanceEffect(us, to, occupied) & pos.pieces(them, LANCE))
+    return true;
+  return false;
+}
+
+CheapEscapeMasks MakeCheapEscapeMasks(const Position& pos) {
+  CheapEscapeMasks result;
+  const Color us = pos.side_to_move();
+  const Square king = pos.square<KING>(us);
+  int direction = 0;
+  for (int df = -1; df <= 1; ++df)
+    for (int dr = -1; dr <= 1; ++dr) {
+      if (df == 0 && dr == 0)
+        continue;
+      Square normalized_king = us == BLACK ? king : Inv(king);
+      const int nf = int(file_of(normalized_king)) + df;
+      const int nr = int(rank_of(normalized_king)) + dr;
+      const int bit = 1 << direction++;
+      if (nf < 0 || nf >= 9 || nr < 0 || nr >= 9)
+        continue;
+      result.onboard |= bit;
+      Square to = File(nf) | Rank(nr);
+      if (us == WHITE)
+        to = Inv(to);
+      const Piece piece = pos.piece_on(to);
+      const bool friendly = piece != NO_PIECE && color_of(piece) == us;
+      const bool enemy = piece != NO_PIECE && color_of(piece) != us;
+      const bool controlled = bool(pos.board_effect[~us].effect(to));
+      if (friendly) result.friendly_occupancy |= bit;
+      if (enemy) result.enemy_occupancy |= bit;
+      if (controlled) result.enemy_control |= bit;
+      if (!controlled)
+        result.c1_effect_only |= bit;
+      if (!friendly && !controlled) {
+        result.c2_occupancy_effect |= bit;
+        bool c3_unsafe = enemy
+            && CheapEscapeSliderUnsafe(pos, us, king, to, false, true);
+        if (!c3_unsafe)
+          result.c3_capture_xray |= bit;
+        bool c4_unsafe = CheapEscapeSliderUnsafe(pos, us, king, to, true, enemy);
+        if (!c4_unsafe)
+          result.c4_origin_capture_xray |= bit;
+      }
+    }
+  for (const auto& ext_move : MoveList<LEGAL_ALL>(pos)) {
+    const Move move = ext_move;
+    if (type_of(pos.moved_piece_before(move)) != KING)
+      continue;
+    Square normalized_king = us == BLACK ? king : Inv(king);
+    Square normalized_to = us == BLACK ? move.to_sq() : Inv(move.to_sq());
+    const int df = int(file_of(normalized_to)) - int(file_of(normalized_king));
+    const int dr = int(rank_of(normalized_to)) - int(rank_of(normalized_king));
+    int index = (df + 1) * 3 + dr + 1;
+    if (index > 4) --index;
+    if (0 <= index && index < 8)
+      result.exact |= 1 << index;
+  }
+  return result;
+}
+
+// Experiment 74: export exact S1 and effect-board-only approximations. The
+// cheap masks never call legal move generation; exact does so only as label.
+void ExportCheapSafeEscapeFeatures(std::istream& stream) {
+  std::string input_name, output_name;
+  std::uint64_t max_records = 0;
+  stream >> std::quoted(input_name) >> std::quoted(output_name) >> max_records;
+  std::ifstream input(input_name, std::ios::binary);
+  std::ofstream output(output_name, std::ios::out | std::ios::trunc);
+  if (!input || !output) {
+    std::cout << "error: export_cheap_safe_escape_features open failed" << std::endl;
+    return;
+  }
+  output << "record,decoded";
+  for (int p = 0; p < 2; ++p)
+    output << ",onboard_p" << p << ",exact_p" << p << ",c1_p" << p
+           << ",c2_p" << p << ",c3_p" << p << ",c4_p" << p
+           << ",friendly_p" << p << ",enemy_p" << p << ",enemy_control_p" << p;
+  output << '\n';
+  MoveAccuracyRecord record;
+  std::uint64_t row = 0, decode_errors = 0;
+  while ((max_records == 0 || row < max_records)
+         && input.read(reinterpret_cast<char*>(&record), sizeof(record))) {
+    Position original;
+    StateInfo original_state;
+    const bool decoded = original
+        .set_from_packed_sfen(record.sfen, &original_state, false, record.game_ply)
+        .is_ok();
+    output << row << ',' << int(decoded);
+    if (!decoded) {
+      ++decode_errors;
+      for (int i = 0; i < 18; ++i) output << ',';
+      output << '\n'; ++row; continue;
+    }
+    const Color stm = original.side_to_move();
+    const std::string original_sfen = original.sfen();
+    for (int perspective = 0; perspective < 2; ++perspective) {
+      const Color us = perspective == 0 ? stm : ~stm;
+      std::string sfen = original_sfen;
+      const auto side_pos = sfen.find(' ');
+      if (side_pos != std::string::npos && side_pos + 1 < sfen.size())
+        sfen[side_pos + 1] = us == BLACK ? 'b' : 'w';
+      Position pos;
+      StateInfo state;
+      pos.set(sfen, &state);
+      const auto m = MakeCheapEscapeMasks(pos);
+      output << ',' << m.onboard << ',' << m.exact << ',' << m.c1_effect_only
+             << ',' << m.c2_occupancy_effect << ',' << m.c3_capture_xray
+             << ',' << m.c4_origin_capture_xray << ',' << m.friendly_occupancy
+             << ',' << m.enemy_occupancy << ',' << m.enemy_control;
+    }
+    output << '\n';
+    ++row;
+    if (row % 100000 == 0)
+      std::cout << "cheap_escape_features records=" << row << std::endl;
+  }
+  std::cout << "export_cheap_safe_escape_features records=" << row
+            << " decode_errors=" << decode_errors << " output=" << output_name << std::endl;
+}
+
+// Per-position microbenchmark. `MakeCheapEscapeMasks` is deliberately not
+// used for cheap timings because it also creates the exact label.
+void BenchmarkCheapSafeEscapeFeatures(std::istream& stream) {
+  std::string input_name, output_name;
+  std::uint64_t max_records = 0;
+  int repeats = 16;
+  stream >> std::quoted(input_name) >> std::quoted(output_name) >> max_records >> repeats;
+  std::ifstream input(input_name, std::ios::binary);
+  std::ofstream output(output_name, std::ios::out | std::ios::trunc);
+  if (!input || !output || repeats <= 0) {
+    std::cout << "error: benchmark_cheap_safe_escape_features open failed" << std::endl;
+    return;
+  }
+  output << "record,decode_effect_ns,exact_ns,c1_ns,c2_ns,c3_ns,c4_ns\n";
+  using Clock = std::chrono::steady_clock;
+  MoveAccuracyRecord record;
+  std::uint64_t row = 0;
+  volatile int sink = 0;
+  while ((max_records == 0 || row < max_records)
+         && input.read(reinterpret_cast<char*>(&record), sizeof(record))) {
+    Position pos;
+    StateInfo state;
+    if (pos.set_from_packed_sfen(record.sfen, &state, false, record.game_ply).is_not_ok())
+      continue;
+    const Color us = pos.side_to_move();
+    const Square king = pos.square<KING>(us);
+    auto measure = [&](auto&& fn) {
+      const auto begin = Clock::now();
+      for (int r = 0; r < repeats; ++r) sink ^= fn();
+      return double(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          Clock::now() - begin).count()) / repeats;
+    };
+    const double decode_effect_ns = measure([&]() {
+      Position fresh;
+      StateInfo fresh_state;
+      const auto status = fresh.set_from_packed_sfen(
+          record.sfen, &fresh_state, false, record.game_ply);
+      return status.is_ok() ? int(fresh.side_to_move()) + 1 : 0;
+    });
+    const double exact_ns = measure([&]() {
+      int mask = 0;
+      for (const auto& ext_move : MoveList<LEGAL_ALL>(pos)) {
+        const Move move = ext_move;
+        if (type_of(pos.moved_piece_before(move)) == KING)
+          mask ^= int(move.to_sq()) + 1;
+      }
+      return mask;
+    });
+    auto cheap = [&](int mode) {
+      int mask = 0, direction = 0;
+      Square nk = us == BLACK ? king : Inv(king);
+      for (int df = -1; df <= 1; ++df)
+        for (int dr = -1; dr <= 1; ++dr) {
+          if (df == 0 && dr == 0) continue;
+          const int bit = 1 << direction++;
+          const int nf = int(file_of(nk)) + df, nr = int(rank_of(nk)) + dr;
+          if (nf < 0 || nf >= 9 || nr < 0 || nr >= 9) continue;
+          Square to = File(nf) | Rank(nr); if (us == WHITE) to = Inv(to);
+          const Piece piece = pos.piece_on(to);
+          const bool friendly = piece != NO_PIECE && color_of(piece) == us;
+          const bool enemy = piece != NO_PIECE && color_of(piece) != us;
+          if (pos.board_effect[~us].effect(to)) continue;
+          if (mode >= 2 && friendly) continue;
+          if (mode >= 3 && enemy
+              && CheapEscapeSliderUnsafe(pos, us, king, to, false, true)) continue;
+          if (mode >= 4
+              && CheapEscapeSliderUnsafe(pos, us, king, to, true, enemy)) continue;
+          mask |= bit;
+        }
+      return mask;
+    };
+    const double c1_ns = measure([&]() { return cheap(1); });
+    const double c2_ns = measure([&]() { return cheap(2); });
+    const double c3_ns = measure([&]() { return cheap(3); });
+    const double c4_ns = measure([&]() { return cheap(4); });
+    output << row << ',' << decode_effect_ns << ',' << exact_ns << ',' << c1_ns << ',' << c2_ns << ','
+           << c3_ns << ',' << c4_ns << '\n';
+    ++row;
+  }
+  std::cout << "benchmark_cheap_safe_escape_features records=" << row
+            << " repeats=" << repeats << " sink=" << sink << std::endl;
 }
 #endif
 
@@ -11193,6 +11601,114 @@ void TestUncertaintyHead(const Position& pos) {
 }
 #endif
 
+#if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
+void TestSideInput(const Position& pos, std::uint64_t repeats) {
+  repeats = std::max<std::uint64_t>(repeats, 1);
+  const std::uint16_t mask = NnueSideInput::safe_escape_mask16(pos);
+  std::array<float, Network::kSideInputDimensions> encoded{};
+  std::array<float, L2_INPUT_SIZE> residual{};
+  network[0]->ComputeSideInputResidual(
+      mask, encoded.data(), residual.data());
+  std::cout << std::setprecision(10)
+            << "side_input mask16=" << mask << " encoded=";
+  for (const float value : encoded)
+    std::cout << value << ',';
+  std::cout << " residual=";
+  for (const float value : residual)
+    std::cout << value << ',';
+  std::cout << std::endl;
+
+  volatile std::uint64_t mask_checksum = 0;
+  auto begin = std::chrono::steady_clock::now();
+  for (std::uint64_t i = 0; i < repeats; ++i) {
+#if defined(__GNUC__) || defined(__clang__)
+    asm volatile("" : : "r"(&pos) : "memory");
+#endif
+    mask_checksum += NnueSideInput::safe_escape_mask16(pos);
+  }
+  auto middle = std::chrono::steady_clock::now();
+  volatile float projection_checksum = 0.0f;
+  for (std::uint64_t i = 0; i < repeats; ++i) {
+    network[0]->ComputeSideInputResidual(
+        mask, encoded.data(), residual.data());
+    projection_checksum += residual[i % residual.size()];
+  }
+  auto end = std::chrono::steady_clock::now();
+  const double mask_ns = std::chrono::duration<double, std::nano>(
+      middle - begin).count() / repeats;
+  const double projection_ns = std::chrono::duration<double, std::nano>(
+      end - middle).count() / repeats;
+  std::cout << "side_input_cost repeats=" << repeats
+            << " mask_ns=" << mask_ns
+            << " projection_ns=" << projection_ns
+            << " total_ns=" << (mask_ns + projection_ns)
+            << " checksum=" << mask_checksum << ':' << projection_checksum
+            << std::endl;
+}
+
+void TestSideInputRecord(std::istream& stream) {
+  std::string input_name;
+  std::uint64_t record_index = 0;
+  stream >> std::quoted(input_name) >> record_index;
+  std::ifstream input(input_name, std::ios::binary);
+  if (!input) {
+    std::cout << "error: side_input_record cannot open " << input_name
+              << std::endl;
+    return;
+  }
+  input.seekg(static_cast<std::streamoff>(
+      record_index * sizeof(MoveAccuracyRecord)), std::ios::beg);
+  MoveAccuracyRecord record{};
+  if (!input.read(reinterpret_cast<char*>(&record), sizeof(record))) {
+    std::cout << "error: side_input_record cannot read record" << std::endl;
+    return;
+  }
+  Position position;
+  StateInfo state;
+  if (position.set_from_packed_sfen(
+          record.sfen, &state, false, record.game_ply).is_not_ok()) {
+    std::cout << "error: side_input_record decode failed" << std::endl;
+    return;
+  }
+  const auto mask = NnueSideInput::safe_escape_mask16(position);
+  const auto value = Eval::evaluate(position);
+  std::cout << "side_input_record index=" << record_index
+            << " mask16=" << mask << " eval=" << value
+            << " sfen=" << position.sfen() << std::endl;
+}
+
+void FindSideInputRecord(std::istream& stream) {
+  std::string input_name;
+  int wanted_score = 0;
+  int wanted_ply = 0;
+  unsigned wanted_mask = 0;
+  stream >> std::quoted(input_name) >> wanted_score >> wanted_ply >> wanted_mask;
+  std::ifstream input(input_name, std::ios::binary);
+  MoveAccuracyRecord record{};
+  std::uint64_t index = 0;
+  while (input.read(reinterpret_cast<char*>(&record), sizeof(record))) {
+    if (record.score != wanted_score || record.game_ply != wanted_ply) {
+      ++index;
+      continue;
+    }
+    Position position;
+    StateInfo state;
+    if (position.set_from_packed_sfen(
+            record.sfen, &state, false, record.game_ply).is_ok()
+        && NnueSideInput::safe_escape_mask16(position) == wanted_mask) {
+      std::cout << "side_input_find index=" << index
+                << " mask16=" << wanted_mask
+                << " eval=" << Eval::evaluate(position)
+                << " score=" << record.score << " ply=" << record.game_ply
+                << std::endl;
+      return;
+    }
+    ++index;
+  }
+  std::cout << "error: side_input_find no matching record" << std::endl;
+}
+#endif
+
 }  // namespace
 
 // NNUE評価関数に関するUSI拡張コマンド
@@ -11208,6 +11724,16 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     TestAccumulator(pos);
   } else if (sub_command == "incremental_eval_checksum") {
     TestIncrementalEvalChecksum();
+#if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
+  } else if (sub_command == "side_input_selftest") {
+    std::uint64_t repeats = 100000;
+    stream >> repeats;
+    TestSideInput(pos, repeats);
+  } else if (sub_command == "side_input_record") {
+    TestSideInputRecord(stream);
+  } else if (sub_command == "side_input_find") {
+    FindSideInputRecord(stream);
+#endif
 #if defined(ENABLE_NNUE_DECISION_RISK_LMR_COUNTERS)
   } else if (sub_command == "decision_risk_lmr_counters_reset") {
     Search::NnueDecisionRiskLmrCounters::Reset();
@@ -11408,6 +11934,12 @@ void TestCommand(IEngine& engine, std::istream& stream) {
 #if defined(ENABLE_NNUE_BENCH)
   } else if (sub_command == "inspect_packed_sfen_sample") {
     InspectPackedSfenSample(stream);
+  } else if (sub_command == "export_shogi_tactical_features") {
+    ExportShogiTacticalFeatures(stream);
+  } else if (sub_command == "export_cheap_safe_escape_features") {
+    ExportCheapSafeEscapeFeatures(stream);
+  } else if (sub_command == "benchmark_cheap_safe_escape_features") {
+    BenchmarkCheapSafeEscapeFeatures(stream);
   } else if (sub_command == "export_calibration_corpus") {
     ExportNnueCalibrationCorpus(stream);
   } else if (sub_command == "bench_ft") {
@@ -11526,6 +12058,13 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << " test nnue test_features" << std::endl;
     std::cout << " test nnue test_accumulator" << std::endl;
     std::cout << " test nnue incremental_eval_checksum" << std::endl;
+#if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
+    std::cout << " test nnue side_input_selftest [repeats]" << std::endl;
+    std::cout << " test nnue side_input_record <packed.bin> [index]"
+              << std::endl;
+    std::cout << " test nnue side_input_find <packed.bin> <score> <ply> <mask>"
+              << std::endl;
+#endif
 #if defined(ENABLE_NNUE_DECISION_RISK_LMR_COUNTERS)
     std::cout << " test nnue decision_risk_lmr_counters_reset" << std::endl;
     std::cout << " test nnue decision_risk_lmr_counters_report" << std::endl;
