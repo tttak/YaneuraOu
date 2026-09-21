@@ -167,6 +167,16 @@ else ifneq ($(NNUE_PAIR_RELATION),NO)
   $(error NNUE_PAIR_RELATION must be NO or YES)
 endif
 
+# Experiment 83 only: reference/oracle prototype for sparse incremental shogi
+# threat features.  It does not alter NNUE evaluation or the production
+# architecture and defaults to complete compile-time removal.
+NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE ?= NO
+ifeq ($(NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE),YES)
+  CPPFLAGS += -DENABLE_NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE
+else ifneq ($(NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE),NO)
+  $(error NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE must be NO or YES)
+endif
+
 # Experiment-only inference ablation: load the complete Pair network but force
 # its residual contribution to exactly zero.  This remains fully compiled out
 # unless explicitly requested.
@@ -597,6 +607,7 @@ ifneq (,$(findstring YANEURAOU_ENGINE_NNUE,$(YANEURAOU_EDITION)))
 	SOURCES += \
 		eval/nnue/evaluate_nnue.cpp                                     \
 		eval/nnue/evaluate_nnue_learner.cpp                             \
+		eval/nnue/nnue_shogi_threat_lazy.cpp                            \
 		eval/nnue/nnue_test_command.cpp                                 \
 		eval/nnue/features/k.cpp                                        \
 		eval/nnue/features/p.cpp                                        \

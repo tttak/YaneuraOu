@@ -21,6 +21,10 @@
 #if defined(ENABLE_NNUE_PAIR_RELATION_SIDE_INPUT)
 #include "nnue_pair_relation.h"
 #endif
+#if defined(ENABLE_NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE)
+#include "nnue_shogi_threat_lazy.h"
+#include "nnue_shogi_threat_sparse.h"
+#endif
 #if defined(ENABLE_QSEARCH_CORRECTION_SHADOW)
 #include "qsearch_correction_shadow.h"
 #endif
@@ -74,6 +78,9 @@
 #include <utility>
 #include <unordered_set>
 #include <vector>
+#if defined(ENABLE_NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE) && defined(USE_AVX2)
+#include <immintrin.h>
+#endif
 
 #if defined(ENABLE_NNUE_TRACE) || defined(ENABLE_NNUE_BENCH)
 #include <algorithm>
@@ -11998,6 +12005,852 @@ void TestFreshEvaluateCost(const Position& pos, const std::uint64_t repeats) {
             << " checksum=" << checksum << std::endl;
 }
 
+#if defined(ENABLE_NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE)
+void TestShogiThreatSparsePrototype(std::istream& stream) {
+  using namespace NnueShogiThreatSparse;
+  std::uint64_t requested_games = 1000;
+  int max_ply = 1000;
+  stream >> requested_games >> max_ply;
+  if (requested_games == 0 || max_ply <= 0) {
+    std::cout << "error: threat_sparse_prototype requires games>0 max_ply>0"
+              << std::endl;
+    return;
+  }
+
+  Position pos;
+  StateInfo root_state;
+  std::vector<StateInfo> states(static_cast<std::size_t>(max_ply));
+  PRNG prng(UINT64_C(0x83a11ce5d17f00d));
+  std::array<Edge, MaxRelations> before_edges[COLOR_NB]{};
+  std::array<Edge, MaxRelations> after_edges[COLOR_NB]{};
+  PrototypeAccumulator incremental[COLOR_NB]{};
+  std::vector<std::uint16_t> before_indices[COLOR_NB];
+  std::vector<std::uint16_t> after_indices[COLOR_NB];
+  std::vector<std::uint16_t> removed[COLOR_NB];
+  std::vector<std::uint16_t> added[COLOR_NB];
+
+  std::uint64_t positions = 0;
+  std::uint64_t moves_checked = 0;
+  std::uint64_t accumulator_mismatches = 0;
+  std::uint64_t touched_coverage_misses = 0;
+  std::uint64_t changed_edges = 0;
+  std::uint64_t total_active = 0;
+  std::uint64_t total_removed = 0;
+  std::uint64_t total_added = 0;
+  std::uint64_t max_active = 0;
+  std::uint64_t max_dirty = 0;
+  std::uint64_t fresh_enumeration_ns = 0;
+  std::uint64_t fresh_sort_ns = 0;
+  std::uint64_t oracle_diff_ns = 0;
+  std::uint64_t accumulator_update_ns = 0;
+  double max_accumulator_abs_diff = 0.0;
+
+  for (std::uint64_t game = 0; game < requested_games; ++game) {
+    pos.set_hirate(&root_state);
+    for (const Color perspective : {BLACK, WHITE}) {
+      const auto count = generate_edges(pos, perspective,
+          before_edges[perspective].data(), before_edges[perspective].size());
+      if (count > before_edges[perspective].size()) {
+        std::cout << "error: threat relation capacity exceeded" << std::endl;
+        return;
+      }
+      before_indices[perspective] = sorted_indices(
+          before_edges[perspective].data(), count);
+      refresh_accumulator(before_indices[perspective], incremental[perspective]);
+    }
+
+    for (int ply = 0; ply < max_ply; ++ply) {
+      MoveList<LEGAL_ALL> moves(pos);
+      if (moves.size() == 0)
+        break;
+      const Move move = moves.begin()[prng.rand(moves.size())];
+      const Square to = move.to_sq();
+      const bool drop = move.is_drop();
+      const Square from = drop ? SQ_NB : move.from_sq();
+
+      std::size_t before_count[COLOR_NB]{};
+      for (const Color perspective : {BLACK, WHITE}) {
+        const auto enumerate_start = std::chrono::steady_clock::now();
+        before_count[perspective] = generate_edges(
+            pos, perspective, before_edges[perspective].data(),
+            before_edges[perspective].size());
+        const auto enumerate_end = std::chrono::steady_clock::now();
+        fresh_enumeration_ns +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                enumerate_end - enumerate_start).count();
+        const auto sort_start = std::chrono::steady_clock::now();
+        before_indices[perspective] = sorted_indices(
+            before_edges[perspective].data(), before_count[perspective]);
+        const auto sort_end = std::chrono::steady_clock::now();
+        fresh_sort_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            sort_end - sort_start).count();
+      }
+
+      pos.do_move(move, states[ply]);
+
+      std::size_t after_count[COLOR_NB]{};
+      for (const Color perspective : {BLACK, WHITE}) {
+        const auto enumerate_start = std::chrono::steady_clock::now();
+        after_count[perspective] = generate_edges(
+            pos, perspective, after_edges[perspective].data(),
+            after_edges[perspective].size());
+        const auto enumerate_end = std::chrono::steady_clock::now();
+        fresh_enumeration_ns +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                enumerate_end - enumerate_start).count();
+        const auto sort_start = std::chrono::steady_clock::now();
+        after_indices[perspective] = sorted_indices(
+            after_edges[perspective].data(), after_count[perspective]);
+        const auto sort_end = std::chrono::steady_clock::now();
+        fresh_sort_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            sort_end - sort_start).count();
+      }
+
+      const auto diff_start = std::chrono::steady_clock::now();
+      for (const Color perspective : {BLACK, WHITE})
+        multiset_delta(before_indices[perspective], after_indices[perspective],
+                       removed[perspective], added[perspective]);
+      const auto diff_end = std::chrono::steady_clock::now();
+      oracle_diff_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+          diff_end - diff_start).count();
+
+      const auto update_start = std::chrono::steady_clock::now();
+      for (const Color perspective : {BLACK, WHITE})
+        update_accumulator(removed[perspective], added[perspective],
+                           incremental[perspective]);
+      const auto update_end = std::chrono::steady_clock::now();
+      accumulator_update_ns +=
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              update_end - update_start).count();
+
+      for (const Color perspective : {BLACK, WHITE}) {
+        PrototypeAccumulator refreshed{};
+        refresh_accumulator(after_indices[perspective], refreshed);
+        bool mismatch = false;
+        for (std::size_t channel = 0; channel < PrototypeWidth; ++channel) {
+          const double difference = std::abs(double(refreshed[channel])
+                                            - incremental[perspective][channel]);
+          max_accumulator_abs_diff = std::max(max_accumulator_abs_diff,
+                                              difference);
+          mismatch |= difference > 2.0e-6;
+        }
+        accumulator_mismatches += mismatch;
+        total_active += after_count[perspective];
+        total_removed += removed[perspective].size();
+        total_added += added[perspective].size();
+        max_active = std::max<std::uint64_t>(max_active,
+                                            after_count[perspective]);
+        max_dirty = std::max<std::uint64_t>(
+            max_dirty, removed[perspective].size() + added[perspective].size());
+
+        // Verify the proposed localization contract at feature-multiset level.
+        // Edge identity itself is intentionally ignored: moving a slider can
+        // change (from,to) while leaving the compact feature index unchanged.
+        // LongEffect's collector records every square whose effect is written,
+        // even if writes later cancel. from/to are added because target
+        // identity/occupancy can change while incoming effect count is stable.
+        Bitboard touched = pos.state()->effect_touched_any;
+        touched |= to;
+        if (!drop)
+          touched |= from;
+        std::vector<std::uint16_t> before_local;
+        std::vector<std::uint16_t> after_local;
+        for (std::size_t i = 0; i < before_count[perspective]; ++i)
+          if ((touched & before_edges[perspective][i].to)
+              || (!drop && before_edges[perspective][i].from == from))
+            before_local.push_back(before_edges[perspective][i].index);
+        for (std::size_t i = 0; i < after_count[perspective]; ++i)
+          if ((touched & after_edges[perspective][i].to)
+              || after_edges[perspective][i].from == to)
+            after_local.push_back(after_edges[perspective][i].index);
+        std::sort(before_local.begin(), before_local.end());
+        std::sort(after_local.begin(), after_local.end());
+        std::vector<std::uint16_t> local_removed;
+        std::vector<std::uint16_t> local_added;
+        multiset_delta(before_local, after_local, local_removed, local_added);
+        changed_edges += removed[perspective].size() + added[perspective].size();
+        std::vector<std::uint16_t> missing;
+        std::set_difference(removed[perspective].begin(),
+                            removed[perspective].end(), local_removed.begin(),
+                            local_removed.end(), std::back_inserter(missing));
+        touched_coverage_misses += missing.size();
+        missing.clear();
+        std::set_difference(added[perspective].begin(), added[perspective].end(),
+                            local_added.begin(), local_added.end(),
+                            std::back_inserter(missing));
+        touched_coverage_misses += missing.size();
+      }
+
+      ++moves_checked;
+      ++positions;
+      if (accumulator_mismatches) {
+        std::cout << "threat_sparse_mismatch game=" << game
+                  << " ply=" << ply << " move=" << move
+                  << " sfen=" << pos.sfen()
+                  << " accumulator_mismatches=" << accumulator_mismatches
+                  << std::endl;
+        return;
+      }
+
+      for (const Color perspective : {BLACK, WHITE}) {
+        before_indices[perspective] = after_indices[perspective];
+        before_edges[perspective] = after_edges[perspective];
+      }
+    }
+  }
+
+  const double perspective_positions = double(positions) * 2.0;
+  std::cout << "[Shogi Threat Sparse Prototype]" << std::endl
+            << "feature_count=" << FeatureCount
+            << " width=" << PrototypeWidth
+            << " games=" << requested_games
+            << " moves=" << moves_checked << std::endl
+            << "accumulator_mismatches=" << accumulator_mismatches
+            << " max_abs_diff=" << std::scientific
+            << max_accumulator_abs_diff << std::fixed << std::endl
+            << "effect_touched_coverage changed_edges=" << changed_edges
+            << " misses=" << touched_coverage_misses << std::endl
+            << "active_relations mean=" << total_active / perspective_positions
+            << " max=" << max_active << std::endl
+            << "dirty_indices removed_mean="
+            << total_removed / perspective_positions
+            << " added_mean=" << total_added / perspective_positions
+            << " max_total=" << max_dirty << std::endl
+            << "cost_ns_per_move fresh_enumeration_2states_x2perspectives="
+            << double(fresh_enumeration_ns) / moves_checked
+            << " sort_2states_x2perspectives="
+            << double(fresh_sort_ns) / moves_checked
+            << " oracle_multiset_diff=" << double(oracle_diff_ns) / moves_checked
+            << " accumulator_update_2x32="
+            << double(accumulator_update_ns) / moves_checked << std::endl
+            << "note=oracle_multiset_diff_is_a_correctness_scaffold_not_the_"
+               "production_dirty_extractor"
+            << std::endl;
+}
+
+namespace ThreatDirectTest {
+
+constexpr std::size_t FoldedWidth = 128;
+using FoldedAccumulator = std::array<std::int32_t, FoldedWidth>;
+
+struct DecodedDirty {
+  Square from;
+  Square to;
+  Piece attacker;
+  Piece target;
+  bool add;
+};
+
+inline DecodedDirty decode(const StateInfo::ThreatDirtyRecord record) {
+  const std::uint32_t value = record.packed;
+  return {Square(value & 0x7fu), Square((value >> 7) & 0x7fu),
+          Piece((value >> 14) & 0x1fu), Piece((value >> 19) & 0x1fu),
+          bool((value >> 24) & 1u)};
+}
+
+inline std::uint32_t logical_key(const DecodedDirty& edge) {
+  return std::uint32_t(edge.from)
+       | (std::uint32_t(edge.to) << 7)
+       | (std::uint32_t(edge.attacker) << 14)
+       | (std::uint32_t(edge.target) << 19);
+}
+
+inline std::vector<std::uint32_t> logical_keys(
+    const NnueShogiThreatSparse::Edge* edges,
+                                                const std::size_t count) {
+  std::vector<std::uint32_t> keys;
+  keys.reserve(count);
+  for (std::size_t i = 0; i < count; ++i)
+    keys.push_back(logical_edge_key(edges[i]));
+  std::sort(keys.begin(), keys.end());
+  return keys;
+}
+
+inline std::int16_t pseudo_weight(const std::size_t index,
+                                  const std::size_t channel) {
+  std::uint32_t x = std::uint32_t(index) * 0x9e3779b9u
+                  ^ std::uint32_t(channel + 1) * 0x85ebca6bu;
+  x ^= x >> 16;
+  x *= 0x7feb352du;
+  x ^= x >> 15;
+  return std::int16_t(int(x & 63u) - 32);
+}
+
+inline void refresh(const std::vector<std::int16_t>& table,
+                    const std::vector<std::uint16_t>& active,
+                    FoldedAccumulator& accumulator) {
+  accumulator.fill(0);
+  for (const auto index : active) {
+    const auto* row = table.data() + std::size_t(index) * FoldedWidth;
+    for (std::size_t channel = 0; channel < FoldedWidth; ++channel)
+      accumulator[channel] += row[channel];
+  }
+}
+
+inline void update_row_avx2(const std::int16_t* row,
+                            FoldedAccumulator& accumulator,
+                            const bool add) {
+#if defined(USE_AVX2)
+  for (std::size_t channel = 0; channel < FoldedWidth; channel += 16) {
+    const __m256i weights16 = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i*>(row + channel));
+    const __m128i low16 = _mm256_castsi256_si128(weights16);
+    const __m128i high16 = _mm256_extracti128_si256(weights16, 1);
+    const __m256i low32 = _mm256_cvtepi16_epi32(low16);
+    const __m256i high32 = _mm256_cvtepi16_epi32(high16);
+    __m256i acc0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
+        accumulator.data() + channel));
+    __m256i acc1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
+        accumulator.data() + channel + 8));
+    acc0 = add ? _mm256_add_epi32(acc0, low32)
+               : _mm256_sub_epi32(acc0, low32);
+    acc1 = add ? _mm256_add_epi32(acc1, high32)
+               : _mm256_sub_epi32(acc1, high32);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(
+        accumulator.data() + channel), acc0);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(
+        accumulator.data() + channel + 8), acc1);
+  }
+#else
+  for (std::size_t channel = 0; channel < FoldedWidth; ++channel)
+    accumulator[channel] += add ? row[channel] : -row[channel];
+#endif
+}
+
+inline void update_row_scaled_avx2(const std::int16_t* row,
+                                   FoldedAccumulator& accumulator,
+                                   const int signed_count) {
+#if defined(USE_AVX2)
+  const __m256i scale = _mm256_set1_epi32(signed_count);
+  for (std::size_t channel = 0; channel < FoldedWidth; channel += 16) {
+    const __m256i weights16 = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i*>(row + channel));
+    __m256i low32 = _mm256_cvtepi16_epi32(
+        _mm256_castsi256_si128(weights16));
+    __m256i high32 = _mm256_cvtepi16_epi32(
+        _mm256_extracti128_si256(weights16, 1));
+    low32 = _mm256_mullo_epi32(low32, scale);
+    high32 = _mm256_mullo_epi32(high32, scale);
+    __m256i acc0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
+        accumulator.data() + channel));
+    __m256i acc1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
+        accumulator.data() + channel + 8));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(
+        accumulator.data() + channel), _mm256_add_epi32(acc0, low32));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(
+        accumulator.data() + channel + 8), _mm256_add_epi32(acc1, high32));
+  }
+#else
+  for (std::size_t channel = 0; channel < FoldedWidth; ++channel)
+    accumulator[channel] += signed_count * row[channel];
+#endif
+}
+
+inline void update_compact_batch_avx2(
+    const std::vector<std::int16_t>& table,
+    const std::uint32_t* compact, const std::size_t count,
+    const Color perspective, FoldedAccumulator& accumulator) {
+#if defined(USE_AVX2)
+  // Keep half of the accumulator resident in registers across the complete
+  // dirty batch.  Eight accumulator YMM registers plus conversion temporaries
+  // fit without spills on AVX2, while eliminating per-record accumulator
+  // loads/stores.
+  for (std::size_t base = 0; base < FoldedWidth; base += 64) {
+    __m256i acc[8];
+    for (std::size_t lane = 0; lane < 8; ++lane)
+      acc[lane] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
+          accumulator.data() + base + lane * 8));
+    for (std::size_t i = 0; i < count; ++i) {
+      const auto packed = compact[i];
+      const auto index = std::uint16_t(
+          perspective == BLACK ? packed & 0x1fffu
+                               : (packed >> 13) & 0x1fffu);
+      const bool add = bool((packed >> 26) & 1u);
+      const auto* row = table.data() + std::size_t(index) * FoldedWidth + base;
+      for (std::size_t block = 0; block < 4; ++block) {
+        const __m256i weights16 = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(row + block * 16));
+        const __m256i low32 = _mm256_cvtepi16_epi32(
+            _mm256_castsi256_si128(weights16));
+        const __m256i high32 = _mm256_cvtepi16_epi32(
+            _mm256_extracti128_si256(weights16, 1));
+        acc[block * 2] = add
+            ? _mm256_add_epi32(acc[block * 2], low32)
+            : _mm256_sub_epi32(acc[block * 2], low32);
+        acc[block * 2 + 1] = add
+            ? _mm256_add_epi32(acc[block * 2 + 1], high32)
+            : _mm256_sub_epi32(acc[block * 2 + 1], high32);
+      }
+    }
+    for (std::size_t lane = 0; lane < 8; ++lane)
+      _mm256_storeu_si256(reinterpret_cast<__m256i*>(
+          accumulator.data() + base + lane * 8), acc[lane]);
+  }
+#else
+  for (std::size_t i = 0; i < count; ++i) {
+    const auto packed = compact[i];
+    const auto index = std::uint16_t(
+        perspective == BLACK ? packed & 0x1fffu
+                             : (packed >> 13) & 0x1fffu);
+    update_row_avx2(table.data() + std::size_t(index) * FoldedWidth,
+                    accumulator, bool((packed >> 26) & 1u));
+  }
+#endif
+}
+
+inline double percentile(std::vector<std::uint16_t> values, const double p) {
+  if (values.empty()) return 0.0;
+  std::sort(values.begin(), values.end());
+  const std::size_t index = std::min(values.size() - 1,
+      std::size_t(std::ceil(p * values.size())) - 1);
+  return values[index];
+}
+
+enum MoveKind : std::size_t { Normal, Drop, Capture, Promotion, MoveKindCount };
+inline MoveKind move_kind(const Move move, const Piece captured) {
+  if (move.is_drop()) return Drop;
+  if (captured != NO_PIECE) return Capture;
+  if (move.is_promote()) return Promotion;
+  return Normal;
+}
+
+}  // namespace ThreatDirectTest
+
+void TestShogiThreatDirectDirty(std::istream& stream) {
+  using namespace NnueShogiThreatSparse;
+  using namespace ThreatDirectTest;
+  std::uint64_t requested_games = 5500;
+  int max_ply = 1000;
+  stream >> requested_games >> max_ply;
+
+  std::vector<std::int16_t> table(FeatureCount * FoldedWidth);
+  for (std::size_t index = 0; index < FeatureCount; ++index)
+    for (std::size_t channel = 0; channel < FoldedWidth; ++channel)
+      table[index * FoldedWidth + channel] = pseudo_weight(index, channel);
+
+  Position pos;
+  StateInfo root_state;
+  std::vector<StateInfo> states(static_cast<std::size_t>(max_ply));
+  PRNG prng(UINT64_C(0x84d17ec7c0ffee1));
+  std::array<Edge, MaxRelations> before_edges{};
+  std::array<Edge, MaxRelations> after_edges{};
+  FoldedAccumulator incremental[COLOR_NB]{};
+  FoldedAccumulator precomputed_incremental[COLOR_NB]{};
+  FoldedAccumulator aggregated_incremental[COLOR_NB]{};
+  std::vector<std::uint16_t> dirty_counts;
+  std::vector<std::uint16_t> dirty_by_kind[MoveKindCount];
+  std::vector<std::uint16_t> dirty_promotion_all;
+  std::vector<std::uint16_t> unique_compact_black;
+  std::vector<std::uint16_t> unique_compact_white;
+  std::vector<std::uint16_t> net_compact_black;
+  std::vector<std::uint16_t> net_compact_white;
+
+  std::uint64_t moves_checked = 0;
+  std::uint64_t direct_misses = 0;
+  std::uint64_t accumulator_misses = 0;
+  std::uint64_t overflows = 0;
+  std::uint64_t full_refreshes = 0;
+  std::uint64_t extraction_ns = 0;
+  std::uint64_t publish_ns = 0;
+  std::uint64_t source_cycles[4]{};
+  std::uint64_t source_records[3]{};
+  std::uint64_t extraction_by_kind_ns[MoveKindCount]{};
+  std::uint64_t publish_by_kind_ns[MoveKindCount]{};
+  std::uint64_t update_ns = 0;
+  std::uint64_t precompute_record_ns = 0;
+  std::uint64_t precomputed_update_ns = 0;
+  std::uint64_t aggregated_update_ns = 0;
+  std::uint64_t refresh_ns = 0;
+  std::uint64_t max_abs_accumulator = 0;
+  std::uint64_t kind_count[MoveKindCount]{};
+  std::uint64_t promotion_all_count = 0;
+  std::uint64_t ray_moves = 0;
+  std::uint64_t horse_dragon_moves = 0;
+  std::uint64_t friendly_defense_moves = 0;
+  std::uint64_t mutual_relation_moves = 0;
+
+  for (std::uint64_t game = 0; game < requested_games; ++game) {
+    pos.set_hirate(&root_state);
+    std::size_t before_count = generate_edges(pos, BLACK, before_edges.data(),
+                                               before_edges.size());
+    if (before_count > before_edges.size()) {
+      std::cout << "error: threat edge capacity" << std::endl;
+      return;
+    }
+    for (const Color perspective : {BLACK, WHITE}) {
+      std::array<Edge, MaxRelations> initial_edges{};
+      const auto count = generate_edges(pos, perspective, initial_edges.data(),
+                                        initial_edges.size());
+      refresh(table, sorted_indices(initial_edges.data(), count),
+              incremental[perspective]);
+      precomputed_incremental[perspective] = incremental[perspective];
+      aggregated_incremental[perspective] = incremental[perspective];
+    }
+
+    for (int ply = 0; ply < max_ply; ++ply) {
+      MoveList<LEGAL_ALL> moves(pos);
+      if (moves.size() == 0) break;
+      const Move move = moves.begin()[prng.rand(moves.size())];
+      const Piece captured = pos.piece_on(move.to_sq());
+      const MoveKind kind = move_kind(move, captured);
+      const Square changed_from = move.is_drop() ? SQ_NB : move.from_sq();
+      const Square changed_to = move.to_sq();
+      const auto before_keys = logical_keys(before_edges.data(), before_count);
+
+      pos.do_move(move, states[ply]);
+      const auto& dirty = pos.state()->threatDirty;
+      const auto& timing = NnueThreatDirectDirty::last_timing();
+      extraction_ns += timing.extraction_ns;
+      publish_ns += timing.publish_ns;
+      extraction_by_kind_ns[kind] += timing.extraction_ns;
+      publish_by_kind_ns[kind] += timing.publish_ns;
+      source_cycles[0] += timing.outgoing_cycles;
+      source_cycles[1] += timing.incoming_cycles;
+      source_cycles[2] += timing.ray_cycles;
+      source_cycles[3] += timing.construction_cycles;
+      source_records[0] += timing.outgoing_records;
+      source_records[1] += timing.incoming_records;
+      source_records[2] += timing.ray_records;
+      overflows += dirty.overflow;
+      full_refreshes += dirty.full_refresh;
+      dirty_counts.push_back(dirty.count);
+      dirty_by_kind[kind].push_back(dirty.count);
+      ++kind_count[kind];
+      if (move.is_promote()) {
+        dirty_promotion_all.push_back(dirty.count);
+        ++promotion_all_count;
+      }
+
+      const std::size_t after_count = generate_edges(
+          pos, BLACK, after_edges.data(), after_edges.size());
+      const auto after_keys = logical_keys(after_edges.data(), after_count);
+      auto reconstructed = before_keys;
+      bool ray = false;
+      bool horse_dragon = false;
+      bool friendly = false;
+      bool mutual = false;
+
+      if (!dirty.full_refresh) {
+        for (std::size_t i = 0; i < dirty.count; ++i) {
+          const auto edge = decode(dirty.records[i]);
+          const auto key = logical_key(edge);
+          if (edge.add)
+            reconstructed.push_back(key);
+          else {
+            const auto found = std::find(reconstructed.begin(),
+                                         reconstructed.end(), key);
+            if (found == reconstructed.end()) {
+              ++direct_misses;
+              break;
+            }
+            reconstructed.erase(found);
+          }
+
+          ray |= edge.from != changed_from && edge.from != changed_to
+              && edge.to != changed_from && edge.to != changed_to;
+          horse_dragon |= type_of(edge.attacker) == HORSE
+                       || type_of(edge.attacker) == DRAGON
+                       || type_of(edge.target) == HORSE
+                       || type_of(edge.target) == DRAGON;
+          friendly |= color_of(edge.attacker) == color_of(edge.target);
+        }
+      }
+
+      // Time only folded row add/sub. Exact-edge reconstruction and diagnostic
+      // classification above are intentionally outside this interval.
+      const auto update_started = std::chrono::steady_clock::now();
+      if (!dirty.full_refresh)
+        for (std::size_t i = 0; i < dirty.count; ++i) {
+          const auto edge = decode(dirty.records[i]);
+          for (const Color perspective : {BLACK, WHITE}) {
+            const auto index = feature_index(edge.attacker, edge.target,
+                edge.from, edge.to, perspective);
+            update_row_avx2(table.data() + std::size_t(index) * FoldedWidth,
+                            incremental[perspective], edge.add);
+          }
+        }
+      update_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - update_started).count();
+
+      // Alternative 4-byte record prototype:
+      // black index 13b | white index 13b | add 1b.  It has the same size as
+      // the logical record but moves feature_index() work into publication.
+      std::array<std::uint32_t, StateInfo::ThreatDirtyCapacity> compact{};
+      const auto precompute_started = std::chrono::steady_clock::now();
+      if (!dirty.full_refresh)
+        for (std::size_t i = 0; i < dirty.count; ++i) {
+          const auto edge = decode(dirty.records[i]);
+          std::uint16_t black, white;
+          feature_indices(edge.attacker, edge.target, edge.from, edge.to,
+                          black, white);
+          compact[i] = std::uint32_t(black)
+                     | (std::uint32_t(white) << 13)
+                     | (std::uint32_t(edge.add) << 26);
+        }
+      precompute_record_ns +=
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - precompute_started).count();
+
+      const auto precomputed_started = std::chrono::steady_clock::now();
+      if (!dirty.full_refresh)
+        for (const Color perspective : {BLACK, WHITE})
+          update_compact_batch_avx2(table, compact.data(), dirty.count,
+                                    perspective,
+                                    precomputed_incremental[perspective]);
+      precomputed_update_ns +=
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - precomputed_started).count();
+
+      const auto aggregated_started = std::chrono::steady_clock::now();
+      if (!dirty.full_refresh)
+        for (const Color perspective : {BLACK, WHITE}) {
+          std::array<std::uint16_t, StateInfo::ThreatDirtyCapacity> indices{};
+          std::array<std::int8_t, StateInfo::ThreatDirtyCapacity> counts{};
+          std::size_t unique = 0;
+          for (std::size_t i = 0; i < dirty.count; ++i) {
+            const auto packed = compact[i];
+            const auto index = std::uint16_t(
+                perspective == BLACK ? packed & 0x1fffu
+                                     : (packed >> 13) & 0x1fffu);
+            const int sign = ((packed >> 26) & 1u) ? 1 : -1;
+            std::size_t slot = 0;
+            while (slot < unique && indices[slot] != index) ++slot;
+            if (slot == unique) {
+              indices[unique] = index;
+              counts[unique] = 0;
+              ++unique;
+            }
+            counts[slot] = std::int8_t(int(counts[slot]) + sign);
+          }
+          std::size_t net = 0;
+          for (std::size_t slot = 0; slot < unique; ++slot)
+            if (counts[slot]) {
+              update_row_scaled_avx2(
+                  table.data() + std::size_t(indices[slot]) * FoldedWidth,
+                  aggregated_incremental[perspective], counts[slot]);
+              ++net;
+            }
+          (perspective == BLACK ? unique_compact_black
+                                : unique_compact_white).push_back(
+                                    std::uint16_t(unique));
+          (perspective == BLACK ? net_compact_black
+                                : net_compact_white).push_back(
+                                    std::uint16_t(net));
+        }
+      aggregated_update_ns +=
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - aggregated_started).count();
+
+      std::sort(reconstructed.begin(), reconstructed.end());
+      if (!dirty.full_refresh && reconstructed != after_keys) {
+        ++direct_misses;
+        std::cout << "threat_direct_mismatch game=" << game
+                  << " ply=" << ply << " move=" << move
+                  << " move_type=" << (kind == Drop ? "drop" :
+                      kind == Capture ? "capture" :
+                      kind == Promotion ? "promotion" : "normal")
+                  << " sfen_after=" << pos.sfen()
+                  << " dirty_count=" << dirty.count << std::endl;
+        std::cout << "fresh_removed_added:";
+        std::vector<std::uint32_t> oracle_removed, oracle_added;
+        std::set_difference(before_keys.begin(), before_keys.end(),
+            after_keys.begin(), after_keys.end(),
+            std::back_inserter(oracle_removed));
+        std::set_difference(after_keys.begin(), after_keys.end(),
+            before_keys.begin(), before_keys.end(),
+            std::back_inserter(oracle_added));
+        for (const auto key : oracle_removed) std::cout << " -" << key;
+        for (const auto key : oracle_added) std::cout << " +" << key;
+        std::cout << "\ndirect_dirty:";
+        for (std::size_t i = 0; i < dirty.count; ++i) {
+          const auto edge = decode(dirty.records[i]);
+          std::cout << (edge.add ? " +" : " -") << logical_key(edge)
+                    << "(a=" << int(edge.attacker)
+                    << ",t=" << int(edge.target)
+                    << ",from=" << edge.from << ",to=" << edge.to << ')';
+        }
+        std::cout << std::endl;
+        return;
+      }
+
+      // Confirm mutual relations touched by this move without an O(N^2) scan.
+      for (std::size_t i = 0; !mutual && i < dirty.count; ++i) {
+        const auto edge = decode(dirty.records[i]);
+        if (!edge.add) continue;
+        Edge reverse{edge.to, edge.from, edge.target, edge.attacker, 0};
+        mutual = std::binary_search(after_keys.begin(), after_keys.end(),
+                                    logical_edge_key(reverse));
+      }
+      ray_moves += ray;
+      horse_dragon_moves += horse_dragon;
+      friendly_defense_moves += friendly;
+      mutual_relation_moves += mutual;
+
+      const auto refresh_started = std::chrono::steady_clock::now();
+      for (const Color perspective : {BLACK, WHITE}) {
+        std::array<Edge, MaxRelations> fresh_edges{};
+        const auto count = generate_edges(pos, perspective, fresh_edges.data(),
+                                          fresh_edges.size());
+        FoldedAccumulator refreshed{};
+        refresh(table, sorted_indices(fresh_edges.data(), count), refreshed);
+        if (dirty.full_refresh)
+          incremental[perspective] = precomputed_incremental[perspective]
+              = aggregated_incremental[perspective] = refreshed;
+        else if (refreshed != incremental[perspective]
+                 || refreshed != precomputed_incremental[perspective]
+                 || refreshed != aggregated_incremental[perspective])
+          ++accumulator_misses;
+        for (const auto value : refreshed)
+          max_abs_accumulator = std::max<std::uint64_t>(
+              max_abs_accumulator, std::uint64_t(std::abs(value)));
+      }
+      refresh_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - refresh_started).count();
+      if (accumulator_misses) {
+        std::cout << "folded128_mismatch game=" << game << " ply=" << ply
+                  << " move=" << move << " sfen=" << pos.sfen() << std::endl;
+        return;
+      }
+
+      before_edges = after_edges;
+      before_count = after_count;
+      ++moves_checked;
+    }
+  }
+
+  // Evaluate-side residual add only: int32 accumulator into int32 L2 staging.
+  alignas(32) std::array<std::int32_t, FoldedWidth> base{};
+  alignas(32) std::array<std::int32_t, FoldedWidth> residual{};
+  for (std::size_t i = 0; i < FoldedWidth; ++i) {
+    base[i] = int(i * 3 + 7);
+    residual[i] = int(i % 17) - 8;
+  }
+  constexpr std::uint64_t ResidualRepeats = 2000000;
+  volatile std::int64_t residual_checksum = 0;
+  const auto residual_started = std::chrono::steady_clock::now();
+  for (std::uint64_t repeat = 0; repeat < ResidualRepeats; ++repeat) {
+#if defined(USE_AVX2)
+    for (std::size_t i = 0; i < FoldedWidth; i += 8) {
+      const __m256i lhs = _mm256_load_si256(
+          reinterpret_cast<const __m256i*>(base.data() + i));
+      const __m256i rhs = _mm256_load_si256(
+          reinterpret_cast<const __m256i*>(residual.data() + i));
+      const __m256i sum = _mm256_add_epi32(lhs, rhs);
+      residual_checksum += _mm256_extract_epi32(sum, 0);
+    }
+#else
+    for (std::size_t i = 0; i < FoldedWidth; ++i)
+      residual_checksum += base[i] + residual[i];
+#endif
+  }
+  const auto residual_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - residual_started).count();
+
+  auto print_distribution = [&](const char* label,
+                                const std::vector<std::uint16_t>& values) {
+    const double mean = values.empty() ? 0.0
+        : double(std::accumulate(values.begin(), values.end(), UINT64_C(0)))
+              / values.size();
+    std::cout << label << " n=" << values.size()
+              << " mean=" << mean
+              << " median=" << percentile(values, 0.5)
+              << " p90=" << percentile(values, 0.9)
+              << " p99=" << percentile(values, 0.99)
+              << " p99.9=" << percentile(values, 0.999)
+              << " max=" << (values.empty() ? 0
+                   : *std::max_element(values.begin(), values.end()))
+              << std::endl;
+  };
+
+  std::cout << "[Shogi Threat Direct Dirty / Folded128]" << std::endl
+            << "games=" << requested_games << " moves=" << moves_checked
+            << " fixed_seed=0x84d17ec7c0ffee1" << std::endl
+            << "direct_dirty_misses=" << direct_misses
+            << " folded128_misses=" << accumulator_misses
+            << " capacity64_overflows=" << overflows
+            << " full_refreshes=" << full_refreshes << std::endl;
+  print_distribution("dirty_all", dirty_counts);
+  print_distribution("dirty_normal", dirty_by_kind[Normal]);
+  print_distribution("dirty_drop", dirty_by_kind[Drop]);
+  print_distribution("dirty_capture", dirty_by_kind[Capture]);
+  print_distribution("dirty_promotion_non_capture", dirty_by_kind[Promotion]);
+  print_distribution("dirty_promotion_all", dirty_promotion_all);
+  print_distribution("unique_compact_black", unique_compact_black);
+  print_distribution("unique_compact_white", unique_compact_white);
+  print_distribution("net_compact_black", net_compact_black);
+  print_distribution("net_compact_white", net_compact_white);
+  const auto measured_profile_cycles = std::accumulate(
+      std::begin(source_cycles), std::end(source_cycles), UINT64_C(0));
+  const auto total_profile_cycles = std::max(UINT64_C(1), measured_profile_cycles);
+  std::cout << "coverage_moves drop=" << kind_count[Drop]
+            << " capture=" << kind_count[Capture]
+            << " promotion_all=" << promotion_all_count
+            << " ray_open_close=" << ray_moves
+            << " horse_dragon=" << horse_dragon_moves
+            << " friendly_defense=" << friendly_defense_moves
+            << " mutual_attack_positions=" << mutual_relation_moves
+            << std::endl
+            << "stateinfo sizeof=" << sizeof(StateInfo)
+            << " threat_dirty_state=" << sizeof(StateInfo::ThreatDirtyState)
+            << " record=" << sizeof(StateInfo::ThreatDirtyRecord)
+            << std::endl
+            << "folded_table bytes=" << table.size() * sizeof(table[0])
+            << " accumulator_int32_2persp_bytes="
+            << 2 * sizeof(FoldedAccumulator)
+            << " accumulator_int16_2persp_bytes="
+            << 2 * FoldedWidth * sizeof(std::int16_t)
+            << " observed_max_abs_acc=" << max_abs_accumulator
+            << " conservative_int16_bound=" << MaxRelations * 32
+            << std::endl
+            << "cost_ns_per_move dirty_extraction="
+            << double(extraction_ns) / moves_checked
+            << " dirty_publish=" << double(publish_ns) / moves_checked
+            << " folded128_avx2_update_2persp="
+            << double(update_ns) / moves_checked
+            << " precompute_2indices="
+            << double(precompute_record_ns) / moves_checked
+            << " precomputed_perspective_major_update="
+            << double(precomputed_update_ns) / moves_checked
+            << " aggregate_plus_update="
+            << double(aggregated_update_ns) / moves_checked
+            << " refresh_2persp=" << double(refresh_ns) / moves_checked
+            << " total_incremental="
+            << double(extraction_ns + publish_ns + update_ns) / moves_checked
+            << std::endl
+            << "source_profile cycles outgoing=" << source_cycles[0]
+            << '(' << 100.0 * source_cycles[0] / total_profile_cycles << "%)"
+            << " incoming=" << source_cycles[1]
+            << '(' << 100.0 * source_cycles[1] / total_profile_cycles << "%)"
+            << " ray=" << source_cycles[2]
+            << '(' << 100.0 * source_cycles[2] / total_profile_cycles << "%)"
+            << " match_publish=" << source_cycles[3]
+            << '(' << 100.0 * source_cycles[3] / total_profile_cycles << "%)"
+            << " records_per_move outgoing="
+            << double(source_records[0]) / moves_checked
+            << " incoming=" << double(source_records[1]) / moves_checked
+            << " ray=" << double(source_records[2]) / moves_checked
+            << std::endl
+            << "cost_ns_by_move_type extraction/publish normal="
+            << double(extraction_by_kind_ns[Normal]) / kind_count[Normal]
+            << '/' << double(publish_by_kind_ns[Normal]) / kind_count[Normal]
+            << " drop="
+            << double(extraction_by_kind_ns[Drop]) / kind_count[Drop]
+            << '/' << double(publish_by_kind_ns[Drop]) / kind_count[Drop]
+            << " capture="
+            << double(extraction_by_kind_ns[Capture]) / kind_count[Capture]
+            << '/' << double(publish_by_kind_ns[Capture]) / kind_count[Capture]
+            << " promotion_non_capture="
+            << double(extraction_by_kind_ns[Promotion]) / kind_count[Promotion]
+            << '/' << double(publish_by_kind_ns[Promotion]) / kind_count[Promotion]
+            << std::endl
+            << "evaluate_residual_add_128d_ns="
+            << double(residual_ns) / ResidualRepeats
+            << " checksum=" << residual_checksum << std::endl
+            << "perspective=fixed_BLACK_WHITE logical_dirty_generated_once"
+            << std::endl;
+}
+#endif
+
 }  // namespace
 
 // NNUE評価関数に関するUSI拡張コマンド
@@ -12036,6 +12889,22 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     TestPairRelationStages(pos);
   } else if (sub_command == "pair_relation_quantization") {
     TestPairRelationQuantization(stream);
+#endif
+#if defined(ENABLE_NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE)
+  } else if (sub_command == "threat_sparse_prototype") {
+    TestShogiThreatSparsePrototype(stream);
+  } else if (sub_command == "threat_sparse_direct") {
+    TestShogiThreatDirectDirty(stream);
+  } else if (sub_command == "threat_lazy_selftest") {
+    std::uint64_t games = 3000;
+    int max_ply = 1000;
+    stream >> games >> max_ply;
+    NnueThreatLazy::self_test(std::cout, games, max_ply);
+  } else if (sub_command == "threat_lazy_stats_reset") {
+    NnueThreatLazy::reset_all_statistics();
+    std::cout << "Shogi Threat lazy statistics reset." << std::endl;
+  } else if (sub_command == "threat_lazy_stats") {
+    NnueThreatLazy::print_statistics(std::cout);
 #endif
 #if defined(ENABLE_NNUE_DECISION_RISK_LMR_COUNTERS)
   } else if (sub_command == "decision_risk_lmr_counters_reset") {
@@ -12373,6 +13242,12 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << " test nnue pair_relation_selftest [repeats]" << std::endl;
     std::cout << " test nnue pair_relation_stages" << std::endl;
     std::cout << " test nnue pair_relation_quantization <sfenpack file>"
+              << std::endl;
+#endif
+#if defined(ENABLE_NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE)
+    std::cout << " test nnue threat_sparse_prototype [games] [max_ply]"
+              << std::endl;
+    std::cout << " test nnue threat_sparse_direct [games] [max_ply]"
               << std::endl;
 #endif
 #if defined(ENABLE_NNUE_DECISION_RISK_LMR_COUNTERS)

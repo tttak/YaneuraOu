@@ -23,6 +23,23 @@ namespace YaneuraOu {
 //     局面の情報
 // --------------------
 
+#if defined(ENABLE_NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE)
+namespace NnueThreatDirectDirty {
+struct Timing {
+	std::uint64_t extraction_ns;
+	std::uint64_t publish_ns;
+	std::uint64_t outgoing_cycles;
+	std::uint64_t incoming_cycles;
+	std::uint64_t ray_cycles;
+	std::uint64_t construction_cycles;
+	std::uint16_t outgoing_records;
+	std::uint16_t incoming_records;
+	std::uint16_t ray_records;
+};
+const Timing& last_timing();
+}
+#endif
+
 // StateInfo struct stores information needed to restore a Position object to
 // its previous state when we retract a move. Whenever a move is made on the
 // board (by calling Position::do_move), a StateInfo object must be passed.
@@ -197,6 +214,21 @@ struct StateInfo {
 
 #if defined(EVAL_NNUE)
 	Eval::NNUE::Accumulator accumulator;
+#endif
+
+#if defined(ENABLE_NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE)
+	// Experiment-only logical relation deltas. They are converted to fixed
+	// BLACK/WHITE feature indices when the folded accumulator is updated.
+	static constexpr std::size_t ThreatDirtyCapacity = 64;
+	struct ThreatDirtyRecord {
+		std::uint32_t packed;
+	};
+	struct ThreatDirtyState {
+		std::array<ThreatDirtyRecord, ThreatDirtyCapacity> records;
+		std::uint16_t count;
+		bool overflow;
+		bool full_refresh;
+	} threatDirty;
 #endif
 
 #if (defined(ENABLE_NNUE_BENCH) \

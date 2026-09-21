@@ -24,6 +24,9 @@
 #endif
 
 #include "evaluate_nnue.h"
+#if defined(ENABLE_NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE)
+#include "nnue_shogi_threat_lazy.h"
+#endif
 #if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
 #define NNUE_SIDE_INPUT_KING_SQUARE(pos, color) (pos).square<KING>(color)
 #define NNUE_SIDE_INPUT_NAMESPACE_BEGIN namespace YaneuraOu {
@@ -582,6 +585,12 @@ namespace {
 #endif
             return accumulator.score;
         }
+
+#if defined(ENABLE_NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE)
+        // Experiment-only shadow accumulator.  Its pseudo residual is never
+        // consumed by Network or the returned score.
+        NnueThreatLazy::on_evaluate(pos);
+#endif
 
         // L1パス用 (1280次元)
         alignas(kCacheLineSize) TransformedFeatureType

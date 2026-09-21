@@ -2,6 +2,11 @@
 #include <sstream>
 #include <cstring> // std::memset()
 #include <stack>
+#include <algorithm>
+#include <chrono>
+#if defined(ENABLE_NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE) && defined(USE_AVX2)
+#include <immintrin.h>
+#endif
 
 #include "position.h"
 #include "misc.h"
@@ -10,6 +15,9 @@
 #include "book/book.h"
 #include "movegen.h"
 #include "testcmd/unit_test.h"
+#if defined(ENABLE_NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE)
+#include "eval/nnue/nnue_shogi_threat_lazy.h"
+#endif
 
 #if defined(EVAL_KPPT) || defined(EVAL_KPP_KKPT) || defined(EVAL_NNUE)
 #include "eval/evaluate_common.h"
@@ -17,6 +25,274 @@
 
 using namespace std;
 namespace YaneuraOu {
+
+#if defined(ENABLE_NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE)
+namespace NnueThreatDirectDirty {
+namespace {
+
+struct LogicalEdge {
+    Square from;
+    Square to;
+    Piece attacker;
+    Piece target;
+};
+
+constexpr std::size_t LocalEdgeCapacity = 256;
+struct EdgeList {
+    std::array<LogicalEdge, LocalEdgeCapacity> edges{};
+    std::size_t count = 0;
+    bool overflow = false;
+};
+
+thread_local EdgeList before_edges;
+thread_local Square pending_from = SQ_NB;
+thread_local Square pending_to = SQ_NB;
+thread_local std::uint64_t before_extraction_ns = 0;
+thread_local Timing timing{};
+
+// Enable only in a dedicated source-profile build.  The production-candidate
+// timing below deliberately excludes six RDTSC pairs and per-edge counters.
+#if defined(ENABLE_NNUE_SHOGI_THREAT_SOURCE_PROFILE)
+constexpr bool DetailedSourceProfile = true;
+#else
+constexpr bool DetailedSourceProfile = false;
+#endif
+#if defined(ENABLE_NNUE_SHOGI_THREAT_DETAILED_TIMING)
+constexpr bool DetailedCostTiming = true;
+#else
+constexpr bool DetailedCostTiming = false;
+#endif
+
+inline std::uint64_t ticks() {
+#if defined(USE_AVX2)
+    return __rdtsc();
+#else
+    return 0;
+#endif
+}
+
+inline std::uint32_t edge_key(const LogicalEdge& edge) {
+    return std::uint32_t(edge.from)
+         | (std::uint32_t(edge.to) << 7)
+         | (std::uint32_t(edge.attacker) << 14)
+         | (std::uint32_t(edge.target) << 19);
+}
+
+inline bool edge_less(const LogicalEdge& lhs, const LogicalEdge& rhs) {
+    return edge_key(lhs) < edge_key(rhs);
+}
+
+inline bool edge_equal(const LogicalEdge& lhs, const LogicalEdge& rhs) {
+    return edge_key(lhs) == edge_key(rhs);
+}
+
+inline void append_unique(EdgeList& list, const LogicalEdge edge) {
+    const auto key = edge_key(edge);
+    for (std::size_t i = 0; i < list.count; ++i)
+        if (edge_key(list.edges[i]) == key)
+            return;
+    if (list.count == list.edges.size()) {
+        list.overflow = true;
+        return;
+    }
+    list.edges[list.count++] = edge;
+}
+
+inline void append_edge(const Position& pos, EdgeList& list,
+                        const Square from, const Square to) {
+    const Piece attacker = pos.piece_on(from);
+    const Piece target = pos.piece_on(to);
+    if (attacker != NO_PIECE && target != NO_PIECE)
+        append_unique(list, {from, to, attacker, target});
+}
+
+inline Square first_occupied_on_ray(const Square origin,
+                                    const Effect8::Direct direction,
+                                    const Bitboard& occupied) {
+    Bitboard endpoint = directEffect(origin, direction, occupied) & occupied;
+    return endpoint ? endpoint.pop() : SQ_NB;
+}
+
+inline void append_crossing_ray_edges(const Position& pos, EdgeList& result,
+                                       const Square changed,
+                                       std::uint16_t& records) {
+    // An occupied changed square blocks every relation crossing it. When it
+    // is empty, only the nearest occupied squares on opposite sides of each
+    // of the four lines can form an active crossing relation.
+    if (pos.piece_on(changed) != NO_PIECE)
+        return;
+    constexpr Effect8::Direct directions[4] = {
+        Effect8::DIRECT_R, Effect8::DIRECT_D,
+        Effect8::DIRECT_RD, Effect8::DIRECT_LD};
+    const Bitboard occupied = pos.pieces();
+    // LongEffect already encodes which slider rays actually cross this empty
+    // square.  A crossing Threat relation cannot exist on an inactive line,
+    // so avoid the two endpoint lookups for those (the common case).
+    const std::uint16_t le16 = pos.long_effect.long_effect16(changed);
+    const std::uint8_t active_directions =
+        std::uint8_t(le16 | (le16 >> 8));
+    for (const auto direction : directions) {
+        const auto opposite = ~direction;
+        const std::uint8_t line_mask = std::uint8_t(
+            (1u << unsigned(direction)) | (1u << unsigned(opposite)));
+        if (!(active_directions & line_mask))
+            continue;
+        const Square first = first_occupied_on_ray(changed, direction, occupied);
+        const Square second = first_occupied_on_ray(changed, opposite, occupied);
+        if (first == SQ_NB || second == SQ_NB)
+            continue;
+        if (effects_from(pos.piece_on(first), first, occupied) & second) {
+            append_edge(pos, result, first, second);
+            if constexpr (DetailedSourceProfile) ++records;
+        }
+        if (effects_from(pos.piece_on(second), second, occupied) & first) {
+            append_edge(pos, result, second, first);
+            if constexpr (DetailedSourceProfile) ++records;
+        }
+    }
+}
+
+// Exact local contract: all relations incident to a changed square plus every
+// slider relation whose open segment crosses it. No effect-count/touched mask
+// is used as a correctness premise.
+inline EdgeList collect_local(const Position& pos, const Square changed_from,
+                              const Square changed_to, Timing& profile) {
+    EdgeList result;
+    const Bitboard occupied = pos.pieces();
+    const std::array<Square, 2> changed{{changed_from, changed_to}};
+
+    auto started = DetailedSourceProfile ? ticks() : 0;
+    for (const Square square : changed) {
+        if (square == SQ_NB)
+            continue;
+        if (pos.piece_on(square) != NO_PIECE) {
+            Bitboard targets = effects_from(pos.piece_on(square), square,
+                                            occupied) & occupied;
+            while (targets) {
+                append_edge(pos, result, square, targets.pop());
+                if constexpr (DetailedSourceProfile) ++profile.outgoing_records;
+            }
+        }
+    }
+    if constexpr (DetailedSourceProfile)
+        profile.outgoing_cycles += ticks() - started;
+
+    started = DetailedSourceProfile ? ticks() : 0;
+    for (const Square square : changed) {
+        if (square == SQ_NB)
+            continue;
+        // Incoming relations require an actual target.  In the old generic
+        // collector attackers_to() was also evaluated for the vacated/empty
+        // endpoint and every result was discarded by append_edge().
+        if (pos.piece_on(square) == NO_PIECE)
+            continue;
+        Bitboard attackers = pos.attackers_to(square, occupied);
+        while (attackers) {
+            const Square attacker = attackers.pop();
+            // Outgoing from either changed square was already emitted above.
+            if (attacker == changed_from || attacker == changed_to)
+                continue;
+            append_edge(pos, result, attacker, square);
+            if constexpr (DetailedSourceProfile) ++profile.incoming_records;
+        }
+    }
+    if constexpr (DetailedSourceProfile)
+        profile.incoming_cycles += ticks() - started;
+
+    started = DetailedSourceProfile ? ticks() : 0;
+    for (const Square square : changed)
+        if (square != SQ_NB)
+            append_crossing_ray_edges(pos, result, square,
+                                      profile.ray_records);
+    if constexpr (DetailedSourceProfile)
+        profile.ray_cycles += ticks() - started;
+    return result;
+}
+
+inline StateInfo::ThreatDirtyRecord make_record(const LogicalEdge& edge,
+                                                 const bool add) {
+    return {edge_key(edge) | (std::uint32_t(add) << 24)};
+}
+
+}  // namespace
+
+void begin_move(const Position& pos, const Move move) {
+    timing = {};
+    std::chrono::steady_clock::time_point started{};
+    if constexpr (DetailedCostTiming)
+        started = std::chrono::steady_clock::now();
+    pending_from = move.is_drop() ? SQ_NB : move.from_sq();
+    pending_to = move.to_sq();
+    before_edges = collect_local(pos, pending_from, pending_to, timing);
+    if constexpr (DetailedCostTiming)
+        before_extraction_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count();
+}
+
+void finish_move(const Position& pos, StateInfo& state) {
+    std::chrono::steady_clock::time_point extraction_started{};
+    if constexpr (DetailedCostTiming)
+        extraction_started = std::chrono::steady_clock::now();
+    EdgeList after_edges = collect_local(pos, pending_from, pending_to, timing);
+    std::chrono::steady_clock::time_point extraction_finished{};
+    if constexpr (DetailedCostTiming)
+        extraction_finished = std::chrono::steady_clock::now();
+
+    auto& dirty = state.threatDirty;
+    dirty.count = 0;
+    dirty.overflow = before_edges.overflow || after_edges.overflow;
+    dirty.full_refresh = dirty.overflow;
+    if constexpr (DetailedCostTiming)
+        timing.extraction_ns = before_extraction_ns
+            + std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  extraction_finished - extraction_started).count();
+
+    std::chrono::steady_clock::time_point publish_started{};
+    if constexpr (DetailedCostTiming)
+        publish_started = std::chrono::steady_clock::now();
+    const auto construction_started = DetailedSourceProfile ? ticks() : 0;
+    std::array<bool, LocalEdgeCapacity> after_matched{};
+    auto publish = [&](const LogicalEdge& edge, const bool add) {
+        if (dirty.count == StateInfo::ThreatDirtyCapacity) {
+            dirty.overflow = true;
+            dirty.full_refresh = true;
+            dirty.count = 0;
+            return false;
+        }
+        dirty.records[dirty.count++] = make_record(edge, add);
+        return true;
+    };
+
+    for (std::size_t before = 0;
+         !dirty.overflow && before < before_edges.count; ++before) {
+        bool found = false;
+        for (std::size_t after = 0; after < after_edges.count; ++after) {
+            if (!after_matched[after]
+                && edge_equal(before_edges.edges[before],
+                              after_edges.edges[after])) {
+                after_matched[after] = true;
+                found = true;
+                break;
+            }
+        }
+        if (!found && !publish(before_edges.edges[before], false)) break;
+    }
+    for (std::size_t after = 0;
+         !dirty.overflow && after < after_edges.count; ++after)
+        if (!after_matched[after]
+            && !publish(after_edges.edges[after], true)) break;
+    if constexpr (DetailedSourceProfile)
+        timing.construction_cycles += ticks() - construction_started;
+    if constexpr (DetailedCostTiming)
+        timing.publish_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - publish_started).count();
+    NnueThreatLazy::on_dirty_published(dirty.count);
+}
+
+const Timing& last_timing() { return timing; }
+
+}  // namespace NnueThreatDirectDirty
+#endif
 
 #if !STOCKFISH
 using namespace Effect8;
@@ -1736,6 +2012,13 @@ void Position::do_move_impl(Move m, StateInfo& newSt, bool givesCheck, const T* 
 
 #endif
 
+#if defined(ENABLE_NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE)
+    // Bracket update_by_dropping/capturing/no_capturing and the LongEffect
+    // ray writes. The resulting logical dirty list is independent of
+    // effect_touched_any and is diagnostic-only.
+    NnueThreatDirectDirty::begin_move(*this, m);
+#endif
+
 #if defined(USE_PIECE_VALUE)
     // 駒割りの差分計算用
     int materialDiff;
@@ -2015,6 +2298,9 @@ void Position::do_move_impl(Move m, StateInfo& newSt, bool givesCheck, const T* 
             st->continuousCheck[Us] = 0;
         }
     }
+#if defined(ENABLE_NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE)
+    NnueThreatDirectDirty::finish_move(*this, *st);
+#endif
     // 非手番側のほうは関係ないので前ノードの値をそのまま受け継ぐ。
     //st->continuousCheck[them] = prev->continuousCheck[them];
     // 💡 memcpy()するので自動的にそうなっている。
@@ -2365,6 +2651,14 @@ void Position::do_null_move(StateInfo& newSt, const T& tt) {
 
 	newSt.previous = st;
     st             = &newSt;
+
+#if defined(ENABLE_NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE)
+    // Fixed BLACK/WHITE Threat features do not change on a null move.  The
+    // lazy accumulator can therefore copy/apply an empty delta from parent.
+    st->threatDirty.count = 0;
+    st->threatDirty.overflow = false;
+    st->threatDirty.full_refresh = false;
+#endif
 
 #if (defined(ENABLE_NNUE_BENCH) \
      || defined(USE_NNUE_KSDG3_EFFECT_TOUCHED_MASK)) \
