@@ -56,6 +56,15 @@ constexpr IndexType kHidden1Dims = 31;
 #if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL) && !defined(ENABLE_NNUE_SIGNAL_LOG)
 #error ENABLE_NNUE_UNCERTAINTY_SIGNAL requires ENABLE_NNUE_SIGNAL_LOG
 #endif
+#if defined(ENABLE_NNUE_PAIR_RELATION_SIDE_INPUT) \
+	&& !defined(NNUE_PAIR_RELATION_SCHEMA_V2) \
+	&& !defined(NNUE_PAIR_RELATION_SCHEMA_V3)
+#error Pair relation side input requires an explicit schema version
+#endif
+#if defined(NNUE_PAIR_RELATION_SCHEMA_V2) \
+	&& defined(NNUE_PAIR_RELATION_SCHEMA_V3)
+#error Pair relation schema v2 and v3 are mutually exclusive
+#endif
 #if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL) && !defined(USE_NNUE_FC1_WIDTH_64)
 #error ENABLE_NNUE_UNCERTAINTY_SIGNAL requires the FC1x64 architecture
 #endif
@@ -184,6 +193,29 @@ constexpr IndexType kHidden2Dims = 64;
 constexpr IndexType kHidden2Dims = 96;
 #endif
 
+#if defined(ENABLE_NNUE_PAIR_RELATION_POST_ACTIVATION_DIAGNOSTIC)
+struct PairPostActivationScaleStats {
+	std::uint64_t positions = 0;
+	std::uint64_t changed_positions = 0;
+	std::uint64_t changed_channels = 0;
+	std::uint64_t positive_changes = 0;
+	std::uint64_t negative_changes = 0;
+	std::uint64_t zero_boundary_changes = 0;
+	std::uint64_t high_boundary_changes = 0;
+	std::uint64_t clipped_zero_channels = 0;
+	std::uint64_t clipped_high_channels = 0;
+	std::array<std::uint64_t, 65> changed_histogram{};
+};
+struct PairPostActivationDiagnostic {
+	PairPostActivationScaleStats current{};
+	PairPostActivationScaleStats scale8{};
+	PairPostActivationScaleStats scale16{};
+	std::uint64_t baseline_clipped_zero_channels = 0;
+	std::uint64_t baseline_clipped_high_channels = 0;
+};
+inline PairPostActivationDiagnostic* pair_post_activation_diagnostic = nullptr;
+#endif
+
 // --- [追加] Router 層の型定義 ---
 using Router = Layers::AffineTransformExplicit<384, 32>;
 
@@ -250,6 +282,86 @@ struct Network {
 					row * kSideInputDimensions + column] * encoded[column];
 			residual[row] = value;
 		}
+	}
+#endif
+
+#if defined(ENABLE_NNUE_PAIR_RELATION_SIDE_INPUT)
+	static constexpr IndexType kPairRelationTypes = 784;
+	static constexpr IndexType kPairRelationDimensions = 32;
+#if defined(NNUE_PAIR_RELATION_SCHEMA_V3)
+	static constexpr float kPairRelationScale = 8.0f;
+#else
+	static constexpr float kPairRelationScale = 1.0f;
+#endif
+	std::array<float, kPairRelationTypes * kPairRelationDimensions>
+		pair_relation_embedding{};
+	std::array<float, kPairRelationDimensions> pair_relation_ln_weight{};
+	std::array<float, kPairRelationDimensions> pair_relation_ln_bias{};
+	std::array<float, kHidden2Dims * kPairRelationDimensions>
+		pair_relation_proj_weight{};
+	std::array<float, kHidden2Dims> pair_relation_proj_bias{};
+	float pair_relation_gate = -2.94443898f;
+
+	void ComputePairRelationStages(const std::uint16_t* indices,
+		const std::size_t count, float* pooled_out, float* normalized_out,
+		float* projected_out, float* gated_delta_out,
+		float* gate_out = nullptr) const {
+		float pooled[kPairRelationDimensions]{};
+		for (std::size_t item = 0; item < count; ++item) {
+			const IndexType index = indices[item];
+			if (index >= kPairRelationTypes)
+				continue;
+			for (IndexType column = 0; column < kPairRelationDimensions; ++column)
+				pooled[column] += pair_relation_embedding[
+					index * kPairRelationDimensions + column];
+		}
+		float mean = 0.0f;
+		for (float value : pooled)
+			mean += value;
+		mean /= kPairRelationDimensions;
+		float variance = 0.0f;
+		for (float value : pooled) {
+			const float centered = value - mean;
+			variance += centered * centered;
+		}
+		variance /= kPairRelationDimensions;
+		const float inverse_std = 1.0f / std::sqrt(variance + 1.0e-5f);
+		float normalized[kPairRelationDimensions];
+		for (IndexType column = 0; column < kPairRelationDimensions; ++column)
+			normalized[column] = (pooled[column] - mean) * inverse_std
+				* pair_relation_ln_weight[column]
+				+ pair_relation_ln_bias[column];
+		const float gate = 1.0f / (1.0f + std::exp(-pair_relation_gate));
+		if (gate_out)
+			*gate_out = gate;
+		if (pooled_out)
+			std::copy_n(pooled, kPairRelationDimensions, pooled_out);
+		if (normalized_out)
+			std::copy_n(normalized, kPairRelationDimensions, normalized_out);
+		for (IndexType row = 0; row < kHidden2Dims; ++row) {
+			float value = pair_relation_proj_bias[row];
+			for (IndexType column = 0; column < kPairRelationDimensions; ++column)
+				value += pair_relation_proj_weight[
+					row * kPairRelationDimensions + column] * normalized[column];
+			if (projected_out)
+				projected_out[row] = value;
+			if (gated_delta_out)
+				gated_delta_out[row] = kPairRelationScale * gate * value;
+		}
+	}
+
+	void ComputePairRelationDelta(const std::uint16_t* indices,
+		const std::size_t count, float* delta) const {
+#if defined(NNUE_PAIR_RELATION_FORCE_GATE0)
+		// Experiment-only inference ablation.  Keep every serialized/shared
+		// parameter intact while removing exactly the Pair residual.
+		std::fill_n(delta, kHidden2Dims, 0.0f);
+		(void)indices;
+		(void)count;
+#else
+		ComputePairRelationStages(indices, count, nullptr, nullptr, nullptr,
+			delta, nullptr);
+#endif
 	}
 #endif
 
@@ -407,13 +519,22 @@ struct Network {
 
 	static constexpr std::uint32_t GetHashValue() {
 #if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
-		return GetBaseHashValue() ^ 0x48414F52u;
+		constexpr std::uint32_t optional_hash = 0x48414F52u;
 #elif defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
-		return GetBaseHashValue() ^ 0x53414645u;
+		constexpr std::uint32_t optional_hash = 0x53414645u;
 #elif defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
-		return GetBaseHashValue() ^ 0x00554E43u;
+		constexpr std::uint32_t optional_hash = 0x00554E43u;
 #else
-		return GetBaseHashValue();
+		constexpr std::uint32_t optional_hash = 0u;
+#endif
+#if defined(ENABLE_NNUE_PAIR_RELATION_SIDE_INPUT)
+	#if defined(NNUE_PAIR_RELATION_SCHEMA_V3)
+		return GetBaseHashValue() ^ optional_hash ^ 0x50524938u;
+	#else
+		return GetBaseHashValue() ^ optional_hash ^ 0x50524932u;
+	#endif
+#else
+		return GetBaseHashValue() ^ optional_hash;
 #endif
 	}
 
@@ -454,6 +575,13 @@ struct Network {
 #if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
 		result += "-SideSafe8";
 #endif
+#if defined(ENABLE_NNUE_PAIR_RELATION_SIDE_INPUT)
+	#if defined(NNUE_PAIR_RELATION_SCHEMA_V3)
+		result += "-PairRel784x32-FC1PreR64-S8-v3";
+	#else
+		result += "-PairRel784x32-FC1PreR64-v2";
+	#endif
+#endif
 		return result;
 	}
 
@@ -481,6 +609,21 @@ struct Network {
 		            sizeof(side_input_residual_weight));
 		stream.read(reinterpret_cast<char*>(side_input_residual_bias.data()),
 		            sizeof(side_input_residual_bias));
+		if (!stream)
+			return Tools::ResultCode::FileMismatch;
+#endif
+#if defined(ENABLE_NNUE_PAIR_RELATION_SIDE_INPUT)
+		stream.read(reinterpret_cast<char*>(pair_relation_embedding.data()),
+		            sizeof(pair_relation_embedding));
+		stream.read(reinterpret_cast<char*>(pair_relation_ln_weight.data()),
+		            sizeof(pair_relation_ln_weight));
+		stream.read(reinterpret_cast<char*>(pair_relation_ln_bias.data()),
+		            sizeof(pair_relation_ln_bias));
+		stream.read(reinterpret_cast<char*>(pair_relation_proj_weight.data()),
+		            sizeof(pair_relation_proj_weight));
+		stream.read(reinterpret_cast<char*>(pair_relation_proj_bias.data()),
+		            sizeof(pair_relation_proj_bias));
+		stream.read(reinterpret_cast<char*>(&pair_relation_gate), sizeof(float));
 		if (!stream)
 			return Tools::ResultCode::FileMismatch;
 #endif
@@ -1099,6 +1242,10 @@ struct Network {
 #if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
 		, const std::uint16_t side_input_mask = 0
 #endif
+#if defined(ENABLE_NNUE_PAIR_RELATION_SIDE_INPUT)
+		, const std::uint16_t* pair_relation_indices = nullptr
+		, const std::size_t pair_relation_count = 0
+#endif
 	) const {
 		auto& buf = *reinterpret_cast<Buffer*>(buffer);
 
@@ -1495,6 +1642,66 @@ struct Network {
 
 		// --- 7. Deep Path 推論 ---
 		fc_1.Propagate(buf.l2_input, buf.fc_1_out);
+#if defined(ENABLE_NNUE_PAIR_RELATION_SIDE_INPUT)
+		float pair_delta[kHidden2Dims];
+		ComputePairRelationDelta(
+			pair_relation_indices, pair_relation_count, pair_delta);
+#if defined(ENABLE_NNUE_PAIR_RELATION_POST_ACTIVATION_DIAGNOSTIC)
+		if (pair_post_activation_diagnostic) {
+			constexpr float diag_pre_activation_scale =
+				127.0f * static_cast<float>(1 << kWeightScaleBits);
+			const auto collect = [&](const int scale,
+				PairPostActivationScaleStats& stats) {
+				std::uint32_t changed = 0;
+				for (IndexType row = 0; row < kHidden2Dims; ++row) {
+					const auto base = static_cast<std::int32_t>(std::clamp(
+						buf.fc_1_out[row] >> kWeightScaleBits, 0, 127));
+					const auto injected = buf.fc_1_out[row]
+						+ static_cast<std::int32_t>(std::round(
+							pair_delta[row] * diag_pre_activation_scale * scale));
+					const auto counterfactual = static_cast<std::int32_t>(
+						std::clamp(injected >> kWeightScaleBits, 0, 127));
+					stats.clipped_zero_channels += counterfactual == 0;
+					stats.clipped_high_channels += counterfactual == 127;
+					if (counterfactual != base) {
+						++changed;
+						stats.positive_changes += counterfactual > base;
+						stats.negative_changes += counterfactual < base;
+						stats.zero_boundary_changes +=
+							base == 0 || counterfactual == 0;
+						stats.high_boundary_changes +=
+							base == 127 || counterfactual == 127;
+					}
+				}
+				++stats.positions;
+				stats.changed_positions += changed != 0;
+				stats.changed_channels += changed;
+				++stats.changed_histogram[changed];
+			};
+			for (IndexType row = 0; row < kHidden2Dims; ++row) {
+				const auto base = static_cast<std::int32_t>(std::clamp(
+					buf.fc_1_out[row] >> kWeightScaleBits, 0, 127));
+				pair_post_activation_diagnostic->baseline_clipped_zero_channels += base == 0;
+				pair_post_activation_diagnostic->baseline_clipped_high_channels += base == 127;
+			}
+			collect(1, pair_post_activation_diagnostic->current);
+			collect(8, pair_post_activation_diagnostic->scale8);
+			collect(16, pair_post_activation_diagnostic->scale16);
+		}
+#endif
+		for (IndexType row = 0; row < kHidden2Dims; ++row) {
+			// fc_1_out is the pre-activation int32 value.  ac_1 converts it
+			// to the [0,127] activation domain by shifting kWeightScaleBits,
+			// so a Python-domain residual of 1.0 corresponds to
+			// 127 * 2^kWeightScaleBits here.
+			const float pre_activation_scale =
+				127.0f * static_cast<float>(1 << kWeightScaleBits);
+			buf.fc_1_out[row] += static_cast<std::int32_t>(
+				std::round(pair_delta[row] * pre_activation_scale));
+		}
+#endif
+		// Pair residual (when enabled) and the baseline affine output pass
+		// through the existing ClippedReLU exactly once.
 		ac_1.Propagate(buf.fc_1_out, buf.ac_1_out);
 #if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
 		if (signal) {

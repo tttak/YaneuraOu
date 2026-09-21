@@ -33,6 +33,9 @@
 #undef NNUE_SIDE_INPUT_NAMESPACE_BEGIN
 #undef NNUE_SIDE_INPUT_KING_SQUARE
 #endif
+#if defined(ENABLE_NNUE_PAIR_RELATION_SIDE_INPUT)
+#include "nnue_pair_relation.h"
+#endif
 
 namespace YaneuraOu::Eval::NNUE {
 extern int FV_SCALE;
@@ -629,6 +632,14 @@ namespace {
         network_buffer.phase_input[127] =
           static_cast<std::uint8_t>((bucket_id1 * 127) / 11);
 
+#if defined(ENABLE_NNUE_PAIR_RELATION_SIDE_INPUT)
+        std::array<std::uint16_t, NnuePairRelation::MaxRelations>
+          pair_relation_indices{};
+        const std::size_t pair_relation_count = std::min(
+          NnuePairRelation::generate(pos, pair_relation_indices.data(),
+                                     pair_relation_indices.size()),
+          pair_relation_indices.size());
+#endif
         const auto output = network[bucket_id2]->Propagate<true, true>(
           transformed_features, diff_transformed, abs_transformed, bucket_id1, buffer
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
@@ -640,6 +651,9 @@ namespace {
 #endif
 #if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
           , NnueSideInput::safe_escape_mask16(pos)
+#endif
+#if defined(ENABLE_NNUE_PAIR_RELATION_SIDE_INPUT)
+          , pair_relation_indices.data(), pair_relation_count
 #endif
         );
 

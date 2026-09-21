@@ -150,6 +150,41 @@ else ifneq ($(NNUE_SIDE_INPUT),NONE)
   $(error NNUE_SIDE_INPUT must be NONE or SAFE_ESCAPE)
 endif
 
+# Experiment-only exact direct attack/defense relation branch.  OFF leaves
+# the production architecture, hash, nn.bin layout and evaluation path intact.
+NNUE_PAIR_RELATION ?= NO
+ifeq ($(NNUE_PAIR_RELATION),YES)
+  CPPFLAGS += -DENABLE_NNUE_PAIR_RELATION_SIDE_INPUT
+  NNUE_PAIR_RELATION_SCHEMA ?= 3
+  ifeq ($(NNUE_PAIR_RELATION_SCHEMA),2)
+    CPPFLAGS += -DNNUE_PAIR_RELATION_SCHEMA_V2
+  else ifeq ($(NNUE_PAIR_RELATION_SCHEMA),3)
+    CPPFLAGS += -DNNUE_PAIR_RELATION_SCHEMA_V3
+  else
+    $(error NNUE_PAIR_RELATION_SCHEMA must be 2 or 3)
+  endif
+else ifneq ($(NNUE_PAIR_RELATION),NO)
+  $(error NNUE_PAIR_RELATION must be NO or YES)
+endif
+
+# Experiment-only inference ablation: load the complete Pair network but force
+# its residual contribution to exactly zero.  This remains fully compiled out
+# unless explicitly requested.
+NNUE_PAIR_RELATION_FORCE_GATE0 ?= NO
+ifeq ($(NNUE_PAIR_RELATION_FORCE_GATE0),YES)
+  CPPFLAGS += -DNNUE_PAIR_RELATION_FORCE_GATE0
+else ifneq ($(NNUE_PAIR_RELATION_FORCE_GATE0),NO)
+  $(error NNUE_PAIR_RELATION_FORCE_GATE0 must be NO or YES)
+endif
+
+# Experiment-only S=8/S=16 post-FC1-activation counterfactual diagnostic.
+NNUE_PAIR_RELATION_POST_ACTIVATION_DIAGNOSTIC ?= NO
+ifeq ($(NNUE_PAIR_RELATION_POST_ACTIVATION_DIAGNOSTIC),YES)
+  CPPFLAGS += -DENABLE_NNUE_PAIR_RELATION_POST_ACTIVATION_DIAGNOSTIC
+else ifneq ($(NNUE_PAIR_RELATION_POST_ACTIVATION_DIAGNOSTIC),NO)
+  $(error NNUE_PAIR_RELATION_POST_ACTIVATION_DIAGNOSTIC must be NO or YES)
+endif
+
 # Diagnostic-only concurrent Lazy SMP duplicate measurement.  OFF leaves no
 # hot-path branch, load, store, or counter.  SAMPLE_LOG2=3 means 1/8 of keys
 # touch the shared active table while all search() entries are counted locally.

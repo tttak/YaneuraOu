@@ -18,6 +18,9 @@
 #undef NNUE_SIDE_INPUT_NAMESPACE_BEGIN
 #undef NNUE_SIDE_INPUT_KING_SQUARE
 #endif
+#if defined(ENABLE_NNUE_PAIR_RELATION_SIDE_INPUT)
+#include "nnue_pair_relation.h"
+#endif
 #if defined(ENABLE_QSEARCH_CORRECTION_SHADOW)
 #include "qsearch_correction_shadow.h"
 #endif
@@ -11709,6 +11712,292 @@ void FindSideInputRecord(std::istream& stream) {
 }
 #endif
 
+#if defined(ENABLE_NNUE_PAIR_RELATION_SIDE_INPUT)
+void TestPairRelation(const Position& pos, const std::uint64_t repeats) {
+  std::array<std::uint16_t, NnuePairRelation::MaxRelations> indices{};
+  const auto generated = NnuePairRelation::generate(
+      pos, indices.data(), indices.size());
+  const auto count = std::min(generated, indices.size());
+  std::cout << "pair_relation count=" << count;
+  if (generated > indices.size())
+    std::cout << " truncated_from=" << generated;
+  std::cout << " indices=";
+  for (std::size_t i = 0; i < count; ++i)
+    std::cout << (i ? "," : "") << indices[i];
+  std::cout << std::endl;
+
+  volatile std::uint64_t checksum = 0;
+  const auto generation_start = std::chrono::steady_clock::now();
+  for (std::uint64_t i = 0; i < repeats; ++i)
+    checksum += NnuePairRelation::generate(
+        pos, indices.data(), indices.size());
+  const auto generation_end = std::chrono::steady_clock::now();
+  std::array<float, 64> delta{};
+  const auto projection_start = std::chrono::steady_clock::now();
+  for (std::uint64_t i = 0; i < repeats; ++i) {
+    network[0]->ComputePairRelationDelta(indices.data(), count, delta.data());
+    checksum += static_cast<std::uint64_t>(std::abs(delta[i % 64]) * 1000.0f);
+  }
+  const auto projection_end = std::chrono::steady_clock::now();
+  const auto generation_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      generation_end - generation_start).count();
+  const auto projection_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      projection_end - projection_start).count();
+  std::cout << "pair_relation_cost repeats=" << repeats
+            << " generation_ns=" << double(generation_ns) / repeats
+            << " aggregate_ln_proj_ns=" << double(projection_ns) / repeats
+            << " checksum=" << checksum << std::endl;
+}
+
+template <typename T, std::size_t N>
+void PrintPairVector(const char* name, const std::array<T, N>& values) {
+  std::cout << "pair_stage " << name << "=";
+  std::cout << std::setprecision(9);
+  for (std::size_t i = 0; i < N; ++i)
+    std::cout << (i ? "," : "") << +values[i];
+  std::cout << std::endl;
+}
+
+void TestPairRelationStages(const Position& pos) {
+  std::array<std::uint16_t, NnuePairRelation::MaxRelations> indices{};
+  const auto generated = NnuePairRelation::generate(
+      pos, indices.data(), indices.size());
+  const auto count = std::min(generated, indices.size());
+  std::array<float, 32> pooled{};
+  std::array<float, 32> normalized{};
+  std::array<float, 64> projected{};
+  std::array<float, 64> gated{};
+  float gate = 0.0f;
+  network[0]->ComputePairRelationStages(
+      indices.data(), count, pooled.data(), normalized.data(),
+      projected.data(), gated.data(), &gate);
+  std::cout << "pair_stage count=" << count << " indices=";
+  for (std::size_t i = 0; i < count; ++i)
+    std::cout << (i ? "," : "") << indices[i];
+  std::cout << std::endl;
+  PrintPairVector("embedding_sum", pooled);
+  PrintPairVector("layer_norm", normalized);
+  PrintPairVector("projection", projected);
+  std::cout << "pair_stage sigmoid_gate=" << std::setprecision(9) << gate
+            << std::endl;
+  PrintPairVector("pair_delta", gated);
+  std::array<std::int32_t, 64> injected_pre_activation{};
+  std::array<std::uint8_t, 64> injected_activation{};
+  constexpr float kPairPreActivationScale = 127.0f * 64.0f;
+  for (std::size_t i = 0; i < injected_pre_activation.size(); ++i) {
+    // A deterministic affine baseline spanning the unclipped and clipped
+    // regions makes the injection boundary independently testable.
+    const std::int32_t baseline = (static_cast<std::int32_t>(i) - 16) * 512;
+    injected_pre_activation[i] = baseline + static_cast<std::int32_t>(
+        std::round(gated[i] * kPairPreActivationScale));
+  }
+  for (std::size_t i = 0; i < injected_activation.size(); ++i)
+    injected_activation[i] = static_cast<std::uint8_t>(std::clamp(
+        injected_pre_activation[i] >> 6, 0, 127));
+  PrintPairVector("injected_pre_activation", injected_pre_activation);
+  PrintPairVector("activation_after_single_clip", injected_activation);
+  std::cout << "pair_stage final_eval_cp=" << Eval::evaluate(pos) << std::endl;
+}
+
+// Diagnostic-only corpus sweep for checking whether the very small learned
+// float residual survives conversion to the int32 FC1 pre-activation domain.
+// It does not alter the network, position, or search behavior.
+void TestPairRelationQuantization(std::istream& stream) {
+  std::string file_name;
+  stream >> file_name;
+  std::ifstream input(file_name, std::ios::binary);
+  if (!input) {
+    std::cout << "error: failed to open sfenpack file: " << file_name << std::endl;
+    return;
+  }
+
+  constexpr std::array<int, 6> kScales = {1, 2, 4, 8, 16, 32};
+  struct ScaleStats {
+    std::uint64_t all_zero_positions = 0;
+    std::uint64_t nonzero_channels = 0;
+    std::uint64_t hypothetical_full_range_clips = 0;
+    std::array<std::uint64_t, 65> nonzero_histogram{};
+    std::int32_t max_abs = 0;
+  };
+  std::array<ScaleStats, kScales.size()> scale_stats{};
+  std::uint64_t positions = 0;
+  std::uint64_t total_channels = 0;
+  long double raw_abs_sum = 0.0;
+  std::vector<float> raw_abs_delta;
+#if defined(ENABLE_NNUE_PAIR_RELATION_POST_ACTIVATION_DIAGNOSTIC)
+  PairPostActivationDiagnostic post_activation{};
+#endif
+  constexpr float kPairPreActivationScale = 127.0f * 64.0f;
+  MoveAccuracyRecord record{};
+  while (input.read(reinterpret_cast<char*>(&record), sizeof(record))) {
+    if (30000 < std::abs(static_cast<int>(record.score))
+        || record.game_result == 0)
+      continue;
+    Position pos;
+    StateInfo state;
+    if (pos.set_from_packed_sfen(record.sfen, &state, false).is_not_ok())
+      continue;
+    if (MoveList<LEGAL>(pos).size() == 0)
+      continue;
+
+    std::array<std::uint16_t, NnuePairRelation::MaxRelations> indices{};
+    const auto generated = NnuePairRelation::generate(
+        pos, indices.data(), indices.size());
+    const auto count = std::min(generated, indices.size());
+    std::array<float, 64> delta{};
+    network[0]->ComputePairRelationDelta(
+        indices.data(), count, delta.data());
+    for (const float value : delta) {
+      const float magnitude = std::abs(value);
+      raw_abs_sum += magnitude;
+      raw_abs_delta.push_back(magnitude);
+      ++total_channels;
+    }
+    for (std::size_t scale_index = 0; scale_index < kScales.size();
+         ++scale_index) {
+      auto& stats = scale_stats[scale_index];
+      std::uint32_t position_nonzero = 0;
+      for (const float value : delta) {
+        const auto quantized = static_cast<std::int32_t>(std::round(
+            value * kPairPreActivationScale * kScales[scale_index]));
+        const auto magnitude = static_cast<std::int32_t>(std::abs(quantized));
+        position_nonzero += quantized != 0;
+        stats.nonzero_channels += quantized != 0;
+        // The production injection is int32 and has no clip of its own.  This
+        // diagnostic counter asks whether the residual alone exceeds the
+        // entire 0..1 FC1 activation range (127 activation levels * Q6).
+        stats.hypothetical_full_range_clips +=
+            magnitude > static_cast<std::int32_t>(kPairPreActivationScale);
+        stats.max_abs = std::max(stats.max_abs, magnitude);
+      }
+      stats.all_zero_positions += position_nonzero == 0;
+      ++stats.nonzero_histogram[position_nonzero];
+    }
+#if defined(ENABLE_NNUE_PAIR_RELATION_POST_ACTIVATION_DIAGNOSTIC)
+    pair_post_activation_diagnostic = &post_activation;
+    (void) Eval::compute_eval(pos);
+    pair_post_activation_diagnostic = nullptr;
+#endif
+    ++positions;
+  }
+  if (positions == 0) {
+    std::cout << "error: no positions passed pair quantization filters"
+              << std::endl;
+    return;
+  }
+  std::sort(raw_abs_delta.begin(), raw_abs_delta.end());
+  const auto raw_percentile = [&](const double percentile) {
+    const auto index = static_cast<std::size_t>(std::floor(
+        percentile * static_cast<double>(raw_abs_delta.size() - 1)));
+    return raw_abs_delta[index];
+  };
+  const auto histogram_percentile = [&](const ScaleStats& stats,
+                                        const double percentile) {
+    const auto target = static_cast<std::uint64_t>(std::ceil(
+        percentile * static_cast<double>(positions)));
+    std::uint64_t cumulative = 0;
+    for (std::size_t value = 0; value < stats.nonzero_histogram.size(); ++value) {
+      cumulative += stats.nonzero_histogram[value];
+      if (cumulative >= target)
+        return value;
+    }
+    return stats.nonzero_histogram.size() - 1;
+  };
+  std::cout << std::fixed << std::setprecision(9)
+            << "pair_quant positions=" << positions << std::endl
+            << "pair_quant channels=" << total_channels << std::endl
+            << "pair_quant preactivation_fixed_lsb_python="
+            << 1.0 / kPairPreActivationScale << std::endl
+            << "pair_quant activation_output_lsb_python=" << 1.0 / 127.0
+            << std::endl
+            << "pair_quant injection_has_explicit_clip=0" << std::endl
+            << "pair_delta_abs mean="
+            << static_cast<double>(raw_abs_sum / total_channels)
+            << " p50=" << raw_percentile(0.50)
+            << " p90=" << raw_percentile(0.90)
+            << " p99=" << raw_percentile(0.99)
+            << " max=" << raw_abs_delta.back() << std::endl;
+  for (std::size_t scale_index = 0; scale_index < kScales.size();
+       ++scale_index) {
+    const auto& stats = scale_stats[scale_index];
+    std::cout << "pair_scale S=" << kScales[scale_index]
+              << " all64_zero=" << stats.all_zero_positions
+              << " all64_zero_rate="
+              << double(stats.all_zero_positions) / positions
+              << " mean_nonzero="
+              << double(stats.nonzero_channels) / positions
+              << " p50_nonzero=" << histogram_percentile(stats, 0.50)
+              << " p90_nonzero=" << histogram_percentile(stats, 0.90)
+              << " p99_nonzero=" << histogram_percentile(stats, 0.99)
+              << " max_abs_fixed=" << stats.max_abs
+              << " hypothetical_full_range_clip_rate="
+              << double(stats.hypothetical_full_range_clips) / total_channels
+              << std::endl;
+  }
+#if defined(ENABLE_NNUE_PAIR_RELATION_POST_ACTIVATION_DIAGNOSTIC)
+  const auto print_post_activation = [&](const int scale,
+      const PairPostActivationScaleStats& stats) {
+    const auto percentile = [&](const double p) {
+      const auto target = static_cast<std::uint64_t>(
+          std::ceil(p * static_cast<double>(stats.positions)));
+      std::uint64_t cumulative = 0;
+      for (std::size_t value = 0; value < stats.changed_histogram.size(); ++value) {
+        cumulative += stats.changed_histogram[value];
+        if (cumulative >= target)
+          return value;
+      }
+      return stats.changed_histogram.size() - 1;
+    };
+    const auto channels = stats.positions * 64;
+    std::cout << "pair_post_activation S=" << scale
+              << " positions=" << stats.positions
+              << " changed_positions=" << stats.changed_positions
+              << " changed_position_rate="
+              << double(stats.changed_positions) / stats.positions
+              << " mean_changed_channels="
+              << double(stats.changed_channels) / stats.positions
+              << " p50_changed=" << percentile(0.50)
+              << " p90_changed=" << percentile(0.90)
+              << " p99_changed=" << percentile(0.99)
+              << " max_changed=" << percentile(1.0)
+              << " positive_changes=" << stats.positive_changes
+              << " negative_changes=" << stats.negative_changes
+              << " zero_boundary_changes=" << stats.zero_boundary_changes
+              << " high_boundary_changes=" << stats.high_boundary_changes
+              << " clip_zero_rate="
+              << double(stats.clipped_zero_channels) / channels
+              << " clip_127_rate="
+              << double(stats.clipped_high_channels) / channels
+              << std::endl;
+  };
+  print_post_activation(1, post_activation.current);
+  const auto baseline_channels = post_activation.current.positions * 64;
+  std::cout << "pair_post_activation baseline"
+            << " clip_zero_rate="
+            << double(post_activation.baseline_clipped_zero_channels) /
+                   baseline_channels
+            << " clip_127_rate="
+            << double(post_activation.baseline_clipped_high_channels) /
+                   baseline_channels
+            << std::endl;
+  print_post_activation(8, post_activation.scale8);
+  print_post_activation(16, post_activation.scale16);
+#endif
+}
+#endif
+
+void TestFreshEvaluateCost(const Position& pos, const std::uint64_t repeats) {
+  volatile std::int64_t checksum = 0;
+  const auto started = std::chrono::steady_clock::now();
+  for (std::uint64_t i = 0; i < repeats; ++i)
+    checksum += static_cast<std::int64_t>(Eval::compute_eval(pos));
+  const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - started).count();
+  std::cout << "nnue_fresh_eval_cost repeats=" << repeats
+            << " ns_per_eval=" << double(elapsed) / repeats
+            << " checksum=" << checksum << std::endl;
+}
+
 }  // namespace
 
 // NNUE評価関数に関するUSI拡張コマンド
@@ -11724,6 +12013,10 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     TestAccumulator(pos);
   } else if (sub_command == "incremental_eval_checksum") {
     TestIncrementalEvalChecksum();
+  } else if (sub_command == "fresh_eval_cost") {
+    std::uint64_t repeats = 100000;
+    stream >> repeats;
+    TestFreshEvaluateCost(pos, repeats);
 #if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
   } else if (sub_command == "side_input_selftest") {
     std::uint64_t repeats = 100000;
@@ -11733,6 +12026,16 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     TestSideInputRecord(stream);
   } else if (sub_command == "side_input_find") {
     FindSideInputRecord(stream);
+#endif
+#if defined(ENABLE_NNUE_PAIR_RELATION_SIDE_INPUT)
+  } else if (sub_command == "pair_relation_selftest") {
+    std::uint64_t repeats = 100000;
+    stream >> repeats;
+    TestPairRelation(pos, repeats);
+  } else if (sub_command == "pair_relation_stages") {
+    TestPairRelationStages(pos);
+  } else if (sub_command == "pair_relation_quantization") {
+    TestPairRelationQuantization(stream);
 #endif
 #if defined(ENABLE_NNUE_DECISION_RISK_LMR_COUNTERS)
   } else if (sub_command == "decision_risk_lmr_counters_reset") {
@@ -12058,11 +12361,18 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << " test nnue test_features" << std::endl;
     std::cout << " test nnue test_accumulator" << std::endl;
     std::cout << " test nnue incremental_eval_checksum" << std::endl;
+    std::cout << " test nnue fresh_eval_cost [repeats]" << std::endl;
 #if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
     std::cout << " test nnue side_input_selftest [repeats]" << std::endl;
     std::cout << " test nnue side_input_record <packed.bin> [index]"
               << std::endl;
     std::cout << " test nnue side_input_find <packed.bin> <score> <ply> <mask>"
+              << std::endl;
+#endif
+#if defined(ENABLE_NNUE_PAIR_RELATION_SIDE_INPUT)
+    std::cout << " test nnue pair_relation_selftest [repeats]" << std::endl;
+    std::cout << " test nnue pair_relation_stages" << std::endl;
+    std::cout << " test nnue pair_relation_quantization <sfenpack file>"
               << std::endl;
 #endif
 #if defined(ENABLE_NNUE_DECISION_RISK_LMR_COUNTERS)
