@@ -146,8 +146,13 @@ endif
 NNUE_SIDE_INPUT ?= NONE
 ifeq ($(NNUE_SIDE_INPUT),SAFE_ESCAPE)
   CPPFLAGS += -DENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE
+else ifeq ($(NNUE_SIDE_INPUT),MOBILITY_TACTICAL_V1)
+  CPPFLAGS += -DENABLE_NNUE_SIDE_INPUT_MOBILITY_TACTICAL_V1
+else ifeq ($(NNUE_SIDE_INPUT),MOBILITY_TACTICAL_V2)
+  CPPFLAGS += -DENABLE_NNUE_SIDE_INPUT_MOBILITY_TACTICAL_V1
+  CPPFLAGS += -DNNUE_MOBILITY_TACTICAL_SCHEMA_V2
 else ifneq ($(NNUE_SIDE_INPUT),NONE)
-  $(error NNUE_SIDE_INPUT must be NONE or SAFE_ESCAPE)
+  $(error NNUE_SIDE_INPUT must be NONE, SAFE_ESCAPE, MOBILITY_TACTICAL_V1, or MOBILITY_TACTICAL_V2)
 endif
 
 # Experiment-only exact direct attack/defense relation branch.  OFF leaves
@@ -175,6 +180,26 @@ ifeq ($(NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE),YES)
   CPPFLAGS += -DENABLE_NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE
 else ifneq ($(NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE),NO)
   $(error NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE must be NO or YES)
+endif
+
+# Experiment 84 phase-1 only: diagnostic prototype for eight aggregated
+# mobility/tactical-availability scalars.  It does not alter NNUE evaluation,
+# serialization, architecture hashes, or production defaults.
+NNUE_MOBILITY_TACTICAL_PROTOTYPE ?= NO
+ifeq ($(NNUE_MOBILITY_TACTICAL_PROTOTYPE),YES)
+  CPPFLAGS += -DENABLE_NNUE_MOBILITY_TACTICAL_PROTOTYPE
+else ifneq ($(NNUE_MOBILITY_TACTICAL_PROTOTYPE),NO)
+  $(error NNUE_MOBILITY_TACTICAL_PROTOTYPE must be NO or YES)
+endif
+
+# Experiment-only direct-contribution ablation.  The mobility/tactical
+# architecture and serialized parameters are kept intact, but the residual
+# presented to the L2 input is forced to exactly zero.
+NNUE_MOBILITY_TACTICAL_FORCE_ZERO ?= NO
+ifeq ($(NNUE_MOBILITY_TACTICAL_FORCE_ZERO),YES)
+  CPPFLAGS += -DNNUE_MOBILITY_TACTICAL_FORCE_ZERO
+else ifneq ($(NNUE_MOBILITY_TACTICAL_FORCE_ZERO),NO)
+  $(error NNUE_MOBILITY_TACTICAL_FORCE_ZERO must be NO or YES)
 endif
 
 # Experiment-only inference ablation: load the complete Pair network but force

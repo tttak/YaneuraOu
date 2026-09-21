@@ -25,6 +25,10 @@
 #include "nnue_shogi_threat_lazy.h"
 #include "nnue_shogi_threat_sparse.h"
 #endif
+#if defined(ENABLE_NNUE_MOBILITY_TACTICAL_PROTOTYPE) \
+    || defined(ENABLE_NNUE_SIDE_INPUT_MOBILITY_TACTICAL_V1)
+#include "nnue_mobility_tactical.h"
+#endif
 #if defined(ENABLE_QSEARCH_CORRECTION_SHADOW)
 #include "qsearch_correction_shadow.h"
 #endif
@@ -60,6 +64,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstdint>
@@ -78,7 +83,8 @@
 #include <utility>
 #include <unordered_set>
 #include <vector>
-#if defined(ENABLE_NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE) && defined(USE_AVX2)
+#if (defined(ENABLE_NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE) \
+     || defined(ENABLE_NNUE_MOBILITY_TACTICAL_PROTOTYPE)) && defined(USE_AVX2)
 #include <immintrin.h>
 #endif
 
@@ -91,6 +97,16 @@
 #include <cstring>
 #include <memory>
 #include <system_error>
+#endif
+
+#if defined(ENABLE_NNUE_SIDE_INPUT_MOBILITY_TACTICAL_V1)
+// Compile the loader-local implementation as an independent reference inside
+// the diagnostic binary.  This catches drift between the Python loader ABI
+// and the production engine without sharing either implementation header.
+namespace MobilityTacticalLoaderReference {
+using namespace YaneuraOu;
+#include "../../../../lib/nnue_mobility_tactical.h"
+}  // namespace MobilityTacticalLoaderReference
 #endif
 
 #if defined(ENABLE_NNUE_BENCH)
@@ -110,6 +126,77 @@ struct MoveAccuracyRecord {
   s8 game_result;
   u8 padding;
 };
+
+#if defined(ENABLE_NNUE_SIDE_INPUT_MOBILITY_TACTICAL_V1)
+void DumpMobilityTacticalSideInput(const Position& pos) {
+  const auto raw = NnueMobilityTactical::extract(pos);
+  const auto normalized = NnueMobilityTactical::normalize(raw);
+  std::array<float, L2_INPUT_SIZE> residual{};
+  network[0]->ComputeMobilityTacticalResidual(
+      normalized.data(), residual.data());
+  std::cout << std::setprecision(9) << "mobility_tactical_raw";
+  for (const auto value : raw.value) std::cout << ',' << value;
+  std::cout << "\nmobility_tactical_normalized";
+  for (const auto value : normalized) std::cout << ',' << value;
+  std::cout << "\nmobility_tactical_residual";
+  for (const auto value : residual) std::cout << ',' << value;
+  std::cout << std::endl;
+}
+
+void CompareMobilityTacticalLoaderReference(std::istream& stream) {
+  std::string file_name;
+  std::uint64_t limit = 100000;
+  stream >> std::quoted(file_name) >> limit;
+  std::ifstream input(file_name, std::ios::binary);
+  if (!input) {
+    std::cout << "error: failed to open packed corpus: " << file_name
+              << std::endl;
+    return;
+  }
+  std::uint64_t checked = 0, decode_failed = 0, raw_mismatch = 0,
+                normalized_mismatch = 0;
+  float max_normalized_diff = 0.0f;
+  MoveAccuracyRecord record{};
+  while (checked < limit
+         && input.read(reinterpret_cast<char*>(&record), sizeof(record))) {
+    Position test_position;
+    StateInfo state;
+    if (test_position.set_from_packed_sfen(
+            record.sfen, &state, false, record.game_ply).is_not_ok()) {
+      ++decode_failed;
+      continue;
+    }
+    const auto engine_raw = NnueMobilityTactical::extract(test_position);
+    const auto loader_raw =
+        MobilityTacticalLoaderReference::NnueMobilityTactical::raw(
+            test_position);
+    const auto engine_normalized =
+        NnueMobilityTactical::normalize(engine_raw);
+    const auto loader_normalized =
+        MobilityTacticalLoaderReference::NnueMobilityTactical::normalize(
+            loader_raw);
+    bool raw_equal = true;
+    bool normalized_equal = true;
+    for (std::size_t index = 0; index < 8; ++index) {
+      raw_equal &= engine_raw.value[index] == loader_raw[index];
+      const float difference = std::abs(
+          engine_normalized[index] - loader_normalized[index]);
+      max_normalized_diff = std::max(max_normalized_diff, difference);
+      normalized_equal &= difference == 0.0f;
+    }
+    raw_mismatch += !raw_equal;
+    normalized_mismatch += !normalized_equal;
+    ++checked;
+  }
+  std::cout << "mobility_tactical_loader_reference checked=" << checked
+            << " decode_failed=" << decode_failed
+            << " raw_mismatch=" << raw_mismatch
+            << " normalized_mismatch=" << normalized_mismatch
+            << " max_normalized_diff=" << max_normalized_diff << std::endl;
+}
+#endif
+
+#include "nnue_mobility_tactical_tool.inc"
 
 #if defined(ENABLE_QSEARCH_CORRECTION_PROBE)
 #include "qsearch_correction_tool.inc"
@@ -12858,23 +12945,36 @@ void TestCommand(IEngine& engine, std::istream& stream) {
   std::string sub_command;
   stream >> sub_command;
 
-  auto& pos = engine.get_position();
+  // Position::set() and several NNUE diagnostics depend on state initialized
+  // by the engine's `isready` handler (threads and evaluation parameters).
+  // A clean executable previously dereferenced that state and raised an access
+  // violation when `test nnue ...` was sent before `isready`.
+  if (engine.get_threads().size() == 0) {
+    std::cout << "info string Error! : run isready before test nnue"
+              << std::endl;
+    return;
+  }
+
+  // Some diagnostic subcommands are self-contained and can run before
+  // they need the engine's root position. Do not touch it until such a command
+  // is dispatched.
+  const auto position = [&engine]() -> Position& { return engine.get_position(); };
 
   if (sub_command == "test_features") {
-    TestFeatures(pos);
+    TestFeatures(position());
   } else if (sub_command == "test_accumulator") {
-    TestAccumulator(pos);
+    TestAccumulator(position());
   } else if (sub_command == "incremental_eval_checksum") {
     TestIncrementalEvalChecksum();
   } else if (sub_command == "fresh_eval_cost") {
     std::uint64_t repeats = 100000;
     stream >> repeats;
-    TestFreshEvaluateCost(pos, repeats);
+    TestFreshEvaluateCost(position(), repeats);
 #if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
   } else if (sub_command == "side_input_selftest") {
     std::uint64_t repeats = 100000;
     stream >> repeats;
-    TestSideInput(pos, repeats);
+    TestSideInput(position(), repeats);
   } else if (sub_command == "side_input_record") {
     TestSideInputRecord(stream);
   } else if (sub_command == "side_input_find") {
@@ -12884,9 +12984,9 @@ void TestCommand(IEngine& engine, std::istream& stream) {
   } else if (sub_command == "pair_relation_selftest") {
     std::uint64_t repeats = 100000;
     stream >> repeats;
-    TestPairRelation(pos, repeats);
+    TestPairRelation(position(), repeats);
   } else if (sub_command == "pair_relation_stages") {
-    TestPairRelationStages(pos);
+    TestPairRelationStages(position());
   } else if (sub_command == "pair_relation_quantization") {
     TestPairRelationQuantization(stream);
 #endif
@@ -12905,6 +13005,22 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << "Shogi Threat lazy statistics reset." << std::endl;
   } else if (sub_command == "threat_lazy_stats") {
     NnueThreatLazy::print_statistics(std::cout);
+#endif
+#if defined(ENABLE_NNUE_MOBILITY_TACTICAL_PROTOTYPE)
+  } else if (sub_command == "mobility_tactical_selftest") {
+    TestMobilityTacticalSelftest();
+  } else if (sub_command == "mobility_tactical_corpus") {
+    TestMobilityTacticalCorpus(stream);
+  } else if (sub_command == "mobility_tactical_fusion_cost") {
+    TestMobilityTacticalFusionCost(stream);
+  } else if (sub_command == "mobility_tactical_export") {
+    ExportMobilityTacticalFeatures(stream);
+#endif
+#if defined(ENABLE_NNUE_SIDE_INPUT_MOBILITY_TACTICAL_V1)
+  } else if (sub_command == "mobility_tactical_side_input_dump") {
+    DumpMobilityTacticalSideInput(position());
+  } else if (sub_command == "mobility_tactical_loader_reference") {
+    CompareMobilityTacticalLoaderReference(stream);
 #endif
 #if defined(ENABLE_NNUE_DECISION_RISK_LMR_COUNTERS)
   } else if (sub_command == "decision_risk_lmr_counters_reset") {
@@ -12976,7 +13092,7 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     TestMoveAccuracy(engine, stream, true);
 #if defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
   } else if (sub_command == "uncertainty_head_selftest") {
-    TestUncertaintyHead(pos);
+    TestUncertaintyHead(position());
 #endif
 #if defined(ENABLE_NNUE_POLICY_SHADOW)
   } else if (sub_command == "policy_probe_selftest") {
@@ -12984,7 +13100,7 @@ void TestCommand(IEngine& engine, std::istream& stream) {
 #endif
 #if defined(ENABLE_NNUE_HAO_SEARCH_RISK_SIGNAL)
   } else if (sub_command == "hao_risk_head_selftest") {
-    TestHaoRiskHeads(pos);
+    TestHaoRiskHeads(position());
   } else if (sub_command == "hao_root_diagnostic_reset") {
     Search::NnueHaoRiskLog::ResetRootCompact();
     std::cout << "NNUE Hao root diagnostics reset." << std::endl;
@@ -13249,6 +13365,16 @@ void TestCommand(IEngine& engine, std::istream& stream) {
               << std::endl;
     std::cout << " test nnue threat_sparse_direct [games] [max_ply]"
               << std::endl;
+#endif
+#if defined(ENABLE_NNUE_MOBILITY_TACTICAL_PROTOTYPE)
+    std::cout << " test nnue mobility_tactical_selftest" << std::endl;
+    std::cout << " test nnue mobility_tactical_corpus <packed.bin> <records>"
+              << " <distribution.csv> <correlation.csv>"
+              << " [cost_positions] [cost_repeats]" << std::endl;
+    std::cout << " test nnue mobility_tactical_fusion_cost <packed.bin>"
+              << " [positions] [repeats]" << std::endl;
+    std::cout << " test nnue mobility_tactical_export <packed.bin>"
+              << " <features.f32> [records]" << std::endl;
 #endif
 #if defined(ENABLE_NNUE_DECISION_RISK_LMR_COUNTERS)
     std::cout << " test nnue decision_risk_lmr_counters_reset" << std::endl;

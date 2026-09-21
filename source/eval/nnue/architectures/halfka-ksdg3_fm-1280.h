@@ -282,6 +282,30 @@ struct Network {
 					row * kSideInputDimensions + column] * encoded[column];
 			residual[row] = value;
 		}
+}
+#endif
+
+#if defined(ENABLE_NNUE_SIDE_INPUT_MOBILITY_TACTICAL_V1)
+	static constexpr IndexType kMobilityTacticalDimensions = 8;
+#if defined(NNUE_MOBILITY_TACTICAL_SCHEMA_V2)
+	static constexpr float kMobilityTacticalScale = 8.0f;
+#else
+	static constexpr float kMobilityTacticalScale = 1.0f;
+#endif
+	std::array<float, L2_INPUT_SIZE * kMobilityTacticalDimensions>
+		mobility_tactical_weight{};
+	std::array<float, L2_INPUT_SIZE> mobility_tactical_bias{};
+
+	void ComputeMobilityTacticalResidual(const float* input,
+		float* residual) const {
+		for (IndexType row = 0; row < L2_INPUT_SIZE; ++row) {
+			float value = mobility_tactical_bias[row];
+			for (IndexType column = 0;
+				 column < kMobilityTacticalDimensions; ++column)
+				value += mobility_tactical_weight[
+					row * kMobilityTacticalDimensions + column] * input[column];
+			residual[row] = kMobilityTacticalScale * value;
+		}
 	}
 #endif
 
@@ -522,6 +546,12 @@ struct Network {
 		constexpr std::uint32_t optional_hash = 0x48414F52u;
 #elif defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
 		constexpr std::uint32_t optional_hash = 0x53414645u;
+#elif defined(ENABLE_NNUE_SIDE_INPUT_MOBILITY_TACTICAL_V1)
+	#if defined(NNUE_MOBILITY_TACTICAL_SCHEMA_V2)
+		constexpr std::uint32_t optional_hash = 0x4D543832u;
+	#else
+		constexpr std::uint32_t optional_hash = 0x4D543831u;
+	#endif
 #elif defined(ENABLE_NNUE_UNCERTAINTY_SIGNAL)
 		constexpr std::uint32_t optional_hash = 0x00554E43u;
 #else
@@ -575,6 +605,13 @@ struct Network {
 #if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
 		result += "-SideSafe8";
 #endif
+#if defined(ENABLE_NNUE_SIDE_INPUT_MOBILITY_TACTICAL_V1)
+	#if defined(NNUE_MOBILITY_TACTICAL_SCHEMA_V2)
+		result += "-SideMobTac8x128-S8-v2";
+	#else
+		result += "-SideMobTac8x128-v1";
+	#endif
+#endif
 #if defined(ENABLE_NNUE_PAIR_RELATION_SIDE_INPUT)
 	#if defined(NNUE_PAIR_RELATION_SCHEMA_V3)
 		result += "-PairRel784x32-FC1PreR64-S8-v3";
@@ -609,6 +646,14 @@ struct Network {
 		            sizeof(side_input_residual_weight));
 		stream.read(reinterpret_cast<char*>(side_input_residual_bias.data()),
 		            sizeof(side_input_residual_bias));
+		if (!stream)
+			return Tools::ResultCode::FileMismatch;
+#endif
+#if defined(ENABLE_NNUE_SIDE_INPUT_MOBILITY_TACTICAL_V1)
+		stream.read(reinterpret_cast<char*>(mobility_tactical_weight.data()),
+		            sizeof(mobility_tactical_weight));
+		stream.read(reinterpret_cast<char*>(mobility_tactical_bias.data()),
+		            sizeof(mobility_tactical_bias));
 		if (!stream)
 			return Tools::ResultCode::FileMismatch;
 #endif
@@ -1242,6 +1287,9 @@ struct Network {
 #if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
 		, const std::uint16_t side_input_mask = 0
 #endif
+#if defined(ENABLE_NNUE_SIDE_INPUT_MOBILITY_TACTICAL_V1)
+		, const float* mobility_tactical_input = nullptr
+#endif
 #if defined(ENABLE_NNUE_PAIR_RELATION_SIDE_INPUT)
 		, const std::uint16_t* pair_relation_indices = nullptr
 		, const std::size_t pair_relation_count = 0
@@ -1611,6 +1659,24 @@ struct Network {
 		for (IndexType row = 0; row < L2_INPUT_SIZE; ++row) {
 			const int adjusted = static_cast<int>(buf.l2_input[row])
 				+ static_cast<int>(std::round(side_residual[row] * 127.0f));
+			buf.l2_input[row] = static_cast<std::uint8_t>(
+				std::clamp(adjusted, 0, 127));
+		}
+#endif
+
+#if defined(ENABLE_NNUE_SIDE_INPUT_MOBILITY_TACTICAL_V1)
+		float mobility_tactical_residual[L2_INPUT_SIZE];
+		ComputeMobilityTacticalResidual(
+			mobility_tactical_input, mobility_tactical_residual);
+		for (IndexType row = 0; row < L2_INPUT_SIZE; ++row) {
+		#if defined(NNUE_MOBILITY_TACTICAL_FORCE_ZERO)
+			const int residual_fixed = 0;
+		#else
+			const int residual_fixed = static_cast<int>(std::round(
+				mobility_tactical_residual[row] * 127.0f));
+		#endif
+			const int adjusted = static_cast<int>(buf.l2_input[row])
+				+ residual_fixed;
 			buf.l2_input[row] = static_cast<std::uint8_t>(
 				std::clamp(adjusted, 0, 127));
 		}

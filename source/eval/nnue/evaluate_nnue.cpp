@@ -36,6 +36,9 @@
 #undef NNUE_SIDE_INPUT_NAMESPACE_BEGIN
 #undef NNUE_SIDE_INPUT_KING_SQUARE
 #endif
+#if defined(ENABLE_NNUE_SIDE_INPUT_MOBILITY_TACTICAL_V1)
+#include "nnue_mobility_tactical.h"
+#endif
 #if defined(ENABLE_NNUE_PAIR_RELATION_SIDE_INPUT)
 #include "nnue_pair_relation.h"
 #endif
@@ -649,6 +652,10 @@ namespace {
                                      pair_relation_indices.size()),
           pair_relation_indices.size());
 #endif
+#if defined(ENABLE_NNUE_SIDE_INPUT_MOBILITY_TACTICAL_V1)
+        const auto mobility_tactical_input = NnueMobilityTactical::normalize(
+          NnueMobilityTactical::extract(pos));
+#endif
         const auto output = network[bucket_id2]->Propagate<true, true>(
           transformed_features, diff_transformed, abs_transformed, bucket_id1, buffer
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
@@ -660,6 +667,9 @@ namespace {
 #endif
 #if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
           , NnueSideInput::safe_escape_mask16(pos)
+#endif
+#if defined(ENABLE_NNUE_SIDE_INPUT_MOBILITY_TACTICAL_V1)
+          , mobility_tactical_input.data()
 #endif
 #if defined(ENABLE_NNUE_PAIR_RELATION_SIDE_INPUT)
           , pair_relation_indices.data(), pair_relation_count
