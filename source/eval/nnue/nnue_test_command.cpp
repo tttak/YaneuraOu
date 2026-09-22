@@ -118,6 +118,86 @@ namespace Eval::NNUE {
 
 namespace {
 
+#if defined(NNUE_HALFKAHM2_SIMPLE)
+void DumpHalfKAHM2SimpleFeatures(const Position& pos) {
+  using SimpleFeature = Features::HalfKA_hm2<Features::Side::kFriend>;
+  constexpr int kFriendBand[9] = {0, 0, 0, 3, 3, 3, 6, 6, 6};
+  constexpr int kEnemyBand[9] = {0, 0, 0, 1, 1, 1, 2, 2, 2};
+
+  const Color stm = pos.side_to_move();
+  const Square friend_king = pos.square<KING>(stm);
+  const Square enemy_king = pos.square<KING>(~stm);
+  const int friend_rank = stm == BLACK ? rank_of(friend_king)
+                                       : rank_of(Inv(friend_king));
+  const int enemy_rank = stm == BLACK ? rank_of(Inv(enemy_king))
+                                      : rank_of(enemy_king);
+  const int bucket = kFriendBand[friend_rank] + kEnemyBand[enemy_rank];
+
+  std::cout << "simple_hm2 bucket " << bucket << std::endl;
+  for (const Color perspective : {BLACK, WHITE}) {
+    Features::IndexList active;
+    SimpleFeature::AppendActiveIndices(pos, perspective, &active);
+    std::vector<IndexType> sorted(active.begin(), active.end());
+    std::sort(sorted.begin(), sorted.end());
+    std::cout << "simple_hm2 " << (perspective == BLACK ? "BLACK" : "WHITE")
+              << " count " << sorted.size() << " indices";
+    for (const auto index : sorted)
+      std::cout << ' ' << index;
+    std::cout << std::endl;
+  }
+}
+
+template <typename T>
+void DumpHalfKAHM2SimpleVector(const char* name, const T* values,
+                              const std::size_t count) {
+  std::cout << "simple_hm2_stage " << name;
+  for (std::size_t i = 0; i < count; ++i)
+    std::cout << ',' << static_cast<std::int64_t>(values[i]);
+  std::cout << std::endl;
+}
+
+// Experiment 86: expose the exact integer stages of the Simple network.
+// This is a read-only test command and is not called by normal evaluation.
+void DumpHalfKAHM2SimpleStages(const Position& pos) {
+  constexpr int kFriendBand[9] = {0, 0, 0, 3, 3, 3, 6, 6, 6};
+  constexpr int kEnemyBand[9] = {0, 0, 0, 1, 1, 1, 2, 2, 2};
+  const Color stm = pos.side_to_move();
+  const Square friend_king = pos.square<KING>(stm);
+  const Square enemy_king = pos.square<KING>(~stm);
+  const int friend_rank = stm == BLACK ? rank_of(friend_king)
+                                       : rank_of(Inv(friend_king));
+  const int enemy_rank = stm == BLACK ? rank_of(Inv(enemy_king))
+                                      : rank_of(enemy_king);
+  const int bucket = kFriendBand[friend_rank] + kEnemyBand[enemy_rank];
+
+  alignas(kCacheLineSize) TransformedFeatureType
+      transformed[FeatureTransformer::kBufferSize];
+  feature_transformer->Transform(pos, transformed, true);
+  alignas(kCacheLineSize) char storage[Network::kBufferSize];
+  const auto* final_output = network[bucket]->Propagate(transformed, storage);
+  const auto& buffer = *reinterpret_cast<const Network::Buffer*>(storage);
+  const std::int32_t shortcut = buffer.fc0[15];
+  const std::int32_t deep = buffer.fc2[0] - shortcut;
+
+  std::cout << "simple_hm2_stage bucket," << bucket << std::endl;
+  DumpHalfKAHM2SimpleVector("ft", transformed, 1536);
+  DumpHalfKAHM2SimpleVector("fc0_pre", buffer.fc0, 16);
+  DumpHalfKAHM2SimpleVector("hidden_pre", buffer.fc0, 15);
+  DumpHalfKAHM2SimpleVector("shortcut", &shortcut, 1);
+  DumpHalfKAHM2SimpleVector("clipped", buffer.ac0, 15);
+  DumpHalfKAHM2SimpleVector("squared", buffer.concat, 15);
+  DumpHalfKAHM2SimpleVector("concat", buffer.concat, 30);
+  DumpHalfKAHM2SimpleVector("fc1_pre", buffer.fc1, 32);
+  DumpHalfKAHM2SimpleVector("fc1_activation", buffer.ac1, 32);
+  DumpHalfKAHM2SimpleVector("deep", &deep, 1);
+  DumpHalfKAHM2SimpleVector("final", final_output, 1);
+  const std::int32_t cp = final_output[0] / FV_SCALE;
+  DumpHalfKAHM2SimpleVector("cp", &cp, 1);
+
+  std::cout << "simple_hm2_stage fv_scale," << FV_SCALE << std::endl;
+}
+#endif
+
 struct MoveAccuracyRecord {
   PackedSfen sfen;
   s16 score;
@@ -12964,6 +13044,12 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     TestFeatures(position());
   } else if (sub_command == "test_accumulator") {
     TestAccumulator(position());
+#if defined(NNUE_HALFKAHM2_SIMPLE)
+  } else if (sub_command == "simple_hm2_features") {
+    DumpHalfKAHM2SimpleFeatures(position());
+  } else if (sub_command == "simple_hm2_stages") {
+    DumpHalfKAHM2SimpleStages(position());
+#endif
   } else if (sub_command == "incremental_eval_checksum") {
     TestIncrementalEvalChecksum();
   } else if (sub_command == "fresh_eval_cost") {
@@ -13345,6 +13431,9 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::cout << "usage:" << std::endl;
     std::cout << " test nnue test_features" << std::endl;
     std::cout << " test nnue test_accumulator" << std::endl;
+#if defined(NNUE_HALFKAHM2_SIMPLE)
+    std::cout << " test nnue simple_hm2_features" << std::endl;
+#endif
     std::cout << " test nnue incremental_eval_checksum" << std::endl;
     std::cout << " test nnue fresh_eval_cost [repeats]" << std::endl;
 #if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)

@@ -234,8 +234,10 @@ namespace NNUE {
     // 入力特徴量変換器
 	LargePagePtr<FeatureTransformer> feature_transformer;
 
+#if !defined(NNUE_HALFKAHM2_SIMPLE)
     // --- [追加] ルーター (全バケット共通) ---
     AlignedPtr<Router> router;
+#endif
 
     // 評価関数
 #if defined(SFNNwoPSQT)
@@ -249,12 +251,18 @@ namespace NNUE {
 
     // 評価関数の構造を表す文字列を取得する
     std::string GetArchitectureString() {
+#if defined(NNUE_HALFKAHM2_SIMPLE)
+        return "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
+               "[73305->1536x2],Network=SFNN-1536-HalfKAHM2-NoDG-v2"
+               "{LayerStack=9}";
+#else
         const std::string base = "Features=" + FeatureTransformer::GetStructureString() +
 			",Network=" + Network::GetStructureString();
 #if defined(SFNNwoPSQT)
 		return "ModelType=SFNNWithoutPsqt;" + base + "{LayerStack=" + std::to_string(kLayerStacks) + "}";
 #else
 		return base;
+#endif
 #endif
     }
 
@@ -319,7 +327,9 @@ namespace {
 		// 評価関数パラメータを初期化する
 		void Initialize() {
 			Detail::Initialize<FeatureTransformer>(feature_transformer);
+#if !defined(NNUE_HALFKAHM2_SIMPLE)
 			Detail::Initialize<Router>(router);
+#endif
 
 #if defined(SFNNwoPSQT)
 			for (int i = 0; i < kLayerStacks; ++i) {
@@ -368,6 +378,7 @@ namespace {
     		std::string architecture;
 		Tools::Result result = ReadHeader(stream, &hash_value, &architecture, nullptr);
 		if (result.is_not_ok()) return result;
+#if !defined(NNUE_HALFKAHM2_SIMPLE)
 #if defined(USE_NNUE_ABS_SQR_REMOVED_160)
 #if defined(USE_NNUE_LEGACY_PHASE6)
 		if (architecture.find("-L2x160-NoAbsSqr") == std::string::npos
@@ -428,6 +439,7 @@ namespace {
 			return Tools::ResultCode::FileMismatch;
 		}
 #endif
+#endif
 		if (hash_value != kHashValue) {
     			// hash check廃止: 警告のみ出力して続行する
     			sync_cout << "info string Warning: NNUE hash mismatch: expected " << kHashValue
@@ -435,7 +447,14 @@ namespace {
     				<< " arch_in_file=" << architecture
     				<< " arch_expected=" << GetArchitectureString()
     				<< sync_endl;
-    		}
+		}
+#if defined(NNUE_HALFKAHM2_SIMPLE)
+		if (architecture != GetArchitectureString()) {
+			sync_cout << "info string NNUE simple architecture mismatch: expected "
+				<< GetArchitectureString() << " got " << architecture << sync_endl;
+			return Tools::ResultCode::FileMismatch;
+		}
+#endif
     
     		result = Detail::ReadParameters<FeatureTransformer>(stream, feature_transformer);
     		if (result.is_not_ok()) {
@@ -443,10 +462,12 @@ namespace {
     			return result;
     		}
 
+#if !defined(NNUE_HALFKAHM2_SIMPLE)
 			// Router の読み込み
 			sync_cout << "router->ReadParameters(stream) START!!" << sync_endl;
 			router->ReadParameters(stream);
 			sync_cout << "router->ReadParameters(stream) END!!" << sync_endl;
+#endif
 
 #if defined(SFNNwoPSQT)
     		for (int i = 0; i < kLayerStacks; ++i) {
@@ -491,6 +512,16 @@ namespace {
 #if defined(SFNNwoPSQT)
     // レイヤースタックの選択。双方の玉の段に応じて9通りに分岐させる。
     static int stack_index_for_nnue(const Position& pos) {
+#if defined(NNUE_HALFKAHM2_SIMPLE)
+        constexpr int kFToIndex[] = { 0, 0, 0, 3, 3, 3, 6, 6, 6 };
+        constexpr int kEToIndex[] = { 0, 0, 0, 1, 1, 1, 2, 2, 2 };
+        const auto stm = pos.side_to_move();
+        const auto f_king = pos.square<KING>(stm);
+        const auto e_king = pos.square<KING>(~stm);
+        const auto f_rank = stm == BLACK ? rank_of(f_king) : rank_of(Inv(f_king));
+        const auto e_rank = stm == BLACK ? rank_of(Inv(e_king)) : rank_of(e_king);
+        return kFToIndex[f_rank] + kEToIndex[e_rank];
+#else
 /*
         constexpr int kFToIndex[] = { 0, 0, 0, 3, 3, 3, 6, 6, 6 };
         constexpr int kEToIndex[] = { 0, 0, 0, 1, 1, 1, 2, 2, 2 };
@@ -507,9 +538,11 @@ namespace {
         // 駒割りの差の絶対値から算出する
         constexpr int index[24] = {0, 1, 2, 3, 4, 5, 5, 6, 6, 7, 7, 8, 8, 8, 9, 9, 9, 9, 10, 10, 10, 10, 10, 11};
         return index[std::min((std::abs(pos.state()->materialValue) + 99) / 100, 23)];
+#endif
     }
 #endif
 
+#if !defined(NNUE_HALFKAHM2_SIMPLE)
     // Router による動的バケット選択を行うヘルパー関数
     inline int SelectBucketWithRouter(
         const std::uint8_t* router_input
@@ -573,6 +606,7 @@ namespace {
 
         return chosen_bucket;
     }
+#endif
 
     // 評価値を計算する
     static Value ComputeScore(const Position& pos, bool refresh = false) {
@@ -588,6 +622,20 @@ namespace {
 #endif
             return accumulator.score;
         }
+
+#if defined(NNUE_HALFKAHM2_SIMPLE)
+        alignas(kCacheLineSize) TransformedFeatureType
+            transformed_features[FeatureTransformer::kBufferSize];
+        feature_transformer->Transform(pos, transformed_features, refresh);
+        alignas(kCacheLineSize) char buffer[Network::kBufferSize];
+        const int bucket = stack_index_for_nnue(pos);
+        const auto output = network[bucket]->Propagate(transformed_features, buffer);
+        auto score = static_cast<Value>(output[0] / FV_SCALE);
+        score = Math::clamp(score, -VALUE_MAX_EVAL, VALUE_MAX_EVAL);
+        accumulator.score = score;
+        accumulator.computed_score = true;
+        return accumulator.score;
+#else
 
 #if defined(ENABLE_NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE)
         // Experiment-only shadow accumulator.  Its pseudo residual is never
@@ -720,6 +768,7 @@ namespace {
         SetLastNnueRouterLmrSignal(&accumulator.nnue_router_lmr_signal);
 #endif
         return accumulator.score;
+#endif
     }
 
 }  // namespace NNUE

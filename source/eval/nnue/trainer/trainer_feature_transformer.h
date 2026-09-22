@@ -8,7 +8,11 @@
 #if defined(EVAL_LEARN) && defined(EVAL_NNUE)
 
 #include "../../../learn/learn.h"
+#if defined(NNUE_HALFKAHM2_SIMPLE)
+#include "../nnue_feature_transformer_simple.h"
+#else
 #include "../nnue_feature_transformer.h"
+#endif
 #include "trainer.h"
 #include "features/factorizer_feature_set.h"
 

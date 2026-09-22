@@ -47,6 +47,10 @@
 // halfkp_1024x2-8-64型
 #include "architectures/halfkp_1024x2-8-64.h"
 
+#elif defined(YANEURAOU_ENGINE_NNUE_HALFKAHM2_SIMPLE_1536)
+
+#include "architectures/halfka_hm2_simple_1536.h"
+
 #elif defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536)
 
 // SFNN without Psqt 1536型

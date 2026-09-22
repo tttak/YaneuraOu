@@ -8,7 +8,11 @@
 
 #if defined(EVAL_NNUE)
 
+#if defined(NNUE_HALFKAHM2_SIMPLE)
+#include "nnue_feature_transformer_simple.h"
+#else
 #include "nnue_feature_transformer.h"
+#endif
 #include "nnue_architecture.h"
 //#include "../../misc.h"
 #include "../../memory.h"
@@ -20,7 +24,9 @@ namespace Eval::NNUE {
 
 	// Hash value of evaluation function structure
 	// 評価関数の構造のハッシュ値
-#if defined(SFNNwoPSQT)
+#if defined(NNUE_HALFKAHM2_SIMPLE)
+	constexpr std::uint32_t kHashValue = 0x74517600u;
+#elif defined(SFNNwoPSQT)
 	constexpr std::uint32_t kHashValue = 0x3c203b32u;
 #else
 	constexpr std::uint32_t kHashValue =
@@ -30,7 +36,8 @@ namespace Eval::NNUE {
 	// 入力特徴量変換器
 	extern LargePagePtr<FeatureTransformer> feature_transformer;
 
-#if defined(ENABLE_NNUE_TRACE) || defined(ENABLE_NNUE_BENCH)
+#if (defined(ENABLE_NNUE_TRACE) || defined(ENABLE_NNUE_BENCH)) \
+    && !defined(NNUE_HALFKAHM2_SIMPLE)
 	// Test-only access to the already loaded Router parameters.
 	extern AlignedPtr<Router> router;
 #endif

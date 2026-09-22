@@ -406,14 +406,16 @@
 
 // SFNNwoP1536ではFeatureTransformerのelement-wise multiply構成を標準使用する。
 // 比較・検証用buildではDISABLE_ELEMENT_WISE_MULTIPLYを定義して無効化できる。
-#if defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536) \
+#if (defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536) \
+	|| defined(YANEURAOU_ENGINE_NNUE_HALFKAHM2_SIMPLE_1536)) \
 	&& !defined(DISABLE_ELEMENT_WISE_MULTIPLY)
 	#define USE_ELEMENT_WISE_MULTIPLY
 #endif
 
 // SFNNwoP1536ではFinny Tablesを標準使用する。
 // 比較・検証用buildではDISABLE_FINNY_TABLESを定義して無効化できる。
-#if defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536) \
+#if (defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536) \
+	|| defined(YANEURAOU_ENGINE_NNUE_HALFKAHM2_SIMPLE_1536)) \
 	&& !defined(DISABLE_FINNY_TABLES)
 	#define USE_FINNY_TABLES
 #endif
@@ -913,9 +915,12 @@ constexpr bool pretty_jp = false;
 //     evaluate function
 // ----------------------------
 
-// HalfKA-KSDG3 FM 1280型
+// HalfKA-KSDG3 FM 1280型。Experiment 85 simple HalfKA_hm2 baseline
+// intentionally does not maintain persistent effect boards.
+#if !defined(NNUE_HALFKAHM2_SIMPLE)
 #define LONG_EFFECT_LIBRARY
 #define USE_BOARD_EFFECT_PREV
+#endif
 
 // Optional compact feature layout used by Experiment 69/70 variant D.
 // Default (undefined) remains production variant A: HalfKA + distinguish-golds.
@@ -925,7 +930,7 @@ constexpr bool pretty_jp = false;
 #define EXPERIMENT69_MERGE_GOLDS
 #endif
 
-#if !defined(EXPERIMENT69_MERGE_GOLDS)
+#if !defined(EXPERIMENT69_MERGE_GOLDS) && !defined(NNUE_HALFKAHM2_SIMPLE)
 #define DISTINGUISH_GOLDS
 #endif
 
