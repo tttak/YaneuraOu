@@ -13081,6 +13081,29 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::uint64_t repeats = 100000;
     stream >> repeats;
     TestFreshEvaluateCost(position(), repeats);
+#if defined(USE_EVAL_HASH) && defined(MEASURE_EVAL_HASH_BENCHMARK)
+  } else if (sub_command == "evalhash_reset") {
+    Eval::EvalHash_DiagnosticReset();
+    std::cout << "EvalHash diagnostics reset." << std::endl;
+  } else if (sub_command == "evalhash_report") {
+    Eval::EvalHash_DiagnosticReport();
+  } else if (sub_command == "evalhash_enable") {
+    int enabled = 1;
+    stream >> enabled;
+    Eval::EvalHash_SetDiagnosticEnabled(enabled != 0);
+    std::cout << "EvalHash diagnostic enabled " << (enabled != 0)
+              << std::endl;
+  } else if (sub_command == "evalhash_microbench") {
+    std::uint64_t repeats = 1000000;
+    stream >> repeats;
+    Eval::EvalHash_Microbench(repeats);
+#if defined(EVAL_HASH_ATOMIC64)
+  } else if (sub_command == "evalhash_atomic64_selftest") {
+    std::uint64_t trials = 1000000;
+    stream >> trials;
+    Eval::EvalHash_Atomic64Selftest(trials);
+#endif
+#endif
 #if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
   } else if (sub_command == "side_input_selftest") {
     std::uint64_t repeats = 100000;

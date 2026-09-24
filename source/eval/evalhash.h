@@ -3,6 +3,8 @@
 
 #include "../types.h"
 #include "../misc.h"
+#include <atomic>
+#include <new>
 
 namespace YaneuraOu {
 
@@ -42,12 +44,52 @@ struct HashTable
 
 	T* operator[] (const Key k) { return entries_ + (static_cast<size_t>(k) & (size - 1)); }
 	void clear(ThreadPool& threads) { Tools::memclear(threads, "eHash", entries_, size * sizeof(T)); }
+	size_t entry_count() const { return size; }
+	size_t byte_size() const { return size * sizeof(T); }
 
 private:
 
 	size_t size = 0;
 	T* entries_ = nullptr;
 };
+
+#if defined(EVAL_HASH_ATOMIC64)
+// A direct-mapped table whose complete shared entry is one atomic word.
+// It deliberately does not publish or protect any other object.
+struct Atomic64HashTable {
+    void resize(ThreadPool&, size_t mbSize) {
+        size_t requestedBytes = mbSize * 1024 * 1024;
+#if defined(EVAL_HASH_ATOMIC64_HALF_BYTES)
+        requestedBytes /= 2; // diagnostic: same entry count as old 16-byte table.
+#endif
+        size_t newCount = requestedBytes / sizeof(std::atomic<std::uint64_t>);
+        newCount = size_t(1) << MSB64(newCount);
+        if (newCount == size) return;
+        release();
+        size = newCount;
+        entries_ = static_cast<std::atomic<std::uint64_t>*>(
+          aligned_large_pages_alloc(size * sizeof(std::atomic<std::uint64_t>)));
+        for (size_t i=0;i<size;++i)
+            ::new (static_cast<void*>(entries_+i)) std::atomic<std::uint64_t>(0);
+    }
+    void clear(ThreadPool&) {
+        for (size_t i=0;i<size;++i) entries_[i].store(0, std::memory_order_relaxed);
+    }
+    void release() {
+        if (!entries_) return;
+        aligned_large_pages_free(entries_); entries_=nullptr; size=0;
+    }
+    ~Atomic64HashTable() { release(); }
+    std::atomic<std::uint64_t>& operator[](Key key) {
+        return entries_[static_cast<size_t>(key)&(size-1)];
+    }
+    size_t entry_count() const { return size; }
+    size_t byte_size() const { return size*sizeof(std::atomic<std::uint64_t>); }
+private:
+    size_t size=0;
+    std::atomic<std::uint64_t>* entries_=nullptr;
+};
+#endif
 
 } // namespace YaneuraOu
 

@@ -9,6 +9,11 @@
 #include <limits>
 #include <sstream>
 #include <vector>
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+#include <atomic>
+#include <chrono>
+#include <iomanip>
+#endif
 
 #define INCBIN_SILENCE_BITCODE_WARNING
 #include "../../incbin/incbin.h"
@@ -224,6 +229,10 @@ namespace {
 
 namespace YaneuraOu {
 namespace Eval {
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+void EvalHash_DiagnosticBeforeTransform(const Position& pos, bool refresh);
+void EvalHash_DiagnosticOnPropagate();
+#endif
 namespace NNUE {
 
 	int FV_SCALE = 16; // 水匠5では24がベストらしいのでエンジンオプション"FV_SCALE"で変更可能にした。
@@ -632,6 +641,9 @@ namespace {
 #if defined(NNUE_HALFKAHM2_SIMPLE)
         alignas(kCacheLineSize) TransformedFeatureType
             transformed_features[FeatureTransformer::kBufferSize];
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+        EvalHash_DiagnosticBeforeTransform(pos, refresh);
+#endif
         feature_transformer->Transform(pos, transformed_features, refresh);
         alignas(kCacheLineSize) char buffer[Network::kBufferSize];
         const int bucket = stack_index_for_nnue(pos);
@@ -644,6 +656,9 @@ namespace {
         // cohort, but deliberately keep `bucket` and the final score intact.
         if (bucket == 8)
             NnueKpProgressShadow::observe(pos);
+#endif
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+        EvalHash_DiagnosticOnPropagate();
 #endif
         const auto output = network[bucket]->Propagate(transformed_features, buffer);
         auto score = static_cast<Value>(output[0] / FV_SCALE);
@@ -832,14 +847,213 @@ struct alignas(16) ScoreKeyValue {
 
 struct EvaluateHashTable : HashTable<ScoreKeyValue> {};
 
-EvaluateHashTable g_evalTable;
-void EvalHash_Resize(size_t mbSize) { g_evalTable.resize(mbSize); }
-void EvalHash_Clear() { g_evalTable.clear(); };
+#if defined(EVAL_HASH_ATOMIC64)
+#ifndef EVAL_HASH_ATOMIC_TAG_BITS
+#define EVAL_HASH_ATOMIC_TAG_BITS 48
+#endif
+static_assert(EVAL_HASH_ATOMIC_TAG_BITS >= 1 && EVAL_HASH_ATOMIC_TAG_BITS <= 48);
+using EvaluateHashTableSelected = Atomic64HashTable;
+constexpr std::uint64_t kAtomicTagMask =
+  (UINT64_C(1) << EVAL_HASH_ATOMIC_TAG_BITS) - 1;
+inline std::uint64_t evalhash_tag(Key key) {
+    // One xor-fold is cheaper than a full hash and keeps tag bits from being a
+    // plain subset of the direct-map index bits.
+    const std::uint64_t mixed = key ^ (key >> 32);
+    return (mixed >> 16) & kAtomicTagMask;
+}
+inline std::uint16_t evalhash_encode_score(Value score) {
+    ASSERT_LV3(score >= VALUE_MIN_EVAL && score <= VALUE_MAX_EVAL);
+    const auto code = static_cast<std::uint16_t>(score + 32768);
+    ASSERT_LV3(code != 0); // packed==0 remains the empty sentinel.
+    return code;
+}
+inline Value evalhash_decode_score(std::uint16_t code) {
+    return static_cast<Value>(static_cast<int>(code) - 32768);
+}
+inline std::uint64_t evalhash_pack(Key key, Value score) {
+    return (evalhash_tag(key) << 16) | evalhash_encode_score(score);
+}
+inline bool evalhash_unpack(Key key, std::uint64_t packed, Value& score) {
+    if (!packed || (packed >> 16) != evalhash_tag(key)) return false;
+    score = evalhash_decode_score(static_cast<std::uint16_t>(packed));
+    return true;
+}
+#else
+using EvaluateHashTableSelected = EvaluateHashTable;
+#endif
+
+EvaluateHashTableSelected g_evalTable;
+#if defined(EVAL_HASH_DEFAULT_ON)
+bool g_evalHashRequested = true;
+#else
+bool g_evalHashRequested = false;
+#endif
+bool g_evalHashInitialized = false;
+void EvalHash_Resize(size_t mbSize) {
+    // A true default must not probe the table before isready has allocated it.
+    g_evalHashInitialized = false;
+    g_evalTable.resize(Threads, mbSize);
+}
+void EvalHash_Clear() {
+    g_evalTable.clear(Threads);
+    g_evalHashInitialized = true;
+};
+void EvalHash_SetEnabled(bool enabled) { g_evalHashRequested = enabled; }
+bool EvalHash_IsEnabled() { return g_evalHashRequested && g_evalHashInitialized; }
+
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+namespace {
+struct EvalHashDiagnosticCounters {
+    std::atomic<std::uint64_t> evaluate_calls{0};
+    std::atomic<std::uint64_t> accumulator_score_hits{0};
+    std::atomic<std::uint64_t> probes{0};
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> misses{0};
+    std::atomic<std::uint64_t> stores{0};
+    std::atomic<std::uint64_t> compute_score_calls{0};
+    std::atomic<std::uint64_t> transform_calls{0};
+    std::atomic<std::uint64_t> propagate_calls{0};
+    std::atomic<std::uint64_t> accumulator_already_computed{0};
+    std::atomic<std::uint64_t> accumulator_incremental_updates{0};
+    std::atomic<std::uint64_t> accumulator_refreshes{0};
+};
+EvalHashDiagnosticCounters g_evalHashDiagnostic;
+std::atomic<bool> g_evalHashDiagnosticEnabled{true};
+inline void diag_inc(std::atomic<std::uint64_t>& value) {
+    value.fetch_add(1, std::memory_order_relaxed);
+}
+}
+
+void EvalHash_DiagnosticBeforeTransform(const Position& pos, bool refresh) {
+    auto& d = g_evalHashDiagnostic;
+    diag_inc(d.transform_calls);
+    const auto* now = pos.state();
+    if (!refresh && now->accumulator.computed_accumulation)
+        diag_inc(d.accumulator_already_computed);
+    else if (!refresh && now->previous && now->previous->accumulator.computed_accumulation)
+        diag_inc(d.accumulator_incremental_updates);
+    else
+        diag_inc(d.accumulator_refreshes);
+}
+
+void EvalHash_DiagnosticOnPropagate() {
+    diag_inc(g_evalHashDiagnostic.propagate_calls);
+}
+
+void EvalHash_SetDiagnosticEnabled(bool enabled) {
+    g_evalHashDiagnosticEnabled.store(enabled, std::memory_order_relaxed);
+}
+
+void EvalHash_DiagnosticReset() {
+    auto& d = g_evalHashDiagnostic;
+    d.evaluate_calls=0; d.accumulator_score_hits=0; d.probes=0;
+    d.hits=0; d.misses=0; d.stores=0; d.compute_score_calls=0;
+    d.transform_calls=0; d.propagate_calls=0;
+    d.accumulator_already_computed=0; d.accumulator_incremental_updates=0;
+    d.accumulator_refreshes=0;
+}
+
+void EvalHash_DiagnosticReport() {
+    const auto& d = g_evalHashDiagnostic;
+    const auto probes=d.probes.load(std::memory_order_relaxed);
+    const auto hits=d.hits.load(std::memory_order_relaxed);
+    std::cout << "[EvalHash Diagnostic]" << std::endl
+              << "enabled " << g_evalHashDiagnosticEnabled.load(std::memory_order_relaxed) << std::endl
+              << "entry_size " <<
+#if defined(EVAL_HASH_ATOMIC64)
+                 sizeof(std::atomic<std::uint64_t>) << std::endl
+              << "tag_bits " << EVAL_HASH_ATOMIC_TAG_BITS << std::endl
+#else
+                 sizeof(ScoreKeyValue) << std::endl
+#endif
+              << "entry_count " << g_evalTable.entry_count() << std::endl
+              << "table_bytes " << g_evalTable.byte_size() << std::endl
+              << "evaluate_calls " << d.evaluate_calls.load() << std::endl
+              << "accumulator_score_hits " << d.accumulator_score_hits.load() << std::endl
+              << "probes " << probes << std::endl
+              << "hits " << hits << std::endl
+              << "misses " << d.misses.load() << std::endl
+              << "hit_rate " << std::setprecision(10)
+              << (probes ? static_cast<double>(hits)/probes : 0.0) << std::endl
+              << "stores " << d.stores.load() << std::endl
+              << "compute_score_calls " << d.compute_score_calls.load() << std::endl
+              << "transform_calls " << d.transform_calls.load() << std::endl
+              << "propagate_calls " << d.propagate_calls.load() << std::endl
+              << "accumulator_already_computed " << d.accumulator_already_computed.load() << std::endl
+              << "accumulator_incremental_updates " << d.accumulator_incremental_updates.load() << std::endl
+              << "accumulator_refreshes " << d.accumulator_refreshes.load() << std::endl;
+}
+
+void EvalHash_Microbench(std::uint64_t repetitions) {
+    using Clock=std::chrono::steady_clock;
+    volatile std::uint64_t checksum=0;
+    auto measure=[&](const char* name, auto&& operation) {
+        const auto begin=Clock::now();
+        for (std::uint64_t i=0;i<repetitions;++i) checksum ^= operation(i);
+        const auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-begin).count();
+        std::cout << "micro_" << name << "_ns "
+                  << static_cast<double>(ns)/repetitions << std::endl;
+    };
+    constexpr Key base=UINT64_C(0x9e3779b97f4a7c15);
+#if defined(EVAL_HASH_ATOMIC64)
+    for (std::uint64_t i=0;i<4096;++i) {
+        const Key key=base+i*UINT64_C(0x100000001b3);
+        g_evalTable[key].store(evalhash_pack(key, static_cast<Value>(i&1023)), std::memory_order_relaxed);
+    }
+    measure("hit",[&](std::uint64_t i){const Key key=base+(i&4095)*UINT64_C(0x100000001b3);Value v;return evalhash_unpack(key,g_evalTable[key].load(std::memory_order_relaxed),v)?static_cast<std::uint64_t>(v):0;});
+    measure("miss",[&](std::uint64_t i){const Key key=(base^UINT64_C(0xd1b54a32d192ed03))+(i&4095)*UINT64_C(0x100000001b3);Value v;return evalhash_unpack(key,g_evalTable[key].load(std::memory_order_relaxed),v)?static_cast<std::uint64_t>(v):0;});
+    measure("store",[&](std::uint64_t i){const Key key=base+(i&4095)*UINT64_C(0x100000001b3);g_evalTable[key].store(evalhash_pack(key,static_cast<Value>(i&1023)),std::memory_order_relaxed);return i;});
+#else
+    for (std::uint64_t i=0;i<4096;++i) {
+        const Key key=base+i*UINT64_C(0x100000001b3);
+        ScoreKeyValue entry;
+        entry.key=key; entry.score=static_cast<std::uint64_t>(i);
+        entry.encode();*g_evalTable[key]=entry;
+    }
+    measure("hit",[&](std::uint64_t i){const Key key=base+(i&4095)*UINT64_C(0x100000001b3);auto e=*g_evalTable[key];e.decode();return e.key==key?e.score:0;});
+    measure("miss",[&](std::uint64_t i){const Key key=(base^UINT64_C(0xd1b54a32d192ed03))+(i&4095)*UINT64_C(0x100000001b3);auto e=*g_evalTable[key];e.decode();return e.key==key?e.score:0;});
+    measure("store",[&](std::uint64_t i){const Key key=base+(i&4095)*UINT64_C(0x100000001b3);ScoreKeyValue e;e.key=key;e.score=i;e.encode();*g_evalTable[key]=e;return i;});
+#endif
+    std::cout << "micro_checksum " << checksum << std::endl;
+}
+
+#if defined(EVAL_HASH_ATOMIC64)
+void EvalHash_Atomic64Selftest(std::uint64_t collisionTrials) {
+    std::uint64_t errors=0;
+    constexpr Key key=UINT64_C(0x123456789abcdef0);
+    for (int value=VALUE_MIN_EVAL; value<=VALUE_MAX_EVAL; ++value) {
+        Value decoded=VALUE_NONE;
+        const auto packed=evalhash_pack(key,value);
+        if (!evalhash_unpack(key,packed,decoded) || decoded!=value || packed==0) ++errors;
+    }
+    std::uint64_t state=UINT64_C(0x9e3779b97f4a7c15), collisions=0;
+    constexpr unsigned indexBits=17; // 1 MiB packed64 production candidate.
+    constexpr std::uint64_t indexMask=(UINT64_C(1)<<indexBits)-1;
+    for (std::uint64_t i=0;i<collisionTrials;++i) {
+        state ^= state<<7; state ^= state>>9; state ^= state<<8;
+        const Key a=state;
+        state ^= state<<7; state ^= state>>9; state ^= state<<8;
+        const Key b=(state&~indexMask)|(a&indexMask);
+        collisions += evalhash_tag(a)==evalhash_tag(b);
+    }
+    std::cout << "atomic64_score_roundtrip_errors " << errors << std::endl
+              << "atomic64_value_min " << VALUE_MIN_EVAL << std::endl
+              << "atomic64_value_max " << VALUE_MAX_EVAL << std::endl
+              << "atomic64_tag_bits " << EVAL_HASH_ATOMIC_TAG_BITS << std::endl
+              << "atomic64_collision_trials " << collisionTrials << std::endl
+              << "atomic64_tag_collisions " << collisions << std::endl;
+}
+#endif
+#endif
 
 // prefetchする関数も用意しておく。
 void prefetch_evalhash(const Key key) {
     constexpr auto mask = ~((u64)0x1f);
+#if defined(EVAL_HASH_ATOMIC64)
+    prefetch((void*)((u64)&g_evalTable[key] & mask));
+#else
     prefetch((void*)((u64)g_evalTable[key] & mask));
+#endif
 }
 #endif
 
@@ -921,8 +1135,14 @@ Value compute_eval(const Position& pos) {
 
 // 評価関数
 Value evaluate(const Position& pos) {
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+    diag_inc(g_evalHashDiagnostic.evaluate_calls);
+#endif
     const auto& accumulator = pos.state()->accumulator;
     if (accumulator.computed_score) {
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+        diag_inc(g_evalHashDiagnostic.accumulator_score_hits);
+#endif
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
         NNUE::SetLastNnueSignalAccess(
           NNUE::NnueSignalEvalSource::AccumulatorCached,
@@ -945,11 +1165,32 @@ Value evaluate(const Position& pos) {
 #endif
 
 #if defined(USE_EVAL_HASH)
-    // evaluate hash tableにはあるかも。
+    // Runtime option; DISABLE_EVAL_HASH removes this branch at compile time.
+    if (!EvalHash_IsEnabled())
+        return NNUE::ComputeScore(pos);
+
     const Key key = pos.state()->key();
-    ScoreKeyValue entry = *g_evalTable[key];
-    entry.decode();
+#if !defined(EVAL_HASH_ATOMIC64)
+    ScoreKeyValue entry;
+#endif
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+    if (g_evalHashDiagnosticEnabled.load(std::memory_order_relaxed)) {
+#endif
+    // evaluate hash tableにはあるかも。
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+    diag_inc(g_evalHashDiagnostic.probes);
+#endif
+#if defined(EVAL_HASH_ATOMIC64)
+    Value cachedScore;
+    const auto packed = g_evalTable[key].load(std::memory_order_relaxed);
+    if (evalhash_unpack(key, packed, cachedScore)) {
+#else
+    entry = *g_evalTable[key]; entry.decode();
     if (entry.key == key) {
+#endif
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+        diag_inc(g_evalHashDiagnostic.hits);
+#endif
         // あった！
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
         NNUE::SetLastNnueSignalAccess(NNUE::NnueSignalEvalSource::EvalHashHit);
@@ -958,17 +1199,36 @@ Value evaluate(const Position& pos) {
         // Eval hash stores only the score, so no Router signal belongs to this hit.
         NNUE::SetLastNnueRouterLmrSignal();
 #endif
+#if defined(EVAL_HASH_ATOMIC64)
+        return cachedScore;
+#else
         return Value(entry.score);
+#endif
+    }
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+    diag_inc(g_evalHashDiagnostic.misses);
     }
 #endif
+#endif
 
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+    diag_inc(g_evalHashDiagnostic.compute_score_calls);
+#endif
     Value score = NNUE::ComputeScore(pos);
 #if defined(USE_EVAL_HASH)
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+    if (g_evalHashDiagnosticEnabled.load(std::memory_order_relaxed)) {
+#endif
     // せっかく計算したのでevaluate hash tableに保存しておく。
-    entry.key = key;
-    entry.score = score;
-    entry.encode();
-    *g_evalTable[key] = entry;
+#if defined(EVAL_HASH_ATOMIC64)
+    g_evalTable[key].store(evalhash_pack(key, score), std::memory_order_relaxed);
+#else
+    entry.key = key; entry.score = score; entry.encode(); *g_evalTable[key] = entry;
+#endif
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+    diag_inc(g_evalHashDiagnostic.stores);
+    }
+#endif
 #endif
 
     return score;

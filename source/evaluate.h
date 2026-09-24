@@ -411,6 +411,21 @@ namespace Eval {
 
 	// EvalHashのクリア
 	void EvalHash_Clear();
+
+	// Runtime switch for USE_EVAL_HASH builds.  The Simple HalfKA_HM2 edition
+	// enables it by default; DISABLE_EVAL_HASH still removes the whole path.
+	void EvalHash_SetEnabled(bool enabled);
+	bool EvalHash_IsEnabled();
+
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+	void EvalHash_DiagnosticReset();
+	void EvalHash_DiagnosticReport();
+	void EvalHash_Microbench(std::uint64_t repetitions);
+	void EvalHash_SetDiagnosticEnabled(bool enabled);
+#if defined(EVAL_HASH_ATOMIC64)
+	void EvalHash_Atomic64Selftest(std::uint64_t collisionTrials);
+#endif
+#endif
 #endif
 
 

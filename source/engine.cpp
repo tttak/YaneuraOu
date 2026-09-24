@@ -3,6 +3,7 @@
 #include "perft.h"
 #include "usioption.h"
 #include "book/book.h"
+#include "evaluate.h"
 #include "search.h"
 
 namespace YaneuraOu {
@@ -138,6 +139,29 @@ void Engine::add_options() {
           return thread_allocation_information_as_string();
       }));
 
+#if defined(USE_EVAL_HASH)
+    // Simple HalfKA_HM2 production defaults to the Experiment 107 winner.
+    // Other explicitly enabled EvalHash builds retain their old OFF default.
+#if defined(EVAL_HASH_DEFAULT_ON)
+    constexpr bool kEvalHashDefaultEnabled = true;
+#else
+    constexpr bool kEvalHashDefaultEnabled = false;
+#endif
+#if defined(EVAL_HASH_DEFAULT_MB)
+    constexpr int kEvalHashDefaultMb = EVAL_HASH_DEFAULT_MB;
+#else
+    constexpr int kEvalHashDefaultMb = 128;
+#endif
+    options.add("UseEvalHash", Option(kEvalHashDefaultEnabled, [](const Option& o) {
+        Eval::EvalHash_SetEnabled(o);
+        return std::nullopt;
+    }));
+    options.add("EvalHash", Option(kEvalHashDefaultMb, 1, MaxHashMB, [this](const Option&) {
+        Eval::EvalHash_Resize(options["EvalHash"]);
+        return std::nullopt;
+    }));
+#endif
+
     // 基本オプションを生やす。
     add_base_options();
 
@@ -257,6 +281,13 @@ void Engine::isready()
 {
 	// エンジン設定のスレッド数を反映させる。
 	resize_threads();
+
+#if defined(USE_EVAL_HASH)
+	// The current Engine path does not pass through the legacy USIEngine
+	// allocation hook. Keep this entirely compile-time optional.
+	Eval::EvalHash_Resize(options["EvalHash"]);
+	Eval::EvalHash_Clear();
+#endif
 
 	sync_cout << "readyok" << sync_endl;
 }
