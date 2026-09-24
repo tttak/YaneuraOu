@@ -15,6 +15,9 @@
 #include "nnue_common.h"
 #include "nnue_architecture.h"
 #include "features/index_list.h"
+#if defined(USE_EXPERIMENTAL_KP_PROGRESS_SHADOW)
+#include "kp_progress_shadow.h"
+#endif
 
 #include <algorithm>  // std::clamp
 #include <cstring>  // std::memset()
@@ -152,6 +155,24 @@ class FeatureTransformer {
 	// Number of input/output dimensions
 	// 入出力の次元数
 	static constexpr IndexType kInputDimensions  = RawFeatures::kDimensions;
+#if defined(KP_PROGRESS_SHADOW_INTERLEAVED)
+#if defined(KP_PROGRESS_SHADOW_TAIL_COMPACT)
+	// Experiment-only compact tail.  Rows after the first are unaligned, so
+	// weight loads use the unaligned intrinsic.  This is the literal
+	// "one scalar after each row" layout used as Stage-2 layout B.
+	static constexpr IndexType kProgressTailElements = 1;
+#else
+	// Keep every ordinary FT row cache-line aligned.  A single int16 tail
+	// would make row N+1 unaligned and break the aligned AVX2 loads below.
+	// Reserve one full cache line and use its first element for progress.
+	static constexpr IndexType kProgressTailElements =
+		kCacheLineSize / sizeof(WeightType);
+#endif
+	static constexpr IndexType kWeightRowStride =
+		kHalfDimensions + kProgressTailElements;
+#else
+	static constexpr IndexType kWeightRowStride = kHalfDimensions;
+#endif
 #if defined(USE_ELEMENT_WISE_MULTIPLY)
 	static constexpr IndexType kOutputDimensions = kHalfDimensions;
 #else
@@ -197,12 +218,28 @@ class FeatureTransformer {
 		stream.seekg(ft_start);
 
 		if (compressed) {
+#if defined(KP_PROGRESS_SHADOW_INTERLEAVED)
+			return Tools::ResultCode::FileMismatch;
+#else
 			read_leb_128<BiasType>(stream, biases_, kHalfDimensions);
 			read_leb_128<WeightType>(stream, weights_, kHalfDimensions * kInputDimensions);
+#endif
 		} else {
 			read_little_endian<BiasType>(stream, biases_, kHalfDimensions);
+#if defined(KP_PROGRESS_SHADOW_INTERLEAVED)
+			NnueKpProgressShadow::load_from_environment(nullptr);
+			for (IndexType row=0;row<kInputDimensions;++row) {
+				read_little_endian<WeightType>(stream,
+					&weights_[row*kWeightRowStride], kHalfDimensions);
+				std::fill_n(&weights_[row*kWeightRowStride+kHalfDimensions],
+					kProgressTailElements, WeightType{});
+				weights_[row*kWeightRowStride+kHalfDimensions]=
+					static_cast<WeightType>(NnueKpProgressShadow::runtime_weight(row));
+			}
+#else
 			read_little_endian<WeightType>(
 				stream, weights_, kHalfDimensions * kInputDimensions);
+#endif
 		}
 
 #if defined(VECTOR) && !defined(NNUE_SMALL_SFNN_FT)
@@ -215,8 +252,14 @@ class FeatureTransformer {
 #endif
 #else
 		for (std::size_t i = 0; i < kHalfDimensions; ++i) biases_[i] = read_little_endian<BiasType>(stream);
-		for (std::size_t i = 0; i < kHalfDimensions * kInputDimensions; ++i)
-			weights_[i] = read_little_endian<WeightType>(stream);
+		for (std::size_t row = 0; row < kInputDimensions; ++row) {
+			for (std::size_t i = 0; i < kHalfDimensions; ++i)
+				weights_[row*kWeightRowStride+i] = read_little_endian<WeightType>(stream);
+#if defined(KP_PROGRESS_SHADOW_INTERLEAVED)
+			weights_[row*kWeightRowStride+kHalfDimensions]=
+				static_cast<WeightType>(NnueKpProgressShadow::runtime_weight(row));
+#endif
+		}
 #if defined(USE_FINNY_TABLES)
 		if (!stream.fail())
 			++finny_generation_;
@@ -229,7 +272,9 @@ class FeatureTransformer {
 	// パラメータを書き込む
 	bool WriteParameters(std::ostream& stream) const {
 		stream.write(reinterpret_cast<const char*>(biases_), kHalfDimensions * sizeof(BiasType));
-		stream.write(reinterpret_cast<const char*>(weights_), kHalfDimensions * kInputDimensions * sizeof(WeightType));
+		for (IndexType row=0;row<kInputDimensions;++row)
+			stream.write(reinterpret_cast<const char*>(&weights_[row*kWeightRowStride]),
+				kHalfDimensions*sizeof(WeightType));
 		return !stream.fail();
 	}
 
@@ -516,7 +561,7 @@ class FeatureTransformer {
 		for (IndexType j = 0; j < kInputDimensions; ++j)
 		{
 			uint64_t* w =
-				reinterpret_cast<uint64_t*>(const_cast<WeightType*>(&weights_[j * kHalfDimensions]));
+				reinterpret_cast<uint64_t*>(const_cast<WeightType*>(&weights_[j * kWeightRowStride]));
 			for (IndexType i = 0; i < kHalfDimensions * sizeof(WeightType) / sizeof(uint64_t);
 					i += di)
 				order_fn(&w[i]);
@@ -527,7 +572,7 @@ class FeatureTransformer {
 	inline void scale_weights(bool read) const {
 		for (IndexType j = 0; j < kInputDimensions; ++j)
 		{
-			WeightType* w = const_cast<WeightType*>(&weights_[j * kHalfDimensions]);
+			WeightType* w = const_cast<WeightType*>(&weights_[j * kWeightRowStride]);
 			for (IndexType i = 0; i < kHalfDimensions; ++i)
 				w[i] = read ? w[i] * 2 : w[i] / 2;
 		}
@@ -577,16 +622,26 @@ class FeatureTransformer {
 
 	void add_weight_to_tile(vec_t* acc, IndexType index, IndexType tile_offset) const {
 		const auto* column = reinterpret_cast<const vec_t*>(
-			&weights_[kHalfDimensions * index + tile_offset]);
+			&weights_[kWeightRowStride * index + tile_offset]);
 		for (IndexType k = 0; k < kTileRegs; ++k)
-			acc[k] = vec_add_16(acc[k], vec_load(column + k));
+			acc[k] = vec_add_16(acc[k], weight_vec_load(column + k));
 	}
 
 	void sub_weight_from_tile(vec_t* acc, IndexType index, IndexType tile_offset) const {
 		const auto* column = reinterpret_cast<const vec_t*>(
-			&weights_[kHalfDimensions * index + tile_offset]);
+			&weights_[kWeightRowStride * index + tile_offset]);
 		for (IndexType k = 0; k < kTileRegs; ++k)
-			acc[k] = vec_sub_16(acc[k], vec_load(column + k));
+			acc[k] = vec_sub_16(acc[k], weight_vec_load(column + k));
+	}
+
+	static inline vec_t weight_vec_load(const vec_t* source) {
+#if defined(KP_PROGRESS_SHADOW_TAIL_COMPACT) && defined(USE_AVX512)
+		return _mm512_loadu_si512(source);
+#elif defined(KP_PROGRESS_SHADOW_TAIL_COMPACT) && defined(USE_AVX2)
+		return _mm256_loadu_si256(source);
+#else
+		return vec_load(source);
+#endif
 	}
 #endif
 
@@ -694,7 +749,7 @@ class FeatureTransformer {
 			std::memset(current, 0, kHalfDimensions * sizeof(BiasType));
 
 		for (const auto index : active_indices) {
-			const IndexType offset = kHalfDimensions * index;
+			const IndexType offset = kWeightRowStride * index;
 			for (IndexType j = 0; j < kHalfDimensions; ++j)
 				current[j] += weights_[offset + j];
 		}
@@ -766,12 +821,12 @@ class FeatureTransformer {
 				});
 #else
 			for (const auto index : removed_indices) {
-				const IndexType offset = kHalfDimensions * index;
+				const IndexType offset = kWeightRowStride * index;
 				for (IndexType j = 0; j < kHalfDimensions; ++j)
 					entry.accumulation[j] -= weights_[offset + j];
 			}
 			for (const auto index : added_indices) {
-				const IndexType offset = kHalfDimensions * index;
+				const IndexType offset = kWeightRowStride * index;
 				for (IndexType j = 0; j < kHalfDimensions; ++j)
 					entry.accumulation[j] += weights_[offset + j];
 			}
@@ -795,6 +850,19 @@ class FeatureTransformer {
 			Features::IndexList active_indices[2];
 			const auto trigger = kRefreshTriggers[i];
 			RawFeatures::AppendActiveIndices(pos, trigger, active_indices);
+#if defined(USE_EXPERIMENTAL_KP_PROGRESS_SHADOW)
+			if (i == 0) {
+#if defined(KP_PROGRESS_SHADOW_INTERLEAVED)
+				std::int32_t sums[COLOR_NB]{};
+				for (int c = 0; c < COLOR_NB; ++c)
+					for (const auto index : active_indices[c])
+						sums[c] += weights_[index * kWeightRowStride + kHalfDimensions];
+				NnueKpProgressShadow::colocated_refresh(pos, sums);
+#else
+				NnueKpProgressShadow::refresh_from_active(pos, active_indices);
+#endif
+			}
+#endif
 			for (int c = 0; c < COLOR_NB; ++c) {
 				const Color perspective = static_cast<Color>(c);
 				const Square bucket = finny_bucket_square(pos, trigger, perspective);
@@ -824,6 +892,19 @@ class FeatureTransformer {
 		for (IndexType i = 0; i < kRefreshTriggers.size(); ++i) {
 			Features::IndexList active_indices[2];
 			RawFeatures::AppendActiveIndices(pos, kRefreshTriggers[i], active_indices);
+#if defined(USE_EXPERIMENTAL_KP_PROGRESS_SHADOW)
+			if (i == 0) {
+#if defined(KP_PROGRESS_SHADOW_INTERLEAVED)
+				std::int32_t sums[COLOR_NB]{};
+				for (int c = 0; c < COLOR_NB; ++c)
+					for (const auto index : active_indices[c])
+						sums[c] += weights_[index * kWeightRowStride + kHalfDimensions];
+				NnueKpProgressShadow::colocated_refresh(pos, sums);
+#else
+				NnueKpProgressShadow::refresh_from_active(pos, active_indices);
+#endif
+			}
+#endif
 			for (int c = 0; c < COLOR_NB; ++c) {
 				const Color perspective = static_cast<Color>(c);
 #if defined(VECTOR)
@@ -850,6 +931,24 @@ class FeatureTransformer {
 			Features::IndexList removed_indices[2], added_indices[2];
 			bool                reset[2];
 			RawFeatures::AppendChangedIndices(pos, kRefreshTriggers[i], removed_indices, added_indices, reset);
+#if defined(USE_EXPERIMENTAL_KP_PROGRESS_SHADOW)
+			if (i == 0) {
+#if defined(KP_PROGRESS_SHADOW_INTERLEAVED)
+				std::int32_t removed_sums[COLOR_NB]{}, added_sums[COLOR_NB]{};
+				for (int c = 0; c < COLOR_NB; ++c) {
+					for (const auto index : removed_indices[c])
+						removed_sums[c] += weights_[index * kWeightRowStride + kHalfDimensions];
+					for (const auto index : added_indices[c])
+						added_sums[c] += weights_[index * kWeightRowStride + kHalfDimensions];
+				}
+				NnueKpProgressShadow::colocated_update(
+					pos, removed_sums, added_sums, reset);
+#else
+				NnueKpProgressShadow::update_from_changed(
+					pos, removed_indices, added_indices, reset);
+#endif
+			}
+#endif
 			for (int c = 0; c < COLOR_NB; ++c) {
 				const Color perspective = static_cast<Color>(c);
 #if defined(VECTOR)
@@ -887,7 +986,7 @@ class FeatureTransformer {
 					std::memcpy(accumulator.accumulation[perspective][i], prev_accumulator.accumulation[perspective][i],
 					            kHalfDimensions * sizeof(BiasType));
 					for (const auto index : removed_indices[perspective]) {
-						const IndexType offset = kHalfDimensions * index;
+						const IndexType offset = kWeightRowStride * index;
 						for (IndexType j = 0; j < kHalfDimensions; ++j) {
 							accumulator.accumulation[perspective][i][j] -= weights_[offset + j];
 						}
@@ -896,7 +995,7 @@ class FeatureTransformer {
 				// Difference calculation for features that changed from 0 to 1
 				// 0から1に変化した特徴量に関する差分計算
 				for (const auto index : added_indices[perspective]) {
-					const IndexType offset = kHalfDimensions * index;
+					const IndexType offset = kWeightRowStride * index;
 					for (IndexType j = 0; j < kHalfDimensions; ++j) {
 							accumulator.accumulation[perspective][i][j] += weights_[offset + j];
 					}
@@ -944,7 +1043,7 @@ class FeatureTransformer {
 	// parameter
 	// パラメータ
 	alignas(kCacheLineSize) BiasType biases_[kHalfDimensions];
-	alignas(kCacheLineSize) WeightType weights_[kHalfDimensions * kInputDimensions];
+	alignas(kCacheLineSize) WeightType weights_[kWeightRowStride * kInputDimensions];
 #if defined(USE_FINNY_TABLES)
 	std::uint64_t finny_generation_ = 0;
 #endif

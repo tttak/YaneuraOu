@@ -42,6 +42,12 @@
 #if defined(ENABLE_NNUE_PAIR_RELATION_SIDE_INPUT)
 #include "nnue_pair_relation.h"
 #endif
+#if defined(USE_EXPERIMENTAL_KP_PROGRESS_SHADOW)
+#include "kp_progress_shadow.h"
+#endif
+#if defined(USE_EXPERIMENTAL_KP_PROGRESS_FT_PROXY)
+#include "kp_progress_ft_proxy.h"
+#endif
 
 namespace YaneuraOu::Eval::NNUE {
 extern int FV_SCALE;
@@ -629,6 +635,16 @@ namespace {
         feature_transformer->Transform(pos, transformed_features, refresh);
         alignas(kCacheLineSize) char buffer[Network::kBufferSize];
         const int bucket = stack_index_for_nnue(pos);
+#if defined(USE_EXPERIMENTAL_KP_PROGRESS_FT_PROXY)
+        if (bucket == 8)
+            NnueKpProgressFtProxy::observe(transformed_features);
+#endif
+#if defined(USE_EXPERIMENTAL_KP_PROGRESS_SHADOW)
+        // Shadow only: compute the candidate route for the dominant B08
+        // cohort, but deliberately keep `bucket` and the final score intact.
+        if (bucket == 8)
+            NnueKpProgressShadow::observe(pos);
+#endif
         const auto output = network[bucket]->Propagate(transformed_features, buffer);
         auto score = static_cast<Value>(output[0] / FV_SCALE);
         score = Math::clamp(score, -VALUE_MAX_EVAL, VALUE_MAX_EVAL);

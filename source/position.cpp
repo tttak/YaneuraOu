@@ -1938,6 +1938,9 @@ void Position::do_move_impl(Move m, StateInfo& newSt, bool givesCheck, const T* 
 #if defined(EVAL_NNUE)
     st->accumulator.computed_accumulation = false;
     st->accumulator.computed_score        = false;
+#if defined(USE_EXPERIMENTAL_KP_PROGRESS_SHADOW)
+    st->accumulator.computed_kp_progress  = false;
+#endif
 #endif
 
 #if defined(USE_BOARD_EFFECT_PREV)
@@ -2694,6 +2697,9 @@ void Position::do_null_move(StateInfo& newSt, const T& tt) {
 #if defined(USE_CLASSIC_EVAL) && defined(EVAL_NNUE)
     // NNUEの場合、KPPT型と違って、手番が違う場合、計算なしに済ますわけにはいかない。
     st->accumulator.computed_score = false;
+#if defined(USE_EXPERIMENTAL_KP_PROGRESS_SHADOW)
+    st->accumulator.computed_kp_progress = false;
+#endif
 #endif
 
 	// このタイミングでアドレスが確定するのでprefetchしたほうが良い。(かも)

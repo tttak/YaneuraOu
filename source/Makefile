@@ -192,6 +192,41 @@ else ifneq ($(NNUE_MOBILITY_TACTICAL_PROTOTYPE),NO)
   $(error NNUE_MOBILITY_TACTICAL_PROTOTYPE must be NO or YES)
 endif
 
+# Experiment 102 only: observe the B08 KP-progress route without changing the
+# selected LayerStack or the returned evaluation.  Parameters live in a
+# separate raw diagnostic file (KP_PROGRESS_SHADOW_FILE); nn.bin and its hash
+# remain untouched.  OFF compiles out the StateInfo fields and hot-path call.
+USE_EXPERIMENTAL_KP_PROGRESS_SHADOW ?= NO
+KP_PROGRESS_SHADOW_TABLE_BITS ?= 32
+KP_PROGRESS_SHADOW_SCALE ?= 4096
+KP_PROGRESS_SHADOW_LAYOUT ?= SEPARATE
+ifeq ($(USE_EXPERIMENTAL_KP_PROGRESS_SHADOW),YES)
+  CPPFLAGS += -DUSE_EXPERIMENTAL_KP_PROGRESS_SHADOW
+  CPPFLAGS += -DKP_PROGRESS_SHADOW_TABLE_BITS=$(KP_PROGRESS_SHADOW_TABLE_BITS)
+  CPPFLAGS += -DKP_PROGRESS_SHADOW_SCALE=$(KP_PROGRESS_SHADOW_SCALE)
+  ifeq ($(KP_PROGRESS_SHADOW_LAYOUT),INTERLEAVED)
+    CPPFLAGS += -DKP_PROGRESS_SHADOW_INTERLEAVED
+  else ifeq ($(KP_PROGRESS_SHADOW_LAYOUT),TAIL_COMPACT)
+    CPPFLAGS += -DKP_PROGRESS_SHADOW_INTERLEAVED -DKP_PROGRESS_SHADOW_TAIL_COMPACT
+  else ifneq ($(KP_PROGRESS_SHADOW_LAYOUT),SEPARATE)
+    $(error KP_PROGRESS_SHADOW_LAYOUT must be SEPARATE, TAIL_COMPACT, or INTERLEAVED)
+  endif
+  ifneq ($(filter $(KP_PROGRESS_SHADOW_TABLE_BITS),8 16 32),$(KP_PROGRESS_SHADOW_TABLE_BITS))
+    $(error KP_PROGRESS_SHADOW_TABLE_BITS must be 8, 16, or 32)
+  endif
+else ifneq ($(USE_EXPERIMENTAL_KP_PROGRESS_SHADOW),NO)
+  $(error USE_EXPERIMENTAL_KP_PROGRESS_SHADOW must be YES or NO)
+endif
+
+# Experiment 103 Stage 3: derive a shadow-only KP-progress route from values
+# already produced by the Simple FT. OFF leaves no call or storage behind.
+USE_EXPERIMENTAL_KP_PROGRESS_FT_PROXY ?= NO
+ifeq ($(USE_EXPERIMENTAL_KP_PROGRESS_FT_PROXY),YES)
+  CPPFLAGS += -DUSE_EXPERIMENTAL_KP_PROGRESS_FT_PROXY
+else ifneq ($(USE_EXPERIMENTAL_KP_PROGRESS_FT_PROXY),NO)
+  $(error USE_EXPERIMENTAL_KP_PROGRESS_FT_PROXY must be NO or YES)
+endif
+
 # Experiment-only direct-contribution ablation.  The mobility/tactical
 # architecture and serialized parameters are kept intact, but the residual
 # presented to the L2 input is forced to exactly zero.
@@ -635,6 +670,8 @@ ifneq (,$(findstring YANEURAOU_ENGINE_NNUE,$(YANEURAOU_EDITION)))
 	SOURCES += \
 		eval/nnue/evaluate_nnue.cpp                                     \
 		eval/nnue/evaluate_nnue_learner.cpp                             \
+		eval/nnue/kp_progress_shadow.cpp                                \
+		eval/nnue/kp_progress_ft_proxy.cpp                              \
 		eval/nnue/nnue_shogi_threat_lazy.cpp                            \
 		eval/nnue/nnue_test_command.cpp                                 \
 		eval/nnue/features/k.cpp                                        \

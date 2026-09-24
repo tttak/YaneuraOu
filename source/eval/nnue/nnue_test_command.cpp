@@ -32,6 +32,12 @@
 #if defined(ENABLE_QSEARCH_CORRECTION_SHADOW)
 #include "qsearch_correction_shadow.h"
 #endif
+#if defined(USE_EXPERIMENTAL_KP_PROGRESS_SHADOW)
+#include "kp_progress_shadow.h"
+#endif
+#if defined(USE_EXPERIMENTAL_KP_PROGRESS_FT_PROXY)
+#include "kp_progress_ft_proxy.h"
+#endif
 
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
 #include "../../engine/yaneuraou-engine/nnue_signal_logger.h"
@@ -13049,6 +13055,25 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     DumpHalfKAHM2SimpleFeatures(position());
   } else if (sub_command == "simple_hm2_stages") {
     DumpHalfKAHM2SimpleStages(position());
+#if defined(USE_EXPERIMENTAL_KP_PROGRESS_SHADOW)
+  } else if (sub_command == "kp_progress_shadow") {
+    std::string weights;
+    std::uint64_t repeats = 100000;
+    stream >> weights >> repeats;
+    NnueKpProgressShadow::test_position(position(), weights, repeats, std::cout);
+  } else if (sub_command == "kp_progress_shadow_selftest") {
+    std::string weights;
+    std::uint64_t games = 2000;
+    int max_ply = 600;
+    stream >> weights >> games >> max_ply;
+    NnueKpProgressShadow::self_test(weights, games, max_ply, std::cout);
+#endif
+#if defined(USE_EXPERIMENTAL_KP_PROGRESS_FT_PROXY)
+  } else if (sub_command == "kp_progress_ft_proxy") {
+    std::uint64_t repeats = 1000000;
+    stream >> repeats;
+    NnueKpProgressFtProxy::benchmark(repeats, std::cout);
+#endif
 #endif
   } else if (sub_command == "incremental_eval_checksum") {
     TestIncrementalEvalChecksum();

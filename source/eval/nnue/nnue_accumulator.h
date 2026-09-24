@@ -34,6 +34,16 @@ struct alignas(64) Accumulator {
   Value score = VALUE_ZERO;
   bool computed_accumulation = false;
   bool computed_score = false;
+#if defined(USE_EXPERIMENTAL_KP_PROGRESS_SHADOW)
+  // Experiment 102: independent scalar accumulator.  It is observation-only
+  // and absent from production/default builds.
+#if KP_PROGRESS_SHADOW_TABLE_BITS == 32
+  double kp_progress_accumulation[2] = {0.0, 0.0};
+#else
+  std::int32_t kp_progress_accumulation[2] = {0, 0};
+#endif
+  bool computed_kp_progress = false;
+#endif
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
   // Valid only when computed_score was produced by a full Network evaluation.
   // Kept diagnostic-only so production StateInfo size and cache behavior do not change.
