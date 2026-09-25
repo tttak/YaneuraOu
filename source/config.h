@@ -420,17 +420,23 @@
 	#define USE_FINNY_TABLES
 #endif
 
-// Experiment 107: the Simple HalfKA_HM2 production edition uses the packed
-// atomic EvalHash by default.  The requested 1 MiB option is halved internally,
-// yielding the measured 512 KiB / 65,536-entry table.  Defining
-// DISABLE_EVAL_HASH keeps a compile-time baseline with no table or hot-path
-// branch.
+// Production EvalHash policy is centralized here.  The USI size is expressed
+// in MiB; Simple divides it by two (1 => 512 KiB), while Complex uses it as-is
+// (1 => 1 MiB).  DISABLE_EVAL_HASH removes the table and hot-path branch.
 #if defined(YANEURAOU_ENGINE_NNUE_HALFKAHM2_SIMPLE_1536) \
 	&& !defined(DISABLE_EVAL_HASH)
 	#define USE_EVAL_HASH
 	#define EVAL_HASH_ATOMIC64
-	#define EVAL_HASH_ATOMIC64_HALF_BYTES
+	#define EVAL_HASH_SIZE_DIVISOR 2
 	#define EVAL_HASH_DEFAULT_ON
+	#define EVAL_HASH_DEFAULT_MB 1
+#elif defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536) \
+	&& !defined(DISABLE_EVAL_HASH)
+	#define USE_EVAL_HASH
+	#define EVAL_HASH_ATOMIC64
+	#define EVAL_HASH_COMPLEX_SAFE
+	#define EVAL_HASH_SIZE_DIVISOR 1
+	// Keep Complex OFF until the production-integration report is reviewed.
 	#define EVAL_HASH_DEFAULT_MB 1
 #endif
 

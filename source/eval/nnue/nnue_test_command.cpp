@@ -1877,6 +1877,7 @@ void TestAccumulator(Position& pos) {
 // identity before comparing the production incremental accumulator with a
 // true scratch rebuild at every ply.  Scratch output is restored afterwards,
 // so the next move always starts from the unmodified production path.
+#if !defined(NNUE_HALFKAHM2_SIMPLE)
 void TestAccumulatorRegression109(Position& pos) {
   constexpr const char* kRootSfen =
       "6n1l/2+S1k4/2lp4p/1np1B2b1/3PP4/1N1S3rP/1P2+pPP+p1/1p1G5/"
@@ -2131,6 +2132,7 @@ comparison_done:
             << " parent_incremental_cp=" << parent_incremental_score
             << " parent_scratch_cp=" << parent_scratch_score << std::endl;
 }
+#endif
 
 // Deterministic incremental-evaluation checksum for comparing separately
 // linked production binaries. This is a test command only; no search or NNUE
@@ -13366,8 +13368,10 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     TestFeatures(position());
   } else if (sub_command == "test_accumulator") {
     TestAccumulator(position());
+#if !defined(NNUE_HALFKAHM2_SIMPLE)
   } else if (sub_command == "accumulator_regression_109") {
     TestAccumulatorRegression109(position());
+#endif
 #if defined(NNUE_HALFKAHM2_SIMPLE)
   } else if (sub_command == "simple_hm2_features") {
     DumpHalfKAHM2SimpleFeatures(position());
@@ -13399,6 +13403,12 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::uint64_t repeats = 100000;
     stream >> repeats;
     TestFreshEvaluateCost(position(), repeats);
+#if defined(USE_EVAL_HASH) && defined(EVAL_HASH_ATOMIC64)
+  } else if (sub_command == "evalhash_codec_selftest") {
+    const bool passed = Eval::EvalHash_Atomic64CodecSelftest();
+    std::cout << "EvalHash atomic64 codec selftest: "
+              << (passed ? "passed" : "FAILED") << std::endl;
+#endif
 #if defined(USE_EVAL_HASH) && defined(MEASURE_EVAL_HASH_BENCHMARK)
   } else if (sub_command == "evalhash_reset") {
     Eval::EvalHash_DiagnosticReset();

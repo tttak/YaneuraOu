@@ -29,6 +29,7 @@
 
 #if defined(USE_EVAL_HASH)
 #include "../evalhash.h"
+#include "../evalhash_atomic64.h"
 #endif
 
 #include "evaluate_nnue.h"
@@ -914,64 +915,19 @@ struct EvaluateHashTable : HashTable<ScoreKeyValue> {};
 
 #if defined(EVAL_HASH_ATOMIC64)
 #if defined(EVAL_HASH_COMPLEX_SAFE)
-// score16 + Router/LCA/Cross decision bits + tag45 = one atomic word.
-constexpr unsigned kAtomicSignalBits = 3;
-constexpr unsigned kAtomicPayloadBits = 16 + kAtomicSignalBits;
-constexpr unsigned kAtomicTagBits = 64 - kAtomicPayloadBits;
+using EvalHashCodec = ComplexEvalHashCodec;
 #else
-#ifndef EVAL_HASH_ATOMIC_TAG_BITS
-#define EVAL_HASH_ATOMIC_TAG_BITS 48
-#endif
-static_assert(EVAL_HASH_ATOMIC_TAG_BITS >= 1 && EVAL_HASH_ATOMIC_TAG_BITS <= 48);
-constexpr unsigned kAtomicSignalBits = 0;
-constexpr unsigned kAtomicPayloadBits = 16;
-constexpr unsigned kAtomicTagBits = EVAL_HASH_ATOMIC_TAG_BITS;
+using EvalHashCodec = SimpleEvalHashCodec;
 #endif
 using EvaluateHashTableSelected = Atomic64HashTable;
-constexpr std::uint64_t kAtomicTagMask =
-  (UINT64_C(1) << kAtomicTagBits) - 1;
-inline std::uint64_t evalhash_tag(Key key) {
-#if defined(EVAL_HASH_COMPLEX_SAFE)
-    // Mix every source bit before truncation.  The former `(key ^ key>>32)>>16`
-    // left key bit 15 uncovered when a 256 KiB table used only 15 index bits,
-    // causing deterministic false hits.  This reversible-style avalanche has
-    // no table-size-dependent verification holes.
-    std::uint64_t mixed = key;
-    mixed ^= mixed >> 30;
-    mixed *= UINT64_C(0xbf58476d1ce4e5b9);
-    mixed ^= mixed >> 27;
-    mixed *= UINT64_C(0x94d049bb133111eb);
-    mixed ^= mixed >> 31;
-    return mixed & kAtomicTagMask;
-#else
-    // Preserve the already-tested Simple/legacy atomic64 contract.  Complex
-    // safe mode needs the stronger avalanche because its payload leaves fewer
-    // tag bits and its table-size sweep exposed a verification-bit hole.
-    return ((key ^ (key >> 32)) >> 16) & kAtomicTagMask;
-#endif
-}
-inline std::uint16_t evalhash_encode_score(Value score) {
-    ASSERT_LV3(score >= VALUE_MIN_EVAL && score <= VALUE_MAX_EVAL);
-    const auto code = static_cast<std::uint16_t>(score + 32768);
-    ASSERT_LV3(code != 0); // packed==0 remains the empty sentinel.
-    return code;
-}
-inline Value evalhash_decode_score(std::uint16_t code) {
-    return static_cast<Value>(static_cast<int>(code) - 32768);
-}
+constexpr unsigned kAtomicTagBits = EvalHashCodec::kTagBits;
+inline std::uint64_t evalhash_tag(Key key) { return EvalHashCodec::tag(key); }
 inline std::uint64_t evalhash_pack(Key key, Value score, std::uint8_t flags = 0) {
-    return (evalhash_tag(key) << kAtomicPayloadBits)
-         | (static_cast<std::uint64_t>(flags) << 16)
-         | evalhash_encode_score(score);
+    return EvalHashCodec::pack(key, score, flags);
 }
 inline bool evalhash_unpack(Key key, std::uint64_t packed, Value& score,
                             std::uint8_t* flags = nullptr) {
-    if (!packed || (packed >> kAtomicPayloadBits) != evalhash_tag(key)) return false;
-    score = evalhash_decode_score(static_cast<std::uint16_t>(packed));
-    if (flags)
-        *flags = static_cast<std::uint8_t>((packed >> 16)
-          & ((UINT64_C(1) << kAtomicSignalBits) - 1));
-    return true;
+    return EvalHashCodec::unpack(key, packed, score, flags);
 }
 #else
 using EvaluateHashTableSelected = EvaluateHashTable;
@@ -1045,8 +1001,32 @@ void EvalHash_Clear() {
     g_evalTable.clear(Threads);
     g_evalHashInitialized = true;
 };
-void EvalHash_SetEnabled(bool enabled) { g_evalHashRequested = enabled; }
+void EvalHash_SetEnabled(bool enabled) {
+    // An OFF interval may span a network or threshold change.  Never expose
+    // entries from that interval when the runtime option is enabled again.
+    if (enabled && !g_evalHashRequested && g_evalHashInitialized)
+        EvalHash_Clear();
+    g_evalHashRequested = enabled;
+}
 bool EvalHash_IsEnabled() { return g_evalHashRequested && g_evalHashInitialized; }
+
+#if defined(EVAL_HASH_ATOMIC64)
+bool EvalHash_Atomic64CodecSelftest() {
+    constexpr Key key = UINT64_C(0x123456789abcdef0);
+    for (int value = VALUE_MIN_EVAL; value <= VALUE_MAX_EVAL; ++value) {
+        Value decoded = VALUE_NONE;
+        std::uint8_t decodedFlags = 0;
+        const std::uint8_t flags = EvalHashCodec::kSignalMask;
+        const auto packed = EvalHashCodec::pack(key, static_cast<Value>(value), flags);
+        if (!packed || !EvalHashCodec::unpack(key, packed, decoded, &decodedFlags)
+            || decoded != value || decodedFlags != flags)
+            return false;
+    }
+    Value ignored = VALUE_NONE;
+    return !EvalHashCodec::unpack(key ^ UINT64_C(0x100000000),
+                                  EvalHashCodec::pack(key, Value(0)), ignored);
+}
+#endif
 #if defined(EVAL_HASH_COMPLEX_SAFE) && defined(USE_NNUE_LCA_LMR)
 void EvalHash_SetLcaLmrThreshold(int threshold) {
     const int previous = g_evalHashLcaThreshold.exchange(threshold, std::memory_order_relaxed);

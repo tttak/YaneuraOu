@@ -416,6 +416,10 @@ namespace Eval {
 	// enables it by default; DISABLE_EVAL_HASH still removes the whole path.
 	void EvalHash_SetEnabled(bool enabled);
 	bool EvalHash_IsEnabled();
+#if defined(EVAL_HASH_ATOMIC64)
+	// Exhaustive score and architecture-specific signal-bit round-trip test.
+	bool EvalHash_Atomic64CodecSelftest();
+#endif
 #if defined(EVAL_HASH_COMPLEX_SAFE) && defined(USE_NNUE_LCA_LMR)
 	// A packed LCA decision bit depends on this runtime threshold. Changing it
 	// invalidates existing entries, so the implementation clears the table.

@@ -158,6 +158,7 @@ void Engine::add_options() {
     }));
     options.add("EvalHash", Option(kEvalHashDefaultMb, 1, MaxHashMB, [this](const Option&) {
         Eval::EvalHash_Resize(options["EvalHash"]);
+        Eval::EvalHash_Clear();
         return std::nullopt;
     }));
 #endif
