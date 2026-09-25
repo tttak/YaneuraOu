@@ -436,7 +436,7 @@
 	#define EVAL_HASH_ATOMIC64
 	#define EVAL_HASH_COMPLEX_SAFE
 	#define EVAL_HASH_SIZE_DIVISOR 1
-	// Keep Complex OFF until the production-integration report is reviewed.
+	#define EVAL_HASH_DEFAULT_ON
 	#define EVAL_HASH_DEFAULT_MB 1
 #endif
 
