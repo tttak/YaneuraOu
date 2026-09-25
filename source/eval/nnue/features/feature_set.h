@@ -110,6 +110,15 @@ class FeatureSetBase {
           ASSERT_LV5(false);
           break;
       }
+#if defined(USE_NNUE_KSDG3_SAVED_DELTA)
+      // The compact do_move-time KSDG3 buffer may overflow in a legal but
+      // rare transition.  Present that perspective as a normal refresh to all
+      // feature-set callers; the transformer additionally chooses its full
+      // scratch/Finny fallback before reaching this point.
+      if (pos.state()->ksdg3SavedDelta.overflow_mask
+          & std::uint8_t(1u << perspective))
+        reset[perspective] = true;
+#endif
       if (reset[perspective]) {
         Derived::CollectActiveIndices(
             pos, trigger, perspective, &added[perspective]);

@@ -22,6 +22,9 @@
 #include <cstdint>
 #include <cstring>  // std::memset()
 #include <memory>
+#if defined(EVAL_HASH_VERIFY_HITS)
+#include <ostream>
+#endif
 
 namespace YaneuraOu {
 namespace Eval::NNUE {
@@ -280,6 +283,118 @@ class FeatureTransformer {
 		return false;
 	}
 
+	// EvalHash hits may skip Transform(), but descendants still require an
+	// exact parent accumulator.  Complete the same update/refresh contract as
+	// Transform without producing its dense output buffers.
+	void EnsureAccumulator(const Position& pos) const {
+		if (!UpdateAccumulatorIfPossible(pos))
+			refresh_accumulator(pos);
+#if defined(EVAL_HASH_VERIFY_HITS)
+		EvalHashDebugVerifyMaterializedAccumulator(pos, "EnsureAccumulator");
+#endif
+	}
+
+	void ForceRefreshAccumulator(const Position& pos) const {
+		refresh_accumulator(pos);
+	}
+
+#if defined(EVAL_HASH_VERIFY_HITS)
+	void EvalHashDebugRefreshAccumulatorFromScratch(const Position& pos) const {
+		refresh_accumulator_from_scratch(pos);
+	}
+
+	void EvalHashDebugVerifyMaterializedAccumulator(
+		const Position& pos, const char* const where) const {
+		static thread_local std::uint64_t mismatch_count = 0;
+		const Accumulator production = pos.state()->accumulator;
+		refresh_accumulator_from_scratch(pos);
+		const Accumulator scratch = pos.state()->accumulator;
+		const bool main_equal = std::memcmp(
+			production.accumulation, scratch.accumulation,
+			sizeof(production.accumulation)) == 0;
+		const bool fm_equal = std::memcmp(
+			production.factors, scratch.factors,
+			sizeof(production.factors)) == 0;
+		pos.state()->accumulator = production;
+		if ((!main_equal || !fm_equal) && mismatch_count++ < 32) {
+			std::cout << "accumulator_materialization_mismatch index="
+			          << (mismatch_count - 1)
+			          << " where=" << where
+			          << " source=" << static_cast<int>(
+			               production.debug_accumulator_source)
+			          << " main=" << (main_equal ? "OK" : "FAIL")
+			          << " fm=" << (fm_equal ? "OK" : "FAIL")
+			          << " key=0x" << std::hex
+			          << static_cast<std::uint64_t>(pos.state()->key())
+			          << std::dec
+			          << " previous=" << static_cast<const void*>(pos.state()->previous)
+			          << " previous_computed="
+			          << (pos.state()->previous
+			                ? pos.state()->previous->accumulator.computed_accumulation : false)
+			          << " move_raw=0x" << std::hex
+			          << production.debug_move_raw << std::dec
+			          << " null=" << production.debug_was_null_move
+			          << " children_before_materialization="
+			          << production.debug_children_before_materialization
+			          << " last_child_move_raw=0x" << std::hex
+			          << production.debug_last_child_move_raw << std::dec
+			          << " sfen=" << pos.sfen() << std::endl;
+			if (mismatch_count == 1) {
+				const StateInfo* state = pos.state();
+				for (int depth = 0; state && depth < 16;
+				     ++depth, state = state->previous) {
+					std::cout << "  materialization_chain depth=" << depth
+					          << " ptr=" << static_cast<const void*>(state)
+					          << " prev=" << static_cast<const void*>(state->previous)
+					          << " key=0x" << std::hex
+					          << static_cast<std::uint64_t>(state->key())
+					          << " move_raw=0x"
+					          << state->accumulator.debug_move_raw << std::dec
+					          << " source=" << static_cast<int>(
+					               state->accumulator.debug_accumulator_source)
+					          << " null="
+					          << state->accumulator.debug_was_null_move
+					          << " computed="
+					          << state->accumulator.computed_accumulation
+					          << " game_ply="
+					          << state->accumulator.debug_game_ply << std::endl;
+				}
+			}
+		}
+	}
+
+	void EvalHashDebugDescribeFeatures(const Position& pos, std::ostream& out) const {
+		for (IndexType trigger_index = 0; trigger_index < kRefreshTriggers.size();
+		     ++trigger_index) {
+			Features::IndexList active[COLOR_NB], removed[COLOR_NB], added[COLOR_NB];
+			bool reset[COLOR_NB] = {false, false};
+			RawFeatures::AppendActiveIndices(
+				pos, kRefreshTriggers[trigger_index], active);
+			if (pos.state()->previous)
+				RawFeatures::AppendChangedIndices(
+					pos, kRefreshTriggers[trigger_index], removed, added, reset);
+			for (const Color perspective : {BLACK, WHITE}) {
+				auto print_indices = [&](const char* label,
+				                         const Features::IndexList& indices) {
+					out << ' ' << label << "=[";
+					for (std::size_t i = 0; i < indices.size(); ++i) {
+						if (i) out << ',';
+						out << indices[i];
+					}
+					out << ']';
+				};
+				out << "\nfeature_trace trigger=" << trigger_index
+				    << " perspective=" << static_cast<int>(perspective)
+				    << " reset=" << reset[perspective]
+				    << " split=" << SPLIT_IDX;
+				print_indices("active", active[perspective]);
+				print_indices("removed", removed[perspective]);
+				print_indices("added", added[perspective]);
+			}
+		}
+	}
+#endif
+
 	// 中立点へのマッピング
 	OutputType ToOutputRange(int64_t shifted_value) const {
 		return static_cast<OutputType>(std::clamp(shifted_value + 63, 0LL, 127LL));
@@ -344,6 +459,9 @@ class FeatureTransformer {
 		if (refresh || !UpdateAccumulatorIfPossible(pos)) {
 			refresh_accumulator(pos);
 		}
+#if defined(EVAL_HASH_VERIFY_HITS)
+		EvalHashDebugVerifyMaterializedAccumulator(pos, "Transform");
+#endif
 		const auto& accumulation = pos.state()->accumulator.accumulation;
 		const auto& factors      = pos.state()->accumulator.factors; // FM項用
 
@@ -807,6 +925,9 @@ class FeatureTransformer {
 		}
 		accumulator.computed_accumulation = true;
 		accumulator.computed_score = false;
+#if defined(EVAL_HASH_VERIFY_HITS)
+		accumulator.debug_accumulator_source = 2;
+#endif
 	}
 
 #if defined(USE_FINNY_TABLES)
@@ -1135,6 +1256,9 @@ class FeatureTransformer {
 		}
 		accumulator.computed_accumulation = true;
 		accumulator.computed_score = false;
+#if defined(EVAL_HASH_VERIFY_HITS)
+		accumulator.debug_accumulator_source = 3;
+#endif
 	}
 
 	void refresh_accumulator_with_finny_cache(const Position& pos) const {
@@ -1381,6 +1505,9 @@ class FeatureTransformer {
 		accumulator.computed_accumulation = true;
 		// Stockfishでは fc27d15(2020-09-07) にcomputed_scoreが排除されているので確認
 		accumulator.computed_score = false;
+#if defined(EVAL_HASH_VERIFY_HITS)
+		accumulator.debug_accumulator_source = 1;
+#endif
 	}
 
 #if defined(ENABLE_NNUE_BENCH)
@@ -1571,6 +1698,25 @@ class FeatureTransformer {
 	public:
 	void TestRefreshAccumulatorFromScratch(const Position& pos) const {
 		refresh_accumulator_from_scratch(pos);
+	}
+
+	// Test-only accessors used by the Experiment 109 regression.  Keep the
+	// exact RawFeatures dispatcher in the loop so the test observes the same
+	// combined HalfKA/KSDG3 index contract as production accumulation.
+	void TestGetActiveIndices(
+		const Position& pos, const IndexType trigger_index,
+		Features::IndexList (&active)[COLOR_NB]) const {
+		RawFeatures::AppendActiveIndices(
+			pos, kRefreshTriggers[trigger_index], active);
+	}
+
+	void TestGetChangedIndices(
+		const Position& pos, const IndexType trigger_index,
+		Features::IndexList (&removed)[COLOR_NB],
+		Features::IndexList (&added)[COLOR_NB],
+		bool (&reset)[COLOR_NB]) const {
+		RawFeatures::AppendChangedIndices(
+			pos, kRefreshTriggers[trigger_index], removed, added, reset);
 	}
 #if defined(USE_FINNY_TABLES)
 	void TestRefreshAccumulatorWithFinny(const Position& pos) const {

@@ -8,6 +8,9 @@
 #include <fstream>
 #include <limits>
 #include <sstream>
+#if defined(EVAL_HASH_VERIFY_HITS)
+#include <unordered_map>
+#endif
 #include <vector>
 #if defined(MEASURE_EVAL_HASH_BENCHMARK)
 #include <atomic>
@@ -232,6 +235,12 @@ namespace Eval {
 #if defined(MEASURE_EVAL_HASH_BENCHMARK)
 void EvalHash_DiagnosticBeforeTransform(const Position& pos, bool refresh);
 void EvalHash_DiagnosticOnPropagate();
+void EvalHash_DiagnosticOnComplexRouter();
+void EvalHash_DiagnosticOnComplexNetwork();
+#if defined(EVAL_HASH_VERIFY_HITS)
+Value EvalHash_DiagnosticVerifyHit(const Position& pos, Value cached,
+                                   std::uint8_t cached_flags = 0);
+#endif
 #endif
 namespace NNUE {
 
@@ -524,6 +533,52 @@ namespace {
         feature_transformer->UpdateAccumulatorIfPossible(pos);
     }
 
+    static void EnsureAccumulator(const Position& pos) {
+        feature_transformer->EnsureAccumulator(pos);
+    }
+
+    static void ForceRefreshAccumulator(const Position& pos) {
+        feature_transformer->ForceRefreshAccumulator(pos);
+    }
+
+#if defined(EVAL_HASH_VERIFY_HITS) && !defined(NNUE_HALFKAHM2_SIMPLE)
+    static void EvalHashDebugRefreshAccumulatorFromScratch(const Position& pos) {
+        feature_transformer->EvalHashDebugRefreshAccumulatorFromScratch(pos);
+    }
+
+    static void EvalHashDebugDescribeFeatures(const Position& pos,
+                                              std::ostream& out) {
+        feature_transformer->EvalHashDebugDescribeFeatures(pos, out);
+    }
+#endif
+
+#if defined(EVAL_HASH_COMPLEX_SAFE)
+    static std::uint64_t AccumulatorFingerprint(const Position& pos) {
+        const auto& accumulator = pos.state()->accumulator;
+        auto mix = [](std::uint64_t h, std::uint64_t value) {
+            value ^= value >> 30;
+            value *= UINT64_C(0xbf58476d1ce4e5b9);
+            value ^= value >> 27;
+            return (h ^ value) * UINT64_C(0x9e3779b185ebca87);
+        };
+        std::uint64_t h = UINT64_C(0x6a09e667f3bcc909);
+        const auto* main_words = reinterpret_cast<const std::uint64_t*>(
+          accumulator.accumulation);
+        constexpr std::size_t main_count = sizeof(accumulator.accumulation) / 8;
+        // Evenly sample the full Main accumulator, including both perspectives
+        // and every refresh trigger.  This keeps the cache key sensitive to
+        // path-dependent accumulator states without scanning several KiB.
+        for (std::size_t i = 0; i < 48; ++i)
+            h = mix(h, main_words[(i * main_count) / 48]);
+        const auto* factor_words = reinterpret_cast<const std::uint64_t*>(
+          accumulator.factors);
+        constexpr std::size_t factor_count = sizeof(accumulator.factors) / 8;
+        for (std::size_t i = 0; i < 16; ++i)
+            h = mix(h, factor_words[(i * factor_count) / 16]);
+        return h ^ (h >> 29);
+    }
+#endif
+
 #if defined(SFNNwoPSQT)
     // レイヤースタックの選択。双方の玉の段に応じて9通りに分岐させる。
     static int stack_index_for_nnue(const Position& pos) {
@@ -686,6 +741,9 @@ namespace {
 
         const auto bucket_id1 = stack_index_for_nnue(pos);
 
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+        EvalHash_DiagnosticBeforeTransform(pos, refresh);
+#endif
         feature_transformer->Transform(pos, transformed_features, diff_transformed, abs_transformed, refresh, bucket_id1);
 
         // Router and Phase have the same 384-byte input layout. Build it once
@@ -709,6 +767,9 @@ namespace {
 #endif
 #if defined(USE_NNUE_ROUTER_LMR)
         NnueRouterLmrSignal router_lmr_signal{};
+#endif
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+        EvalHash_DiagnosticOnComplexRouter();
 #endif
         const auto bucket_id2 = SelectBucketWithRouter(
           network_buffer.phase_input
@@ -734,6 +795,10 @@ namespace {
 #if defined(ENABLE_NNUE_SIDE_INPUT_MOBILITY_TACTICAL_V1)
         const auto mobility_tactical_input = NnueMobilityTactical::normalize(
           NnueMobilityTactical::extract(pos));
+#endif
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+        EvalHash_DiagnosticOnComplexNetwork();
+        EvalHash_DiagnosticOnPropagate();
 #endif
         const auto output = network[bucket_id2]->Propagate<true, true>(
           transformed_features, diff_transformed, abs_transformed, bucket_id1, buffer
@@ -848,18 +913,42 @@ struct alignas(16) ScoreKeyValue {
 struct EvaluateHashTable : HashTable<ScoreKeyValue> {};
 
 #if defined(EVAL_HASH_ATOMIC64)
+#if defined(EVAL_HASH_COMPLEX_SAFE)
+// score16 + Router/LCA/Cross decision bits + tag45 = one atomic word.
+constexpr unsigned kAtomicSignalBits = 3;
+constexpr unsigned kAtomicPayloadBits = 16 + kAtomicSignalBits;
+constexpr unsigned kAtomicTagBits = 64 - kAtomicPayloadBits;
+#else
 #ifndef EVAL_HASH_ATOMIC_TAG_BITS
 #define EVAL_HASH_ATOMIC_TAG_BITS 48
 #endif
 static_assert(EVAL_HASH_ATOMIC_TAG_BITS >= 1 && EVAL_HASH_ATOMIC_TAG_BITS <= 48);
+constexpr unsigned kAtomicSignalBits = 0;
+constexpr unsigned kAtomicPayloadBits = 16;
+constexpr unsigned kAtomicTagBits = EVAL_HASH_ATOMIC_TAG_BITS;
+#endif
 using EvaluateHashTableSelected = Atomic64HashTable;
 constexpr std::uint64_t kAtomicTagMask =
-  (UINT64_C(1) << EVAL_HASH_ATOMIC_TAG_BITS) - 1;
+  (UINT64_C(1) << kAtomicTagBits) - 1;
 inline std::uint64_t evalhash_tag(Key key) {
-    // One xor-fold is cheaper than a full hash and keeps tag bits from being a
-    // plain subset of the direct-map index bits.
-    const std::uint64_t mixed = key ^ (key >> 32);
-    return (mixed >> 16) & kAtomicTagMask;
+#if defined(EVAL_HASH_COMPLEX_SAFE)
+    // Mix every source bit before truncation.  The former `(key ^ key>>32)>>16`
+    // left key bit 15 uncovered when a 256 KiB table used only 15 index bits,
+    // causing deterministic false hits.  This reversible-style avalanche has
+    // no table-size-dependent verification holes.
+    std::uint64_t mixed = key;
+    mixed ^= mixed >> 30;
+    mixed *= UINT64_C(0xbf58476d1ce4e5b9);
+    mixed ^= mixed >> 27;
+    mixed *= UINT64_C(0x94d049bb133111eb);
+    mixed ^= mixed >> 31;
+    return mixed & kAtomicTagMask;
+#else
+    // Preserve the already-tested Simple/legacy atomic64 contract.  Complex
+    // safe mode needs the stronger avalanche because its payload leaves fewer
+    // tag bits and its table-size sweep exposed a verification-bit hole.
+    return ((key ^ (key >> 32)) >> 16) & kAtomicTagMask;
+#endif
 }
 inline std::uint16_t evalhash_encode_score(Value score) {
     ASSERT_LV3(score >= VALUE_MIN_EVAL && score <= VALUE_MAX_EVAL);
@@ -870,12 +959,18 @@ inline std::uint16_t evalhash_encode_score(Value score) {
 inline Value evalhash_decode_score(std::uint16_t code) {
     return static_cast<Value>(static_cast<int>(code) - 32768);
 }
-inline std::uint64_t evalhash_pack(Key key, Value score) {
-    return (evalhash_tag(key) << 16) | evalhash_encode_score(score);
+inline std::uint64_t evalhash_pack(Key key, Value score, std::uint8_t flags = 0) {
+    return (evalhash_tag(key) << kAtomicPayloadBits)
+         | (static_cast<std::uint64_t>(flags) << 16)
+         | evalhash_encode_score(score);
 }
-inline bool evalhash_unpack(Key key, std::uint64_t packed, Value& score) {
-    if (!packed || (packed >> 16) != evalhash_tag(key)) return false;
+inline bool evalhash_unpack(Key key, std::uint64_t packed, Value& score,
+                            std::uint8_t* flags = nullptr) {
+    if (!packed || (packed >> kAtomicPayloadBits) != evalhash_tag(key)) return false;
     score = evalhash_decode_score(static_cast<std::uint16_t>(packed));
+    if (flags)
+        *flags = static_cast<std::uint8_t>((packed >> 16)
+          & ((UINT64_C(1) << kAtomicSignalBits) - 1));
     return true;
 }
 #else
@@ -889,10 +984,62 @@ bool g_evalHashRequested = true;
 bool g_evalHashRequested = false;
 #endif
 bool g_evalHashInitialized = false;
+#if defined(EVAL_HASH_COMPLEX_SAFE) && defined(USE_NNUE_ROUTER_LMR)
+namespace {
+constexpr std::uint8_t kEvalHashRouterFlag = 1u << 0;
+constexpr std::uint8_t kEvalHashLcaFlag    = 1u << 1;
+constexpr std::uint8_t kEvalHashCrossFlag  = 1u << 2;
+constexpr int kEvalHashRouterThreshold = 256;
+constexpr int kEvalHashCrossThreshold = 127;
+#if defined(NNUE_LCA_LMR_FIXED_THRESHOLD)
+std::atomic<int> g_evalHashLcaThreshold{NNUE_LCA_LMR_FIXED_THRESHOLD};
+#else
+std::atomic<int> g_evalHashLcaThreshold{1959};
+#endif
+
+std::uint8_t evalhash_signal_flags(const NNUE::NnueRouterLmrSignal& signal) {
+    if (!signal.valid) return 0;
+    std::uint8_t flags = 0;
+    if (signal.router_margin <= kEvalHashRouterThreshold)
+        flags |= kEvalHashRouterFlag;
+#if defined(USE_NNUE_LCA_LMR)
+    if (signal.lca_abs_delta_sum >=
+        g_evalHashLcaThreshold.load(std::memory_order_relaxed))
+        flags |= kEvalHashLcaFlag;
+#endif
+#if defined(USE_NNUE_CROSS_LMR)
+    if (signal.cross_abs_max >= kEvalHashCrossThreshold)
+        flags |= kEvalHashCrossFlag;
+#endif
+    return flags;
+}
+
+NNUE::NnueRouterLmrSignal evalhash_restore_signal(std::uint8_t flags) {
+    NNUE::NnueRouterLmrSignal signal{};
+    signal.valid = true;
+    signal.router_margin = flags & kEvalHashRouterFlag
+                         ? kEvalHashRouterThreshold : kEvalHashRouterThreshold + 1;
+#if defined(USE_NNUE_LCA_LMR)
+    const int lca = g_evalHashLcaThreshold.load(std::memory_order_relaxed);
+    signal.lca_abs_delta_sum = flags & kEvalHashLcaFlag ? lca : std::max(0, lca - 1);
+#endif
+#if defined(USE_NNUE_CROSS_LMR)
+    signal.cross_abs_max = static_cast<std::uint8_t>(
+      flags & kEvalHashCrossFlag ? kEvalHashCrossThreshold
+                                 : kEvalHashCrossThreshold - 1);
+#endif
+    return signal;
+}
+}
+#endif
 void EvalHash_Resize(size_t mbSize) {
     // A true default must not probe the table before isready has allocated it.
     g_evalHashInitialized = false;
     g_evalTable.resize(Threads, mbSize);
+    // resize() itself zero-initializes the selected table.  Mark it usable
+    // here as well as in Clear(), because an option callback may legally run
+    // after isready without a following Clear().
+    g_evalHashInitialized = g_evalTable.entry_count() != 0;
 }
 void EvalHash_Clear() {
     g_evalTable.clear(Threads);
@@ -900,6 +1047,13 @@ void EvalHash_Clear() {
 };
 void EvalHash_SetEnabled(bool enabled) { g_evalHashRequested = enabled; }
 bool EvalHash_IsEnabled() { return g_evalHashRequested && g_evalHashInitialized; }
+#if defined(EVAL_HASH_COMPLEX_SAFE) && defined(USE_NNUE_LCA_LMR)
+void EvalHash_SetLcaLmrThreshold(int threshold) {
+    const int previous = g_evalHashLcaThreshold.exchange(threshold, std::memory_order_relaxed);
+    if (previous != threshold && g_evalHashInitialized)
+        EvalHash_Clear();
+}
+#endif
 
 #if defined(MEASURE_EVAL_HASH_BENCHMARK)
 namespace {
@@ -916,9 +1070,137 @@ struct EvalHashDiagnosticCounters {
     std::atomic<std::uint64_t> accumulator_already_computed{0};
     std::atomic<std::uint64_t> accumulator_incremental_updates{0};
     std::atomic<std::uint64_t> accumulator_refreshes{0};
+    std::atomic<std::uint64_t> complex_router_calls{0};
+    std::atomic<std::uint64_t> complex_fm_calls{0};
+    std::atomic<std::uint64_t> complex_phase_calls{0};
+    std::atomic<std::uint64_t> complex_cross_calls{0};
+    std::atomic<std::uint64_t> complex_lca_calls{0};
+    std::atomic<std::uint64_t> verified_hits{0};
+    std::atomic<std::uint64_t> score_mismatches{0};
+    std::atomic<std::uint64_t> score_abs_diff_sum{0};
+    std::atomic<std::uint64_t> score_abs_diff_max{0};
+    std::atomic<std::uint64_t> cached_vs_refresh_mismatches{0};
+    std::atomic<std::uint64_t> incremental_vs_refresh_mismatches{0};
+    std::atomic<std::uint64_t> ft_main_vs_refresh_mismatches{0};
+    std::atomic<std::uint64_t> halfka_fm_vs_refresh_mismatches{0};
+    std::atomic<std::uint64_t> ksdg3_fm_vs_refresh_mismatches{0};
+    std::atomic<std::uint64_t> router_bucket_vs_refresh_mismatches{0};
+    std::atomic<std::uint64_t> continuity_updates{0};
+    std::atomic<std::uint64_t> continuity_refreshes{0};
+    std::atomic<std::uint64_t> continuity_ns{0};
+    std::atomic<std::uint64_t> signal_mismatches{0};
+    std::atomic<std::uint64_t> signal_vs_refresh_mismatches{0};
+    std::atomic<std::uint64_t> router_flag_hits{0};
+    std::atomic<std::uint64_t> lca_flag_hits{0};
+    std::atomic<std::uint64_t> cross_flag_hits{0};
 };
 EvalHashDiagnosticCounters g_evalHashDiagnostic;
 std::atomic<bool> g_evalHashDiagnosticEnabled{true};
+#if defined(EVAL_HASH_VERIFY_HITS)
+// T1 verifier only: distinguish a packed-tag false hit from the same position
+// being stored with a path-dependent incremental score.
+struct EvalHashShadowValue {
+    int score; int material; int game_ply;
+    bool current_accumulation; bool parent_accumulation;
+};
+std::unordered_map<std::uint64_t, EvalHashShadowValue> g_evalHashShadowScores;
+
+std::uint64_t debug_hash_bytes(const void* data, const std::size_t size) {
+    const auto* bytes = static_cast<const std::uint8_t*>(data);
+    std::uint64_t hash = UINT64_C(1469598103934665603);
+    for (std::size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+template <typename T>
+void debug_array_diff(std::ostream& out, const char* label,
+                      const T* left, const T* right, const std::size_t count) {
+    std::size_t differences = 0;
+    std::size_t first = count;
+    std::int64_t max_abs = 0;
+    std::int64_t sum_abs = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (left[i] == right[i]) continue;
+        if (first == count) first = i;
+        ++differences;
+        const auto delta = static_cast<std::int64_t>(left[i])
+                         - static_cast<std::int64_t>(right[i]);
+        const auto magnitude = std::llabs(delta);
+        max_abs = std::max(max_abs, magnitude);
+        sum_abs += magnitude;
+    }
+    out << ' ' << label << "_diff_count=" << differences
+        << ' ' << label << "_first="
+        << (first == count ? -1 : static_cast<std::int64_t>(first))
+        << ' ' << label << "_max_abs=" << max_abs
+        << ' ' << label << "_sum_abs=" << sum_abs
+        << ' ' << label << "_left_hash=0x" << std::hex
+        << debug_hash_bytes(left, count * sizeof(T))
+        << ' ' << label << "_right_hash=0x"
+        << debug_hash_bytes(right, count * sizeof(T)) << std::dec;
+}
+
+void debug_accumulator_diff(
+  std::ostream& out, const NNUE::Accumulator& incremental,
+  const NNUE::Accumulator& scratch) {
+    const auto* incremental_main = &incremental.accumulation[0][0][0];
+    const auto* scratch_main = &scratch.accumulation[0][0][0];
+    constexpr auto main_count = sizeof(incremental.accumulation)
+                              / sizeof(*incremental_main);
+    debug_array_diff(out, "ft_main", incremental_main, scratch_main,
+                     main_count);
+    debug_array_diff(out, "fm_factors",
+      reinterpret_cast<const std::int64_t*>(incremental.factors),
+      reinterpret_cast<const std::int64_t*>(scratch.factors),
+      sizeof(incremental.factors) / sizeof(std::int64_t));
+    for (int perspective = 0; perspective < 2; ++perspective) {
+        const auto& il = incremental.factors[perspective];
+        const auto& sl = scratch.factors[perspective];
+        const std::string prefix = "p" + std::to_string(perspective);
+        debug_array_diff(out, (prefix + "_halfka_sum_v").c_str(),
+                         il.halfka.sum_v, sl.halfka.sum_v, 32);
+        debug_array_diff(out, (prefix + "_halfka_sum_v2").c_str(),
+                         il.halfka.sum_v2, sl.halfka.sum_v2, 32);
+        debug_array_diff(out, (prefix + "_ksdg_sum_v").c_str(),
+                         il.ksdg.sum_v, sl.ksdg.sum_v, 32);
+        debug_array_diff(out, (prefix + "_ksdg_sum_v2").c_str(),
+                         il.ksdg.sum_v2, sl.ksdg.sum_v2, 32);
+    }
+}
+
+void debug_state_chain(std::ostream& out, const Position& pos) {
+    auto* state = pos.state();
+    for (int depth = 0; state && depth < 16; ++depth, state = state->previous) {
+        out << "\nstate_chain depth=" << depth
+            << " ptr=" << static_cast<const void*>(state)
+            << " prev=" << static_cast<const void*>(state->previous)
+            << " key=0x" << std::hex << static_cast<std::uint64_t>(state->key())
+            << " move_raw=0x" << state->accumulator.debug_move_raw << std::dec
+            << " game_ply=" << state->accumulator.debug_game_ply
+            << " null=" << state->accumulator.debug_was_null_move
+            << " source=" << static_cast<int>(
+                 state->accumulator.debug_accumulator_source)
+            << " computed_acc=" << state->accumulator.computed_accumulation
+            << " computed_score=" << state->accumulator.computed_score;
+#if defined(USE_EVAL_LIST)
+        out << " dirty_num=" << state->dirtyPiece.dirty_num;
+        for (int i = 0; i < state->dirtyPiece.dirty_num; ++i)
+            out << " dirty" << i << "_piece_no=" << state->dirtyPiece.pieceNo[i]
+                << " dirty" << i << "_old_b="
+                << state->dirtyPiece.changed_piece[i].old_piece.from[BLACK]
+                << " dirty" << i << "_old_w="
+                << state->dirtyPiece.changed_piece[i].old_piece.from[WHITE]
+                << " dirty" << i << "_new_b="
+                << state->dirtyPiece.changed_piece[i].new_piece.from[BLACK]
+                << " dirty" << i << "_new_w="
+                << state->dirtyPiece.changed_piece[i].new_piece.from[WHITE];
+#endif
+    }
+}
+#endif
 inline void diag_inc(std::atomic<std::uint64_t>& value) {
     value.fetch_add(1, std::memory_order_relaxed);
 }
@@ -940,6 +1222,186 @@ void EvalHash_DiagnosticOnPropagate() {
     diag_inc(g_evalHashDiagnostic.propagate_calls);
 }
 
+void EvalHash_DiagnosticOnComplexRouter() {
+    diag_inc(g_evalHashDiagnostic.complex_router_calls);
+}
+
+void EvalHash_DiagnosticOnComplexNetwork() {
+    auto& d = g_evalHashDiagnostic;
+    // These paths are each evaluated once by the Complex network Propagate.
+    diag_inc(d.complex_fm_calls);
+    diag_inc(d.complex_phase_calls);
+    diag_inc(d.complex_cross_calls);
+    diag_inc(d.complex_lca_calls);
+}
+
+#if defined(EVAL_HASH_VERIFY_HITS)
+Value EvalHash_DiagnosticVerifyHit(const Position& pos, Value cached,
+                                   std::uint8_t cached_flags) {
+    // The hit path has already materialized the FT/FM accumulator. Force only
+    // the downstream score/signals to be recomputed, then compare a complete
+    // refresh as an independent oracle.
+    pos.state()->accumulator.computed_score = false;
+    const Value fresh = NNUE::ComputeScore(pos);
+#if defined(EVAL_HASH_COMPLEX_SAFE) && defined(USE_NNUE_ROUTER_LMR)
+    const auto fresh_flags = evalhash_signal_flags(
+      pos.state()->accumulator.nnue_router_lmr_signal);
+#endif
+    // The scratch oracle writes into the production StateInfo accumulator.
+    // Preserve the complete incremental state, not only score/signal: otherwise
+    // a diagnostic hit changes the parent used by descendants and can create
+    // the very multi-ply divergence that this verifier is meant to detect.
+    const auto incremental_accumulator = pos.state()->accumulator;
+#if !defined(NNUE_HALFKAHM2_SIMPLE)
+    NNUE::EvalHashDebugRefreshAccumulatorFromScratch(pos);
+    const Value refreshed = NNUE::ComputeScore(pos);
+#else
+    const Value refreshed = NNUE::ComputeScore(pos, true);
+#endif
+    const auto scratch_accumulator = pos.state()->accumulator;
+#if defined(EVAL_HASH_COMPLEX_SAFE) && defined(USE_NNUE_ROUTER_LMR)
+    const auto refresh_flags = evalhash_signal_flags(
+      pos.state()->accumulator.nnue_router_lmr_signal);
+#endif
+    auto& d = g_evalHashDiagnostic;
+    if (std::memcmp(incremental_accumulator.accumulation,
+                    scratch_accumulator.accumulation,
+                    sizeof(incremental_accumulator.accumulation)) != 0)
+        diag_inc(d.ft_main_vs_refresh_mismatches);
+    bool halfka_fm_diff = false;
+    bool ksdg3_fm_diff = false;
+    for (const Color perspective : {BLACK, WHITE}) {
+        const auto& incremental = incremental_accumulator.factors[perspective];
+        const auto& scratch = scratch_accumulator.factors[perspective];
+        halfka_fm_diff |=
+            std::memcmp(&incremental.halfka, &scratch.halfka,
+                        sizeof(incremental.halfka)) != 0;
+        ksdg3_fm_diff |=
+            std::memcmp(&incremental.ksdg, &scratch.ksdg,
+                        sizeof(incremental.ksdg)) != 0;
+    }
+    if (halfka_fm_diff)
+        diag_inc(d.halfka_fm_vs_refresh_mismatches);
+    if (ksdg3_fm_diff)
+        diag_inc(d.ksdg3_fm_vs_refresh_mismatches);
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+    if (incremental_accumulator.nnue_signal.selected_bucket
+        != scratch_accumulator.nnue_signal.selected_bucket)
+        diag_inc(d.router_bucket_vs_refresh_mismatches);
+#endif
+    pos.state()->accumulator = incremental_accumulator;
+    diag_inc(d.verified_hits);
+    const auto diff = static_cast<std::uint64_t>(std::abs(static_cast<int>(fresh-cached)));
+    d.score_abs_diff_sum.fetch_add(diff, std::memory_order_relaxed);
+    auto old = d.score_abs_diff_max.load(std::memory_order_relaxed);
+    while (old < diff && !d.score_abs_diff_max.compare_exchange_weak(
+             old, diff, std::memory_order_relaxed)) {}
+    if (fresh != cached) {
+        const auto mismatch_index = d.score_mismatches.fetch_add(1, std::memory_order_relaxed);
+        if (mismatch_index < 20) {
+            std::cout << "evalhash_score_mismatch index " << mismatch_index
+                      << " key 0x" << std::hex << static_cast<std::uint64_t>(pos.state()->key())
+                      << std::dec << " cached " << static_cast<int>(cached)
+                      << " fresh " << static_cast<int>(fresh)
+                      << " refresh " << static_cast<int>(refreshed)
+                      << " material " << pos.state()->materialValue
+                      << " game_ply " << pos.game_ply()
+                      << " sfen " << pos.sfen() << std::endl;
+        }
+    }
+    if (cached != refreshed) {
+        const auto mismatch_index = d.cached_vs_refresh_mismatches.fetch_add(
+          1, std::memory_order_relaxed);
+        {
+            const auto shadow_it = g_evalHashShadowScores.find(
+              static_cast<std::uint64_t>(pos.state()->key()));
+            const int shadow_score = shadow_it == g_evalHashShadowScores.end()
+                                   ? 999999 : shadow_it->second.score;
+            const int shadow_material = shadow_it == g_evalHashShadowScores.end()
+                                      ? 999999 : shadow_it->second.material;
+            const int shadow_ply = shadow_it == g_evalHashShadowScores.end()
+                                 ? -1 : shadow_it->second.game_ply;
+            const int shadow_current = shadow_it == g_evalHashShadowScores.end()
+                                     ? -1 : shadow_it->second.current_accumulation;
+            const int shadow_parent = shadow_it == g_evalHashShadowScores.end()
+                                    ? -1 : shadow_it->second.parent_accumulation;
+            std::cout << "evalhash_cached_refresh_mismatch index " << mismatch_index
+                      << " key 0x" << std::hex
+                      << static_cast<std::uint64_t>(pos.state()->key())
+                      << std::dec << " cached " << static_cast<int>(cached)
+                      << " fresh " << static_cast<int>(fresh)
+                      << " refresh " << static_cast<int>(refreshed)
+                      << " shadow " << shadow_score
+                      << " shadow_material " << shadow_material
+                      << " shadow_ply " << shadow_ply
+                      << " shadow_current_acc " << shadow_current
+                      << " shadow_parent_acc " << shadow_parent
+                      << " material " << pos.state()->materialValue
+                      << " game_ply " << pos.game_ply()
+                      << " sfen " << pos.sfen() << std::endl;
+            std::ostringstream details;
+            details << "evalhash_incremental_scratch_detail index="
+                    << mismatch_index
+                    << " first_layer=";
+            const bool main_diff = std::memcmp(
+              incremental_accumulator.accumulation,
+              scratch_accumulator.accumulation,
+              sizeof(incremental_accumulator.accumulation)) != 0;
+            const bool factor_diff = std::memcmp(
+              incremental_accumulator.factors, scratch_accumulator.factors,
+              sizeof(incremental_accumulator.factors)) != 0;
+            details << (main_diff ? "FT_Main" : factor_diff ? "FM" : "Post_FT")
+                    << " incremental_source=" << static_cast<int>(
+                         incremental_accumulator.debug_accumulator_source)
+                    << " scratch_source=" << static_cast<int>(
+                         scratch_accumulator.debug_accumulator_source);
+            debug_accumulator_diff(details, incremental_accumulator,
+                                   scratch_accumulator);
+#if defined(ENABLE_NNUE_SIGNAL_LOG)
+            const auto& is = incremental_accumulator.nnue_signal;
+            const auto& ss = scratch_accumulator.nnue_signal;
+            details << " incremental_bucket=" << is.selected_bucket
+                    << " scratch_bucket=" << ss.selected_bucket
+                    << " incremental_router_top1=" << is.router_top1_logit
+                    << " scratch_router_top1=" << ss.router_top1_logit
+                    << " incremental_router_margin=" << is.router_margin
+                    << " scratch_router_margin=" << ss.router_margin
+                    << " incremental_phase0=" << is.phase_scale[0]
+                    << " scratch_phase0=" << ss.phase_scale[0]
+                    << " incremental_cross_max=" << static_cast<int>(is.cross_abs_max)
+                    << " scratch_cross_max=" << static_cast<int>(ss.cross_abs_max)
+                    << " incremental_lca_sum=" << is.lca_abs_delta_sum
+                    << " scratch_lca_sum=" << ss.lca_abs_delta_sum
+                    << " incremental_deep=" << is.deep_output
+                    << " scratch_deep=" << ss.deep_output
+                    << " incremental_bypass=" << is.bypass_output
+                    << " scratch_bypass=" << ss.bypass_output;
+#endif
+            if (mismatch_index < 32) {
+                debug_state_chain(details, pos);
+                NNUE::EvalHashDebugDescribeFeatures(pos, details);
+            }
+            std::cout << details.str() << std::endl;
+        }
+    }
+    if (fresh != refreshed) diag_inc(d.incremental_vs_refresh_mismatches);
+#if defined(EVAL_HASH_COMPLEX_SAFE) && defined(USE_NNUE_ROUTER_LMR)
+    if (cached_flags != fresh_flags) diag_inc(d.signal_mismatches);
+    if (cached_flags != refresh_flags) diag_inc(d.signal_vs_refresh_mismatches);
+    // Restore the exact hit contract after the verifier's recomputations.
+    // The full accumulator assignment above already restored the incremental
+    // FT/FM bytes.  Only publish the cached boundary-equivalent signal.
+    auto restored = evalhash_restore_signal(cached_flags);
+    auto& accumulator = pos.state()->accumulator;
+    accumulator.score = cached;
+    accumulator.computed_score = true;
+    accumulator.nnue_router_lmr_signal = restored;
+    NNUE::SetLastNnueRouterLmrSignal(&accumulator.nnue_router_lmr_signal);
+#endif
+    return cached;
+}
+#endif
+
 void EvalHash_SetDiagnosticEnabled(bool enabled) {
     g_evalHashDiagnosticEnabled.store(enabled, std::memory_order_relaxed);
 }
@@ -951,6 +1413,20 @@ void EvalHash_DiagnosticReset() {
     d.transform_calls=0; d.propagate_calls=0;
     d.accumulator_already_computed=0; d.accumulator_incremental_updates=0;
     d.accumulator_refreshes=0;
+    d.complex_router_calls=0; d.complex_fm_calls=0;
+    d.complex_phase_calls=0; d.complex_cross_calls=0; d.complex_lca_calls=0;
+    d.verified_hits=0; d.score_mismatches=0; d.score_abs_diff_sum=0; d.score_abs_diff_max=0;
+    d.cached_vs_refresh_mismatches=0; d.incremental_vs_refresh_mismatches=0;
+    d.ft_main_vs_refresh_mismatches=0;
+    d.halfka_fm_vs_refresh_mismatches=0;
+    d.ksdg3_fm_vs_refresh_mismatches=0;
+    d.router_bucket_vs_refresh_mismatches=0;
+    d.continuity_updates=0; d.continuity_refreshes=0; d.continuity_ns=0;
+    d.signal_mismatches=0; d.signal_vs_refresh_mismatches=0;
+    d.router_flag_hits=0; d.lca_flag_hits=0; d.cross_flag_hits=0;
+#if defined(EVAL_HASH_VERIFY_HITS)
+    g_evalHashShadowScores.clear();
+#endif
 }
 
 void EvalHash_DiagnosticReport() {
@@ -959,10 +1435,13 @@ void EvalHash_DiagnosticReport() {
     const auto hits=d.hits.load(std::memory_order_relaxed);
     std::cout << "[EvalHash Diagnostic]" << std::endl
               << "enabled " << g_evalHashDiagnosticEnabled.load(std::memory_order_relaxed) << std::endl
+              << "runtime_requested " << g_evalHashRequested << std::endl
+              << "table_initialized " << g_evalHashInitialized << std::endl
+              << "runtime_effective " << EvalHash_IsEnabled() << std::endl
               << "entry_size " <<
 #if defined(EVAL_HASH_ATOMIC64)
                  sizeof(std::atomic<std::uint64_t>) << std::endl
-              << "tag_bits " << EVAL_HASH_ATOMIC_TAG_BITS << std::endl
+              << "tag_bits " << kAtomicTagBits << std::endl
 #else
                  sizeof(ScoreKeyValue) << std::endl
 #endif
@@ -982,6 +1461,34 @@ void EvalHash_DiagnosticReport() {
               << "accumulator_already_computed " << d.accumulator_already_computed.load() << std::endl
               << "accumulator_incremental_updates " << d.accumulator_incremental_updates.load() << std::endl
               << "accumulator_refreshes " << d.accumulator_refreshes.load() << std::endl;
+    std::cout << "complex_router_calls " << d.complex_router_calls.load() << std::endl
+              << "complex_fm_calls " << d.complex_fm_calls.load() << std::endl
+              << "complex_phase_calls " << d.complex_phase_calls.load() << std::endl
+              << "complex_cross_calls " << d.complex_cross_calls.load() << std::endl
+              << "complex_lca_calls " << d.complex_lca_calls.load() << std::endl;
+    std::cout << "verified_hits " << d.verified_hits.load() << std::endl
+              << "score_mismatches " << d.score_mismatches.load() << std::endl
+              << "score_abs_diff_sum " << d.score_abs_diff_sum.load() << std::endl
+              << "score_abs_diff_max " << d.score_abs_diff_max.load() << std::endl;
+    std::cout << "cached_vs_refresh_mismatches " << d.cached_vs_refresh_mismatches.load() << std::endl
+              << "incremental_vs_refresh_mismatches "
+              << d.incremental_vs_refresh_mismatches.load() << std::endl
+              << "ft_main_vs_refresh_mismatches "
+              << d.ft_main_vs_refresh_mismatches.load() << std::endl
+              << "halfka_fm_vs_refresh_mismatches "
+              << d.halfka_fm_vs_refresh_mismatches.load() << std::endl
+              << "ksdg3_fm_vs_refresh_mismatches "
+              << d.ksdg3_fm_vs_refresh_mismatches.load() << std::endl
+              << "router_bucket_vs_refresh_mismatches "
+              << d.router_bucket_vs_refresh_mismatches.load() << std::endl
+              << "continuity_updates " << d.continuity_updates.load() << std::endl
+              << "continuity_refreshes " << d.continuity_refreshes.load() << std::endl
+              << "continuity_ns " << d.continuity_ns.load() << std::endl
+              << "signal_mismatches " << d.signal_mismatches.load() << std::endl
+              << "signal_vs_refresh_mismatches " << d.signal_vs_refresh_mismatches.load() << std::endl
+              << "router_flag_hits " << d.router_flag_hits.load() << std::endl
+              << "lca_flag_hits " << d.lca_flag_hits.load() << std::endl
+              << "cross_flag_hits " << d.cross_flag_hits.load() << std::endl;
 }
 
 void EvalHash_Microbench(std::uint64_t repetitions) {
@@ -1039,7 +1546,7 @@ void EvalHash_Atomic64Selftest(std::uint64_t collisionTrials) {
     std::cout << "atomic64_score_roundtrip_errors " << errors << std::endl
               << "atomic64_value_min " << VALUE_MIN_EVAL << std::endl
               << "atomic64_value_max " << VALUE_MAX_EVAL << std::endl
-              << "atomic64_tag_bits " << EVAL_HASH_ATOMIC_TAG_BITS << std::endl
+              << "atomic64_tag_bits " << kAtomicTagBits << std::endl
               << "atomic64_collision_trials " << collisionTrials << std::endl
               << "atomic64_tag_collisions " << collisions << std::endl;
 }
@@ -1155,7 +1662,7 @@ Value evaluate(const Position& pos) {
         return accumulator.score;
     }
 
-#if defined(USE_GLOBAL_OPTIONS)
+#if defined(USE_GLOBAL_OPTIONS) && !defined(EVAL_HASH_RUNTIME_OPTION_OVERRIDES_GLOBAL)
     // GlobalOptionsでeval hashを用いない設定になっているなら
     // eval hashへの照会をskipする。
     if (!GlobalOptions.use_eval_hash) {
@@ -1170,6 +1677,33 @@ Value evaluate(const Position& pos) {
         return NNUE::ComputeScore(pos);
 
     const Key key = pos.state()->key();
+#if defined(EVAL_HASH_COMPLEX_SAFE)
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+    const bool continuity_refresh =
+      !pos.state()->accumulator.computed_accumulation
+      && !(pos.state()->previous
+           && pos.state()->previous->accumulator.computed_accumulation);
+    const auto continuity_begin = std::chrono::steady_clock::now();
+#endif
+#if defined(EVAL_HASH_FORCE_REFRESH_ON_HIT)
+    // Diagnostic candidate: canonicalize every probed state.
+    NNUE::ForceRefreshAccumulator(pos);
+#else
+    NNUE::EnsureAccumulator(pos);
+#endif
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+    const auto continuity_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - continuity_begin).count();
+    diag_inc(g_evalHashDiagnostic.continuity_updates);
+    if (continuity_refresh) diag_inc(g_evalHashDiagnostic.continuity_refreshes);
+    g_evalHashDiagnostic.continuity_ns.fetch_add(
+      static_cast<std::uint64_t>(continuity_elapsed), std::memory_order_relaxed);
+#endif
+    const Key lookupKey = static_cast<Key64>(key)
+                        ^ NNUE::AccumulatorFingerprint(pos);
+#else
+    const Key lookupKey = key;
+#endif
 #if !defined(EVAL_HASH_ATOMIC64)
     ScoreKeyValue entry;
 #endif
@@ -1182,8 +1716,9 @@ Value evaluate(const Position& pos) {
 #endif
 #if defined(EVAL_HASH_ATOMIC64)
     Value cachedScore;
-    const auto packed = g_evalTable[key].load(std::memory_order_relaxed);
-    if (evalhash_unpack(key, packed, cachedScore)) {
+    std::uint8_t cachedFlags = 0;
+    const auto packed = g_evalTable[lookupKey].load(std::memory_order_relaxed);
+    if (evalhash_unpack(lookupKey, packed, cachedScore, &cachedFlags)) {
 #else
     entry = *g_evalTable[key]; entry.decode();
     if (entry.key == key) {
@@ -1195,12 +1730,55 @@ Value evaluate(const Position& pos) {
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
         NNUE::SetLastNnueSignalAccess(NNUE::NnueSignalEvalSource::EvalHashHit);
 #endif
+#if defined(EVAL_HASH_MAINTAIN_ACCUMULATOR) && !defined(EVAL_HASH_COMPLEX_SAFE)
+        // A cached score cannot replace the FT/FM state: child positions use
+        // this node as the parent of their incremental accumulator chain.
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+        const bool continuity_refresh =
+          !pos.state()->accumulator.computed_accumulation
+          && !(pos.state()->previous
+               && pos.state()->previous->accumulator.computed_accumulation);
+        const auto continuity_begin = std::chrono::steady_clock::now();
+#endif
+#if defined(EVAL_HASH_FORCE_REFRESH_ON_HIT)
+        NNUE::ForceRefreshAccumulator(pos);
+#else
+        NNUE::EnsureAccumulator(pos);
+#endif
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+        const auto continuity_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - continuity_begin).count();
+        diag_inc(g_evalHashDiagnostic.continuity_updates);
+        if (continuity_refresh) diag_inc(g_evalHashDiagnostic.continuity_refreshes);
+        g_evalHashDiagnostic.continuity_ns.fetch_add(
+          static_cast<std::uint64_t>(continuity_elapsed), std::memory_order_relaxed);
+#endif
+#endif
 #if defined(USE_NNUE_ROUTER_LMR)
-        // Eval hash stores only the score, so no Router signal belongs to this hit.
+#if defined(EVAL_HASH_COMPLEX_SAFE)
+        auto restoredSignal = evalhash_restore_signal(cachedFlags);
+        auto& mutableAccumulator = pos.state()->accumulator;
+        mutableAccumulator.score = cachedScore;
+        mutableAccumulator.computed_score = true;
+        mutableAccumulator.nnue_router_lmr_signal = restoredSignal;
+        NNUE::SetLastNnueRouterLmrSignal(
+          &mutableAccumulator.nnue_router_lmr_signal);
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+        if (cachedFlags & kEvalHashRouterFlag) diag_inc(g_evalHashDiagnostic.router_flag_hits);
+        if (cachedFlags & kEvalHashLcaFlag) diag_inc(g_evalHashDiagnostic.lca_flag_hits);
+        if (cachedFlags & kEvalHashCrossFlag) diag_inc(g_evalHashDiagnostic.cross_flag_hits);
+#endif
+#else
+        // Score-only variants intentionally expose the missing-signal behavior.
         NNUE::SetLastNnueRouterLmrSignal();
 #endif
+#endif
 #if defined(EVAL_HASH_ATOMIC64)
+#if defined(MEASURE_EVAL_HASH_BENCHMARK) && defined(EVAL_HASH_VERIFY_HITS)
+        return EvalHash_DiagnosticVerifyHit(pos, cachedScore, cachedFlags);
+#else
         return cachedScore;
+#endif
 #else
         return Value(entry.score);
 #endif
@@ -1214,6 +1792,11 @@ Value evaluate(const Position& pos) {
 #if defined(MEASURE_EVAL_HASH_BENCHMARK)
     diag_inc(g_evalHashDiagnostic.compute_score_calls);
 #endif
+#if defined(MEASURE_EVAL_HASH_BENCHMARK) && defined(EVAL_HASH_VERIFY_HITS)
+    const bool shadowCurrentAccumulation = pos.state()->accumulator.computed_accumulation;
+    const bool shadowParentAccumulation = pos.state()->previous
+      && pos.state()->previous->accumulator.computed_accumulation;
+#endif
     Value score = NNUE::ComputeScore(pos);
 #if defined(USE_EVAL_HASH)
 #if defined(MEASURE_EVAL_HASH_BENCHMARK)
@@ -1221,7 +1804,17 @@ Value evaluate(const Position& pos) {
 #endif
     // せっかく計算したのでevaluate hash tableに保存しておく。
 #if defined(EVAL_HASH_ATOMIC64)
-    g_evalTable[key].store(evalhash_pack(key, score), std::memory_order_relaxed);
+    std::uint8_t storeFlags = 0;
+#if defined(EVAL_HASH_COMPLEX_SAFE) && defined(USE_NNUE_ROUTER_LMR)
+    storeFlags = evalhash_signal_flags(
+      pos.state()->accumulator.nnue_router_lmr_signal);
+#endif
+    g_evalTable[lookupKey].store(evalhash_pack(lookupKey, score, storeFlags), std::memory_order_relaxed);
+#if defined(MEASURE_EVAL_HASH_BENCHMARK) && defined(EVAL_HASH_VERIFY_HITS)
+    g_evalHashShadowScores[static_cast<std::uint64_t>(key)] = {
+      static_cast<int>(score), pos.state()->materialValue, pos.game_ply(),
+      shadowCurrentAccumulation, shadowParentAccumulation};
+#endif
 #else
     entry.key = key; entry.score = score; entry.encode(); *g_evalTable[key] = entry;
 #endif

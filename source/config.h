@@ -450,6 +450,17 @@
 	#define USE_NNUE_KSDG3_EFFECT_TOUCHED_MASK
 #endif
 
+// KSDG3 changed indices depend on board_effect_prev, which is Position-global
+// scratch storage.  A parent StateInfo may be materialized after a temporary
+// child do/undo has overwritten that scratch board.  Capture the compact
+// KSDG3 delta while do_move() still owns the correct transition and keep it in
+// the destination StateInfo.  DISABLE_NNUE_KSDG3_SAVED_DELTA is retained for
+// before/after benchmarks only.
+#if defined(YANEURAOU_ENGINE_NNUE_SFNNwoP1536) \
+	&& !defined(DISABLE_NNUE_KSDG3_SAVED_DELTA)
+	#define USE_NNUE_KSDG3_SAVED_DELTA
+#endif
+
 // SFNNwoP1536ではMain accumulatorのmulti-delta non-reset更新を、
 // 256-byte tileごとにpreviousを1回loadし、removed/addedを既存順で適用して
 // 1回storeする。1 remove + 1 add fused、reset、FM updateは従来pathのまま。

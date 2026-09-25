@@ -201,6 +201,9 @@ void SearchOptions::add_options(OptionsMap& options) {
 #endif
     options.add("NnueLcaLmrThreshold", Option(NnueLcaLmrOptionDefault, 0, 4064, [&](const Option& o) {
                     nnue_lca_lmr_threshold = int(o);
+#if defined(EVAL_HASH_COMPLEX_SAFE) && defined(USE_EVAL_HASH)
+                    Eval::EvalHash_SetLcaLmrThreshold(nnue_lca_lmr_threshold);
+#endif
                     return std::nullopt;
                 }));
 #endif

@@ -216,6 +216,23 @@ struct StateInfo {
 	Eval::NNUE::Accumulator accumulator;
 #endif
 
+#if defined(USE_NNUE_KSDG3_SAVED_DELTA)
+	// Experiment 111 / production correctness fix.  The fixed-corpus maximum
+	// before the change was 12 removed and 12 added indices per perspective
+	// (p99=8), so 12 is the smallest observed-capacity buffer.  A legal
+	// transition can theoretically exceed it; overflow forces an exact active
+	// feature refresh for that perspective.
+	static constexpr std::size_t Ksdg3DeltaCapacity = 12;
+	struct Ksdg3SavedDelta {
+		std::uint16_t removed[COLOR_NB][Ksdg3DeltaCapacity];
+		std::uint16_t added[COLOR_NB][Ksdg3DeltaCapacity];
+		std::uint8_t removed_count[COLOR_NB];
+		std::uint8_t added_count[COLOR_NB];
+		std::uint8_t valid_mask;
+		std::uint8_t overflow_mask;
+	} ksdg3SavedDelta;
+#endif
+
 #if defined(ENABLE_NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE)
 	// Experiment-only logical relation deltas. They are converted to fixed
 	// BLACK/WHITE feature indices when the folded accumulator is updated.

@@ -752,6 +752,24 @@ void KingSafety3_DistinguishGolds<AssociatedKing>::AppendChangedIndices(
     const Position& pos, Color perspective,
     IndexList* removed, IndexList* added) {
 
+#if defined(USE_NNUE_KSDG3_SAVED_DELTA)
+  if constexpr (AssociatedKing == Side::kFriend) {
+    const auto& saved = pos.state()->ksdg3SavedDelta;
+    const std::uint8_t bit = std::uint8_t(1u << perspective);
+    if (saved.valid_mask & bit) {
+      // Overflow is handled before this method is reached: FeatureSet marks
+      // this perspective for an exact active-feature refresh.
+      if (saved.overflow_mask & bit)
+        return;
+      for (std::size_t i = 0; i < saved.removed_count[perspective]; ++i)
+        removed->push_back(saved.removed[perspective][i]);
+      for (std::size_t i = 0; i < saved.added_count[perspective]; ++i)
+        added->push_back(saved.added[perspective][i]);
+      return;
+    }
+  }
+#endif
+
 #if defined(USE_NNUE_KSDG3_EFFECT_TOUCHED_MASK)
   AppendKsdg3ChangedProduction<AssociatedKing>(
       pos, perspective, removed, added);

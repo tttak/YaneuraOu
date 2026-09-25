@@ -293,6 +293,18 @@ class FeatureTransformer {
 		return false;
 	}
 
+	// Keep an exact accumulator chain when an external score cache bypasses
+	// Transform().
+	void EnsureAccumulator(const Position& pos) const {
+		if (!UpdateAccumulatorIfPossible(pos))
+			refresh_accumulator(pos);
+	}
+
+
+	void ForceRefreshAccumulator(const Position& pos) const {
+		refresh_accumulator(pos);
+	}
+
 	void EnsureAccumulator(const Position& pos, bool refresh) const {
 		if (refresh || !UpdateAccumulatorIfPossible(pos)) {
 			refresh_accumulator(pos);

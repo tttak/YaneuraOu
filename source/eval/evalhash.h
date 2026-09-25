@@ -59,7 +59,11 @@ private:
 struct Atomic64HashTable {
     void resize(ThreadPool&, size_t mbSize) {
         size_t requestedBytes = mbSize * 1024 * 1024;
-#if defined(EVAL_HASH_ATOMIC64_HALF_BYTES)
+#if defined(EVAL_HASH_ATOMIC64_QUARTER_BYTES)
+        requestedBytes /= 4; // diagnostic size sweep: 1 MiB option => 256 KiB.
+#elif defined(EVAL_HASH_ATOMIC64_EIGHTH_BYTES)
+        requestedBytes /= 8; // diagnostic size sweep: 1 MiB option => 128 KiB.
+#elif defined(EVAL_HASH_ATOMIC64_HALF_BYTES)
         requestedBytes /= 2; // diagnostic: same entry count as old 16-byte table.
 #endif
         size_t newCount = requestedBytes / sizeof(std::atomic<std::uint64_t>);

@@ -1537,6 +1537,7 @@ void TestFeatures(Position& pos) {
   PRNG prng(20171128);
 
   std::uint64_t num_moves = 0;
+  std::uint64_t ksdg3_saved_delta_overflows = 0;
   std::vector<std::uint64_t> num_updates(kRefreshTriggers.size() + 1);
   std::vector<std::uint64_t> num_resets(kRefreshTriggers.size());
   constexpr IndexType kUnknown = -1;
@@ -1611,6 +1612,13 @@ void TestFeatures(Position& pos) {
       Move m = mg.begin()[prng.rand(mg.size())];
       pos.do_move(m, state[ply]);
 
+#if defined(USE_NNUE_KSDG3_SAVED_DELTA)
+      for (const Color perspective : {BLACK, WHITE})
+        ksdg3_saved_delta_overflows +=
+            (pos.state()->ksdg3SavedDelta.overflow_mask
+             & std::uint8_t(1u << perspective)) != 0;
+#endif
+
       ++num_moves;
       update_index_sets(pos, &index_sets);
       ASSERT(index_sets == make_index_sets(pos));
@@ -1644,6 +1652,10 @@ void TestFeatures(Position& pos) {
             << (100.0 * num_observed_indices / RawFeatures::kDimensions)
             << "% of " << RawFeatures::kDimensions
             << ") features" << std::endl;
+#if defined(USE_NNUE_KSDG3_SAVED_DELTA)
+  std::cout << "KSDG3 saved-delta overflow perspectives = "
+            << ksdg3_saved_delta_overflows << std::endl;
+#endif
 }
 
 // NNUE Accumulatorの差分更新結果と全計算結果を比較するテスト
@@ -1858,6 +1870,266 @@ void TestAccumulator(Position& pos) {
 
   std::cout << "passed." << std::endl;
   std::cout << num_games << " games, " << num_moves << " moves" << std::endl;
+}
+
+// Experiment 109 regression: this short legal sequence was recovered from the
+// first EvalHash verifier mismatch.  It checks the sparse-feature transition
+// identity before comparing the production incremental accumulator with a
+// true scratch rebuild at every ply.  Scratch output is restored afterwards,
+// so the next move always starts from the unmodified production path.
+void TestAccumulatorRegression109(Position& pos) {
+  constexpr const char* kRootSfen =
+      "6n1l/2+S1k4/2lp4p/1np1B2b1/3PP4/1N1S3rP/1P2+pPP+p1/1p1G5/"
+      "3KG2r1 b GSN2L4Pgs2p 1";
+  constexpr std::array<const char*, 2> kMoves = {"6f5g", "2d5g+"};
+
+  StateInfo root;
+  StateInfo warm_root;
+  std::array<StateInfo, kMoves.size()> states;
+  StateInfo probe_child_state;
+
+#if defined(USE_FINNY_TABLES)
+  // Reproduce the search condition: the same king-square Finny bucket has
+  // already been populated by a different position before this root is
+  // refreshed.  A cold-only check would miss cache-transition defects.
+  pos.set_hirate(&warm_root);
+  feature_transformer->TestResetFinnyCache();
+  feature_transformer->TestRefreshAccumulatorWithFinny(pos);
+#endif
+
+  pos.set(kRootSfen, &root);
+#if defined(USE_FINNY_TABLES)
+  feature_transformer->TestRefreshAccumulatorWithFinny(pos);
+  const Accumulator root_finny = pos.state()->accumulator;
+  feature_transformer->TestRefreshAccumulatorFromScratch(pos);
+  const Accumulator root_scratch = pos.state()->accumulator;
+  const bool root_main_equal =
+      std::memcmp(root_finny.accumulation, root_scratch.accumulation,
+                  sizeof(root_finny.accumulation)) == 0;
+  const bool root_fm_equal =
+      std::memcmp(root_finny.factors, root_scratch.factors,
+                  sizeof(root_finny.factors)) == 0;
+  std::cout << "[Experiment 109 Finny warm transition] main="
+            << (root_main_equal ? "OK" : "FAIL")
+            << " fm=" << (root_fm_equal ? "OK" : "FAIL") << std::endl;
+  pos.state()->accumulator = root_finny;
+#else
+  feature_transformer->TestRefreshAccumulatorFromScratch(pos);
+#endif
+
+  auto sorted = [](const Features::IndexList& source) {
+    std::vector<IndexType> result(source.begin(), source.end());
+    std::sort(result.begin(), result.end());
+    return result;
+  };
+  auto print_vector = [](const char* name,
+                         const std::vector<IndexType>& values) {
+    std::cout << "  " << name << " (" << values.size() << ") :";
+    for (const auto value : values)
+      std::cout << ' ' << value;
+    std::cout << std::endl;
+  };
+  auto subtract = [](const std::vector<IndexType>& left,
+                     const std::vector<IndexType>& right) {
+    std::vector<IndexType> result;
+    std::set_difference(left.begin(), left.end(), right.begin(), right.end(),
+                        std::back_inserter(result));
+    return result;
+  };
+
+  std::cout << "[Experiment 109 accumulator regression]" << std::endl
+            << "root_sfen: " << pos.sfen() << std::endl;
+
+  for (std::size_t ply = 0; ply < kMoves.size(); ++ply) {
+    Features::IndexList before[COLOR_NB];
+    feature_transformer->TestGetActiveIndices(pos, 0, before);
+
+    const Move move = USIEngine::to_move(pos, kMoves[ply]);
+    if (move == Move::none()) {
+      std::cout << "FAIL: illegal/unparsed move " << kMoves[ply] << std::endl;
+      return;
+    }
+    pos.do_move(move, states[ply]);
+
+    // Reproduce the search-only ordering which invalidates Position's single
+    // board_effect_prev snapshot: the current StateInfo is still
+    // unmaterialized, but a temporary child is made and undone before the
+    // current accumulator is requested.  dirtyPiece still describes
+    // parent->current, while board_effect_prev now describes current->child.
+    // The production search is allowed to perform such speculative
+    // do_move/undo_move work before evaluation, so this is the essential
+    // regression case rather than the immediate do_move->evaluate path.
+    if (ply + 1 == kMoves.size()) {
+      MoveList<LEGAL_ALL> probe_moves(pos);
+      if (probe_moves.size() != 0) {
+#if defined(USE_BOARD_EFFECT_PREV)
+        LongEffect::ByteBoard expected_previous_effect[COLOR_NB];
+        std::memcpy(expected_previous_effect, pos.board_effect_prev,
+                    sizeof(expected_previous_effect));
+#endif
+        const Move probe_move = *probe_moves.begin();
+        pos.do_move(probe_move, probe_child_state);
+        pos.undo_move(probe_move);
+        std::cout << "  delayed_materialization_probe child="
+                  << probe_move;
+#if defined(USE_BOARD_EFFECT_PREV)
+        std::cout << " board_effect_prev_preserved="
+                  << (std::memcmp(expected_previous_effect,
+                                  pos.board_effect_prev,
+                                  sizeof(expected_previous_effect)) == 0);
+#endif
+        std::cout << std::endl;
+      }
+    }
+
+    Features::IndexList after[COLOR_NB], removed[COLOR_NB], added[COLOR_NB];
+    bool reset[COLOR_NB] = {false, false};
+    feature_transformer->TestGetActiveIndices(pos, 0, after);
+    feature_transformer->TestGetChangedIndices(
+        pos, 0, removed, added, reset);
+
+    bool transition_ok = true;
+    for (const Color perspective : {BLACK, WHITE}) {
+      auto expected = sorted(before[perspective]);
+      const auto removed_sorted = sorted(removed[perspective]);
+      const auto added_sorted = sorted(added[perspective]);
+      const auto actual = sorted(after[perspective]);
+      if (reset[perspective]) {
+        expected = added_sorted;
+      } else {
+        for (const auto index : removed_sorted) {
+          const auto it = std::lower_bound(expected.begin(), expected.end(), index);
+          if (it == expected.end() || *it != index) {
+            transition_ok = false;
+            std::cout << "  removal_not_active perspective="
+                      << static_cast<int>(perspective)
+                      << " index=" << index << std::endl;
+          } else {
+            expected.erase(it);
+          }
+        }
+        expected.insert(expected.end(), added_sorted.begin(), added_sorted.end());
+        std::sort(expected.begin(), expected.end());
+      }
+      if (expected != actual) {
+        transition_ok = false;
+        std::cout << "  feature_transition_mismatch perspective="
+                  << static_cast<int>(perspective) << std::endl;
+        print_vector("expected_not_actual", subtract(expected, actual));
+        print_vector("actual_not_expected", subtract(actual, expected));
+        print_vector("removed", removed_sorted);
+        print_vector("added", added_sorted);
+      }
+    }
+
+    const Value incremental_score = ::YaneuraOu::Eval::evaluate(pos);
+    const Accumulator incremental = pos.state()->accumulator;
+    feature_transformer->TestRefreshAccumulatorFromScratch(pos);
+    const Value scratch_score = ::YaneuraOu::Eval::evaluate(pos);
+    const Accumulator scratch = pos.state()->accumulator;
+
+    const char* first_layer = "none";
+    Color first_perspective = BLACK;
+    std::size_t first_index = 0;
+    bool equal = true;
+    for (const Color perspective : {BLACK, WHITE}) {
+      for (std::size_t trigger = 0; trigger < kRefreshTriggers.size(); ++trigger) {
+        for (std::size_t index = 0; index < kTransformedFeatureDimensions;
+             ++index) {
+          if (incremental.accumulation[perspective][trigger][index]
+              != scratch.accumulation[perspective][trigger][index]) {
+            equal = false;
+            first_layer = "FT_Main";
+            first_perspective = perspective;
+            first_index = index;
+            goto comparison_done;
+          }
+        }
+      }
+      for (std::size_t index = 0; index < 32; ++index) {
+        if (incremental.factors[perspective].halfka.sum_v[index]
+                != scratch.factors[perspective].halfka.sum_v[index]
+            || incremental.factors[perspective].halfka.sum_v2[index]
+                != scratch.factors[perspective].halfka.sum_v2[index]) {
+          equal = false;
+          first_layer = "FM_HalfKA";
+          first_perspective = perspective;
+          first_index = index;
+          goto comparison_done;
+        }
+        if (incremental.factors[perspective].ksdg.sum_v[index]
+                != scratch.factors[perspective].ksdg.sum_v[index]
+            || incremental.factors[perspective].ksdg.sum_v2[index]
+                != scratch.factors[perspective].ksdg.sum_v2[index]) {
+          equal = false;
+          first_layer = "FM_KSDG3";
+          first_perspective = perspective;
+          first_index = index;
+          goto comparison_done;
+        }
+      }
+    }
+comparison_done:
+    std::cout << "ply=" << (ply + 1) << " move=" << kMoves[ply]
+              << " key=0x" << std::hex << pos.key() << std::dec
+              << " transition=" << (transition_ok ? "OK" : "FAIL")
+              << " accumulator=" << (equal ? "OK" : "FAIL")
+              << " incremental_cp=" << incremental_score
+              << " scratch_cp=" << scratch_score
+              << " first_layer=" << first_layer;
+    if (!equal)
+      std::cout << " perspective=" << static_cast<int>(first_perspective)
+                << " index=" << first_index;
+    std::cout << " sfen=" << pos.sfen() << std::endl;
+
+    // Preserve the production incremental lineage for the next ply.
+    pos.state()->accumulator = incremental;
+  }
+
+  // Multi-ply deferred-materialization check.  Make two moves without
+  // evaluating the intermediate state, materialize the leaf, then undo and
+  // materialize the still-deferred parent after board_effect_prev has been
+  // overwritten by the child transition.
+  pos.set(kRootSfen, &root);
+  feature_transformer->TestRefreshAccumulatorFromScratch(pos);
+  const Move chain_first = USIEngine::to_move(pos, kMoves[0]);
+  pos.do_move(chain_first, states[0]);
+  const Move chain_second = USIEngine::to_move(pos, kMoves[1]);
+  pos.do_move(chain_second, states[1]);
+
+  const Value leaf_incremental_score = ::YaneuraOu::Eval::evaluate(pos);
+  const Accumulator leaf_incremental = pos.state()->accumulator;
+  feature_transformer->TestRefreshAccumulatorFromScratch(pos);
+  const Value leaf_scratch_score = ::YaneuraOu::Eval::evaluate(pos);
+  const Accumulator leaf_scratch = pos.state()->accumulator;
+  const bool leaf_equal =
+      std::memcmp(leaf_incremental.accumulation, leaf_scratch.accumulation,
+                  sizeof(leaf_incremental.accumulation)) == 0
+      && std::memcmp(leaf_incremental.factors, leaf_scratch.factors,
+                     sizeof(leaf_incremental.factors)) == 0
+      && leaf_incremental_score == leaf_scratch_score;
+
+  pos.undo_move(chain_second);
+  const Value parent_incremental_score = ::YaneuraOu::Eval::evaluate(pos);
+  const Accumulator parent_incremental = pos.state()->accumulator;
+  feature_transformer->TestRefreshAccumulatorFromScratch(pos);
+  const Value parent_scratch_score = ::YaneuraOu::Eval::evaluate(pos);
+  const Accumulator parent_scratch = pos.state()->accumulator;
+  const bool parent_equal =
+      std::memcmp(parent_incremental.accumulation,
+                  parent_scratch.accumulation,
+                  sizeof(parent_incremental.accumulation)) == 0
+      && std::memcmp(parent_incremental.factors, parent_scratch.factors,
+                     sizeof(parent_incremental.factors)) == 0
+      && parent_incremental_score == parent_scratch_score;
+
+  std::cout << "multi_ply_dirty_chain leaf="
+            << (leaf_equal ? "OK" : "FAIL")
+            << " leaf_incremental_cp=" << leaf_incremental_score
+            << " leaf_scratch_cp=" << leaf_scratch_score
+            << " parent_after_undo=" << (parent_equal ? "OK" : "FAIL")
+            << " parent_incremental_cp=" << parent_incremental_score
+            << " parent_scratch_cp=" << parent_scratch_score << std::endl;
 }
 
 // Deterministic incremental-evaluation checksum for comparing separately
@@ -2812,6 +3084,9 @@ struct Ksdg3CorpusStatistics {
   std::uint64_t removed = 0;
   std::uint64_t added = 0;
   std::uint64_t effect_changed_squares = 0;
+  std::vector<std::size_t> removed_counts;
+  std::vector<std::size_t> added_counts;
+  std::uint64_t saved_delta_overflows = 0;
 };
 
 struct Ksdg3PassResult {
@@ -2846,6 +3121,11 @@ void CollectKsdg3CorpusStatistics(const Position& pos,
 
   for (const Color perspective : {BLACK, WHITE}) {
     ++statistics.perspective_samples;
+#if defined(USE_NNUE_KSDG3_SAVED_DELTA)
+    statistics.saved_delta_overflows +=
+        (pos.state()->ksdg3SavedDelta.overflow_mask
+         & std::uint8_t(1u << perspective)) != 0;
+#endif
     const bool reset =
         dirty_piece.pieceNo[0] == PIECE_NUMBER_KING + perspective;
     if (reset)
@@ -2865,6 +3145,8 @@ void CollectKsdg3CorpusStatistics(const Position& pos,
         pos, perspective, &removed, &added);
     statistics.removed += removed.size();
     statistics.added += added.size();
+    statistics.removed_counts.push_back(removed.size());
+    statistics.added_counts.push_back(added.size());
 
     const Color opponent = ~perspective;
     const Square king = pos.square<KING>(perspective);
@@ -3192,8 +3474,37 @@ void TestKsdg3FeaturesBenchmark(const std::uint64_t repeat_count) {
     return denominator == 0 ? 0.0
         : 100.0 * static_cast<double>(numerator) / denominator;
   };
+  const auto print_distribution = [](const char* label,
+                                     std::vector<std::size_t> values) {
+    if (values.empty())
+      return;
+    std::sort(values.begin(), values.end());
+    const auto percentile = [&](const double p) {
+      const auto index = static_cast<std::size_t>(
+          std::ceil(p * static_cast<double>(values.size())) - 1.0);
+      return values[std::min(index, values.size() - 1)];
+    };
+    const double mean = static_cast<double>(
+        std::accumulate(values.begin(), values.end(), std::uint64_t{0}))
+        / static_cast<double>(values.size());
+    std::cout << "  " << label << " count distribution: mean="
+              << std::fixed << std::setprecision(4) << mean
+              << " median=" << percentile(0.50)
+              << " p90=" << percentile(0.90)
+              << " p99=" << percentile(0.99)
+              << " max=" << values.back() << std::endl;
+  };
   std::cout << "[fixed corpus statistics]" << std::endl
             << "  positions              : " << statistics.positions << std::endl
+            << "  sizeof(StateInfo)       : " << sizeof(StateInfo) << std::endl
+            << "  alignof(StateInfo)      : " << alignof(StateInfo) << std::endl
+#if defined(USE_NNUE_KSDG3_SAVED_DELTA)
+            << "  saved delta bytes       : "
+            << sizeof(StateInfo::Ksdg3SavedDelta) << std::endl
+            << "  saved delta capacity    : "
+            << StateInfo::Ksdg3DeltaCapacity << " / kind / perspective"
+            << std::endl
+#endif
             << "  perspective samples     : "
             << statistics.perspective_samples << std::endl
             << "  dirty_num 0 / 1 / 2     : " << statistics.dirty_num[0]
@@ -3209,12 +3520,17 @@ void TestKsdg3FeaturesBenchmark(const std::uint64_t repeat_count) {
                  / statistics.perspective_samples << std::endl
             << "  removed / added         : " << statistics.removed
             << " / " << statistics.added << std::endl
+            << "  saved delta overflows   : "
+            << statistics.saved_delta_overflows << std::endl
             << "  effect-changed squares  : "
             << statistics.effect_changed_squares << std::endl
             << "  reset rate              : "
             << percentage(statistics.reset_samples,
                           statistics.perspective_samples)
-            << "%" << std::endl
+            << "%" << std::endl;
+  print_distribution("KSDG3 removed", statistics.removed_counts);
+  print_distribution("KSDG3 added", statistics.added_counts);
+  std::cout
             << "[correctness]" << std::endl
             << "  table/corpus mismatches : " << mismatch_count << std::endl
             << "  active/removed/added order match: "
@@ -13050,6 +13366,8 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     TestFeatures(position());
   } else if (sub_command == "test_accumulator") {
     TestAccumulator(position());
+  } else if (sub_command == "accumulator_regression_109") {
+    TestAccumulatorRegression109(position());
 #if defined(NNUE_HALFKAHM2_SIMPLE)
   } else if (sub_command == "simple_hm2_features") {
     DumpHalfKAHM2SimpleFeatures(position());

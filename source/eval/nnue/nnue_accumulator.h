@@ -34,6 +34,17 @@ struct alignas(64) Accumulator {
   Value score = VALUE_ZERO;
   bool computed_accumulation = false;
   bool computed_score = false;
+#if defined(EVAL_HASH_VERIFY_HITS)
+  // Diagnostic-only provenance.  This is deliberately absent from normal
+  // builds so it cannot alter production StateInfo size/cache behavior.
+  // 0=uncomputed, 1=incremental, 2=scratch, 3=Finny, 4=null-copy.
+  std::uint8_t debug_accumulator_source = 0;
+  bool debug_was_null_move = false;
+  std::uint32_t debug_move_raw = 0;
+  std::int32_t debug_game_ply = 0;
+  std::uint32_t debug_children_before_materialization = 0;
+  std::uint32_t debug_last_child_move_raw = 0;
+#endif
 #if defined(USE_EXPERIMENTAL_KP_PROGRESS_SHADOW)
   // Experiment 102: independent scalar accumulator.  It is observation-only
   // and absent from production/default builds.

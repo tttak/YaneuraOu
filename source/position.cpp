@@ -18,6 +18,10 @@
 #if defined(ENABLE_NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE)
 #include "eval/nnue/nnue_shogi_threat_lazy.h"
 #endif
+#if defined(USE_NNUE_KSDG3_SAVED_DELTA)
+#include "eval/nnue/features/king_safety3_distinguishgolds.h"
+#include "eval/nnue/features/index_list.h"
+#endif
 
 #if defined(EVAL_KPPT) || defined(EVAL_KPP_KKPT) || defined(EVAL_NNUE)
 #include "eval/evaluate_common.h"
@@ -606,6 +610,11 @@ void Position::set_state() const {
 
     // 王手情報の初期化
     set_check_info<false>();
+
+#if defined(USE_NNUE_KSDG3_SAVED_DELTA)
+    st->ksdg3SavedDelta.valid_mask = 0;
+    st->ksdg3SavedDelta.overflow_mask = 0;
+#endif
 #endif
 
 
@@ -1901,6 +1910,12 @@ void Position::do_move_impl(Move m, StateInfo& newSt, bool givesCheck, const T* 
 #else
     std::memcpy(static_cast<void*>(&newSt), st, offsetof(StateInfo, board_key));
 #endif
+#if defined(EVAL_HASH_VERIFY_HITS) && defined(EVAL_NNUE)
+    if (!st->accumulator.computed_accumulation) {
+        ++st->accumulator.debug_children_before_materialization;
+        st->accumulator.debug_last_child_move_raw = m.to_u32();
+    }
+#endif
     newSt.previous = st;
     st             = &newSt;
 
@@ -1938,6 +1953,14 @@ void Position::do_move_impl(Move m, StateInfo& newSt, bool givesCheck, const T* 
 #if defined(EVAL_NNUE)
     st->accumulator.computed_accumulation = false;
     st->accumulator.computed_score        = false;
+#if defined(EVAL_HASH_VERIFY_HITS)
+    st->accumulator.debug_accumulator_source = 0;
+    st->accumulator.debug_was_null_move = false;
+    st->accumulator.debug_move_raw = m.to_u32();
+    st->accumulator.debug_game_ply = gamePly;
+    st->accumulator.debug_children_before_materialization = 0;
+    st->accumulator.debug_last_child_move_raw = 0;
+#endif
 #if defined(USE_EXPERIMENTAL_KP_PROGRESS_SHADOW)
     st->accumulator.computed_kp_progress  = false;
 #endif
@@ -2020,6 +2043,13 @@ void Position::do_move_impl(Move m, StateInfo& newSt, bool givesCheck, const T* 
     // ray writes. The resulting logical dirty list is independent of
     // effect_touched_any and is diagnostic-only.
     NnueThreatDirectDirty::begin_move(*this, m);
+#endif
+
+#if defined(USE_NNUE_KSDG3_SAVED_DELTA)
+    // The destination StateInfo will be populated after the move and effect
+    // boards have both been updated.
+    st->ksdg3SavedDelta.valid_mask = 0;
+    st->ksdg3SavedDelta.overflow_mask = 0;
 #endif
 
 #if defined(USE_PIECE_VALUE)
@@ -2325,6 +2355,47 @@ void Position::do_move_impl(Move m, StateInfo& newSt, bool givesCheck, const T* 
 
     // このタイミングで王手関係の情報を更新しておいてやる。
     set_check_info<false>();
+
+#if defined(USE_NNUE_KSDG3_SAVED_DELTA)
+    // Capture KSDG3 while board_effect_prev still describes exactly
+    // previous -> current.  Later accumulator materialization must not consult
+    // the Position-global previous-effect scratch board.
+    {
+        using Ksdg3Feature = Eval::NNUE::Features::KingSafety3_DistinguishGolds<
+            Eval::NNUE::Features::Side::kFriend>;
+        auto& saved = st->ksdg3SavedDelta;
+        saved.valid_mask = 0;
+        saved.overflow_mask = 0;
+        for (const Color perspective : {BLACK, WHITE}) {
+            saved.removed_count[perspective] = 0;
+            saved.added_count[perspective] = 0;
+            if (st->dirtyPiece.pieceNo[0]
+                != PIECE_NUMBER_KING + perspective) {
+                Eval::NNUE::Features::IndexList removed;
+                Eval::NNUE::Features::IndexList added;
+                Ksdg3Feature::AppendChangedIndices(
+                    *this, perspective, &removed, &added);
+                const std::uint8_t bit = std::uint8_t(1u << perspective);
+                if (removed.size() > StateInfo::Ksdg3DeltaCapacity
+                    || added.size() > StateInfo::Ksdg3DeltaCapacity) {
+                    saved.overflow_mask |= bit;
+                } else {
+                    saved.removed_count[perspective] =
+                        static_cast<std::uint8_t>(removed.size());
+                    saved.added_count[perspective] =
+                        static_cast<std::uint8_t>(added.size());
+                    for (std::size_t i = 0; i < removed.size(); ++i)
+                        saved.removed[perspective][i] =
+                            static_cast<std::uint16_t>(removed[i]);
+                    for (std::size_t i = 0; i < added.size(); ++i)
+                        saved.added[perspective][i] =
+                            static_cast<std::uint16_t>(added[i]);
+                }
+            }
+            saved.valid_mask |= std::uint8_t(1u << perspective);
+        }
+    }
+#endif
 
     // Calculate the repetition info. It is the ply distance from the previous
     // occurrence of the same position, negative in the 3-fold case, or zero
@@ -2663,6 +2734,12 @@ void Position::do_null_move(StateInfo& newSt, const T& tt) {
     st->threatDirty.full_refresh = false;
 #endif
 
+#if defined(USE_NNUE_KSDG3_SAVED_DELTA)
+    // Null moves change no board feature.  The accumulator itself is copied.
+    st->ksdg3SavedDelta.valid_mask = 0;
+    st->ksdg3SavedDelta.overflow_mask = 0;
+#endif
+
 #if (defined(ENABLE_NNUE_BENCH) \
      || defined(USE_NNUE_KSDG3_EFFECT_TOUCHED_MASK)) \
     && defined(LONG_EFFECT_LIBRARY) \
@@ -2697,6 +2774,12 @@ void Position::do_null_move(StateInfo& newSt, const T& tt) {
 #if defined(USE_CLASSIC_EVAL) && defined(EVAL_NNUE)
     // NNUEの場合、KPPT型と違って、手番が違う場合、計算なしに済ますわけにはいかない。
     st->accumulator.computed_score = false;
+#if defined(EVAL_HASH_VERIFY_HITS)
+    st->accumulator.debug_accumulator_source = 4;
+    st->accumulator.debug_was_null_move = true;
+    st->accumulator.debug_move_raw = 0;
+    st->accumulator.debug_game_ply = gamePly;
+#endif
 #if defined(USE_EXPERIMENTAL_KP_PROGRESS_SHADOW)
     st->accumulator.computed_kp_progress = false;
 #endif
