@@ -36,9 +36,12 @@ namespace Eval::NNUE {
 	// 入力特徴量変換器
 	extern LargePagePtr<FeatureTransformer> feature_transformer;
 
-#if (defined(ENABLE_NNUE_TRACE) || defined(ENABLE_NNUE_BENCH)) \
+#if (defined(ENABLE_NNUE_TRACE) || defined(ENABLE_NNUE_BENCH) \
+     || defined(ENABLE_TEST_CMD)) \
     && !defined(NNUE_HALFKAHM2_SIMPLE)
-	// Test-only access to the already loaded Router parameters.
+	// Test-only access to the already loaded Router parameters.  ENABLE_TEST_CMD
+	// uses this only from nnue_test_command.cpp to compare the selected Router
+	// bucket after incremental and true-scratch accumulator materialization.
 	extern AlignedPtr<Router> router;
 #endif
 

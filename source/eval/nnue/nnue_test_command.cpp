@@ -1659,7 +1659,20 @@ void TestFeatures(Position& pos) {
 }
 
 // NNUE Accumulatorの差分更新結果と全計算結果を比較するテスト
+#if !defined(NNUE_HALFKAHM2_SIMPLE)
+bool TestAccumulatorDelayedMaterializationPermanent(Position& pos);
+#endif
+
 void TestAccumulator(Position& pos) {
+#if defined(USE_EVAL_HASH)
+  // A scratch oracle must execute the network rather than reuse a score cached
+  // for the same Position key.  Restore the user's setting on every exit.
+  struct EvalHashTestGuard {
+    bool was_enabled = Eval::EvalHash_IsEnabled();
+    EvalHashTestGuard() { Eval::EvalHash_SetEnabled(false); }
+    ~EvalHashTestGuard() { Eval::EvalHash_SetEnabled(was_enabled); }
+  } eval_hash_test_guard;
+#endif
   const std::uint64_t num_games = 1000;
   const int MAX_PLY = 256;
 
@@ -1870,6 +1883,12 @@ void TestAccumulator(Position& pos) {
 
   std::cout << "passed." << std::endl;
   std::cout << num_games << " games, " << num_moves << " moves" << std::endl;
+
+#if !defined(NNUE_HALFKAHM2_SIMPLE)
+  if (!TestAccumulatorDelayedMaterializationPermanent(pos))
+    std::cout << "NNUE delayed-materialization regression suite: failed."
+              << std::endl;
+#endif
 }
 
 // Experiment 109 regression: this short legal sequence was recovered from the
@@ -2131,6 +2150,246 @@ comparison_done:
             << " parent_after_undo=" << (parent_equal ? "OK" : "FAIL")
             << " parent_incremental_cp=" << parent_incremental_score
             << " parent_scratch_cp=" << parent_scratch_score << std::endl;
+}
+
+// Permanent coverage for the delayed-materialization lifetime defect found by
+// Experiments 109-111.  Unlike the historical regression command, this suite
+// is run by every `test nnue test_accumulator` invocation.
+bool TestAccumulatorDelayedMaterializationPermanent(Position& pos) {
+  constexpr const char* kRootSfen =
+      "6n1l/2+S1k4/2lp4p/1np1B2b1/3PP4/1N1S3rP/1P2+pPP+p1/1p1G5/"
+      "3KG2r1 b GSN2L4Pgs2p 1";
+  constexpr std::array<const char*, 2> kMoves = {"6f5g", "2d5g+"};
+
+  struct CaseStats {
+    const char* name;
+    std::uint64_t tested = 0;
+    std::uint64_t mismatches = 0;
+  } stats[] = {
+      {"1 immediate evaluate"},
+      {"2 one child do/undo before evaluate"},
+      {"3 multiple children do/undo before evaluate"},
+      {"4 multi-ply dirty chain leaf/parent"},
+      {"5 Finny refresh/cache restore"},
+  };
+
+  auto selected_router_bucket = [&](const Position& current_pos) {
+    alignas(kCacheLineSize) TransformedFeatureType
+        transformed[FeatureTransformer::kBufferSize];
+    alignas(kCacheLineSize) TransformedFeatureType diff[128];
+    alignas(kCacheLineSize) TransformedFeatureType abs_value[128];
+    constexpr int material_to_stack[24] = {
+        0, 1, 2, 3, 4, 5, 5, 6, 6, 7, 7, 8,
+        8, 8, 9, 9, 9, 9, 10, 10, 10, 10, 10, 11};
+    const int material_bucket = material_to_stack[std::min(
+        (std::abs(current_pos.state()->materialValue) + 99) / 100, 23)];
+    feature_transformer->Transform(current_pos, transformed, diff, abs_value,
+                                   false, material_bucket);
+    alignas(kCacheLineSize) std::uint8_t router_input[384];
+    for (int i = 0; i < 128; ++i) {
+      router_input[i] = static_cast<std::uint8_t>(std::clamp(
+          (static_cast<std::int32_t>(abs_value[i]) - 64) * 2, 0, 127));
+      router_input[i + 128] = static_cast<std::uint8_t>(diff[i]);
+      router_input[i + 256] = static_cast<std::uint8_t>(transformed[i]);
+    }
+    alignas(kCacheLineSize) std::int32_t router_output[32]{};
+    router->PropagatePrefix<12>(router_input, router_output);
+    return static_cast<int>(std::max_element(router_output,
+                                              router_output + kLayerStacks)
+                            - router_output);
+  };
+
+  auto compare_current = [&](CaseStats& stat, const char* context) {
+    const Value incremental_score = ::YaneuraOu::Eval::evaluate(pos);
+    const int incremental_bucket = selected_router_bucket(pos);
+    const Accumulator incremental = pos.state()->accumulator;
+
+    feature_transformer->TestRefreshAccumulatorFromScratch(pos);
+    pos.state()->accumulator.computed_score = false;
+    const Value scratch_score = ::YaneuraOu::Eval::evaluate(pos);
+    const int scratch_bucket = selected_router_bucket(pos);
+    const Accumulator scratch = pos.state()->accumulator;
+
+    const bool main_equal =
+        std::memcmp(incremental.accumulation, scratch.accumulation,
+                    sizeof(incremental.accumulation)) == 0;
+    bool halfka_equal = true;
+    bool ksdg_equal = true;
+    for (const Color perspective : {BLACK, WHITE}) {
+      halfka_equal &=
+          std::memcmp(&incremental.factors[perspective].halfka,
+                      &scratch.factors[perspective].halfka,
+                      sizeof(incremental.factors[perspective].halfka)) == 0;
+      ksdg_equal &=
+          std::memcmp(&incremental.factors[perspective].ksdg,
+                      &scratch.factors[perspective].ksdg,
+                      sizeof(incremental.factors[perspective].ksdg)) == 0;
+    }
+    const bool bucket_equal = incremental_bucket == scratch_bucket;
+    const bool score_equal = incremental_score == scratch_score;
+    const bool equal = main_equal && halfka_equal && ksdg_equal
+                       && bucket_equal && score_equal;
+    ++stat.tested;
+    if (!equal) {
+      ++stat.mismatches;
+      if (stat.mismatches <= 4) {
+        std::cout << "\nNNUE delayed-materialization mismatch"
+                  << "\n  case       : " << stat.name
+                  << "\n  context    : " << context
+                  << "\n  SFEN       : " << pos.sfen()
+                  << "\n  FT Main    : " << (main_equal ? "OK" : "FAIL")
+                  << "\n  HalfKA FM  : " << (halfka_equal ? "OK" : "FAIL")
+                  << "\n  KSDG3 FM   : " << (ksdg_equal ? "OK" : "FAIL")
+                  << "\n  Router     : " << incremental_bucket << " vs "
+                  << scratch_bucket
+                  << "\n  final score: " << incremental_score << " vs "
+                  << scratch_score << std::endl;
+      }
+    }
+    // Keep the production incremental lineage for subsequent moves.
+    pos.state()->accumulator = incremental;
+    return equal;
+  };
+
+  auto initialize_root = [&](StateInfo& root) {
+    pos.set(kRootSfen, &root);
+    feature_transformer->TestRefreshAccumulatorFromScratch(pos);
+    pos.state()->accumulator.computed_score = false;
+    ::YaneuraOu::Eval::evaluate(pos);
+  };
+  auto play_fixed = [&](const std::size_t index, StateInfo& state) {
+    const Move move = USIEngine::to_move(pos, kMoves[index]);
+    if (move == Move::none())
+      return Move::none();
+    pos.do_move(move, state);
+    return move;
+  };
+  auto probe_children = [&](const int requested, StateInfo& child_state) {
+    std::vector<Move> children;
+    for (const auto& move : MoveList<LEGAL_ALL>(pos)) {
+      children.push_back(move);
+      if (static_cast<int>(children.size()) == requested)
+        break;
+    }
+    for (const Move move : children) {
+      pos.do_move(move, child_state);
+      pos.undo_move(move);
+    }
+    return children.size();
+  };
+
+  // 1. Immediate materialization after do_move.
+  {
+    StateInfo root, state;
+    initialize_root(root);
+    if (play_fixed(0, state) != Move::none())
+      compare_current(stats[0], "fixed immediate");
+    else
+      ++stats[0].mismatches;
+  }
+
+  // 2. One speculative child overwrites Position-global scratch state before
+  // the still-unmaterialized current node is evaluated.
+  {
+    StateInfo root, first, current, child;
+    initialize_root(root);
+    play_fixed(0, first);
+    ::YaneuraOu::Eval::evaluate(pos);
+    play_fixed(1, current);
+    probe_children(1, child);
+    compare_current(stats[1], "fixed one child");
+  }
+
+  // 3. Same lifetime hazard, with several sibling children made and undone.
+  {
+    StateInfo root, first, current, child;
+    initialize_root(root);
+    play_fixed(0, first);
+    ::YaneuraOu::Eval::evaluate(pos);
+    play_fixed(1, current);
+    probe_children(4, child);
+    compare_current(stats[2], "fixed four children");
+  }
+
+  // 4. Materialize a leaf through a multi-ply dirty chain, then undo and
+  // compare the parent as well.
+  {
+    StateInfo root, first, second;
+    initialize_root(root);
+    const Move first_move = play_fixed(0, first);
+    const Move second_move = play_fixed(1, second);
+    compare_current(stats[3], "fixed dirty-chain leaf");
+    pos.undo_move(second_move);
+    compare_current(stats[3], "fixed parent after leaf undo");
+    (void) first_move;
+  }
+
+  // 5. Warm a different Finny entry, restore the fixed root through Finny,
+  // then compare both the restored root and its immediate child to scratch.
+  {
+    StateInfo warm, root, child;
+#if defined(USE_FINNY_TABLES)
+    pos.set_hirate(&warm);
+    feature_transformer->TestResetFinnyCache();
+    feature_transformer->TestRefreshAccumulatorWithFinny(pos);
+    pos.set(kRootSfen, &root);
+    feature_transformer->TestRefreshAccumulatorWithFinny(pos);
+    pos.state()->accumulator.computed_score = false;
+    compare_current(stats[4], "fixed Finny-restored root");
+    play_fixed(0, child);
+    feature_transformer->TestRefreshAccumulatorWithFinny(pos);
+    pos.state()->accumulator.computed_score = false;
+    compare_current(stats[4], "fixed Finny child");
+#else
+    initialize_root(root);
+    compare_current(stats[4], "Finny unavailable (scratch control)");
+#endif
+  }
+
+  // Small deterministic random stress for the one-child and multi-child
+  // delayed paths.  The broad immediate/Finny stress remains in the original
+  // 1000-game TestAccumulator loop above.
+  {
+    constexpr int kStressGames = 8;
+    constexpr int kStressPlies = 32;
+    PRNG prng(110111);
+    StateInfo root;
+    std::array<StateInfo, kStressPlies> states;
+    StateInfo child;
+    for (int game = 0; game < kStressGames; ++game) {
+      pos.set_hirate(&root);
+      feature_transformer->TestRefreshAccumulatorFromScratch(pos);
+      pos.state()->accumulator.computed_score = false;
+      ::YaneuraOu::Eval::evaluate(pos);
+      for (int ply = 0; ply < kStressPlies; ++ply) {
+        MoveList<LEGAL_ALL> moves(pos);
+        if (moves.size() == 0)
+          break;
+        const Move move = moves.begin()[prng.rand(moves.size())];
+        pos.do_move(move, states[ply]);
+        const bool multiple = (ply & 1) != 0;
+        probe_children(multiple ? 3 : 1, child);
+        compare_current(stats[multiple ? 2 : 1],
+                        multiple ? "random multiple children"
+                                 : "random one child");
+      }
+    }
+  }
+
+  bool passed = true;
+  std::cout << "[NNUE delayed-materialization permanent regression]"
+            << std::endl;
+  for (const auto& stat : stats) {
+    passed &= stat.mismatches == 0;
+    std::cout << "  " << stat.name << " : "
+              << (stat.mismatches == 0 ? "passed" : "failed")
+              << ", tested positions = " << stat.tested
+              << ", mismatch count = " << stat.mismatches << std::endl;
+  }
+  std::cout << "  compared stages: FT Main / HalfKA FM / KSDG3 FM / "
+               "Router bucket / final score"
+            << std::endl;
+  return passed;
 }
 #endif
 
