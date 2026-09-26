@@ -31,10 +31,18 @@ struct Network {
     using OutputType = std::int32_t;
     static constexpr IndexType kOutputDimensions = 1;
     static constexpr std::uint32_t GetHashValue() {
-        return 0x6333718Au ^ 0x484D3202u;
+        return (0x6333718Au ^ 0x484D3202u)
+#if defined(NNUE_SIMPLE_PP3WIDE)
+            ^ 0x50335031u
+#endif
+            ;
     }
     static std::string GetStructureString() {
+#if defined(NNUE_SIMPLE_PP3WIDE)
+        return "SFNN-1536-HalfKAHM2-NoDG-PP3WPL-v3";
+#else
         return "SFNN-1536-HalfKAHM2-NoDG-v2";
+#endif
     }
     Tools::Result ReadParameters(std::istream& stream) {
         const bool ok = fc_0.ReadParameters(stream).is_ok()

@@ -216,6 +216,13 @@ struct StateInfo {
 	Eval::NNUE::Accumulator accumulator;
 #endif
 
+#if defined(NNUE_SIMPLE_PP3WIDE)
+	// Exact before/after board-only pawn/lance snapshots for delayed NNUE
+	// materialization. [absolute color][0=pawn, 1=lance].
+	Bitboard pp3wide_before[COLOR_NB][2];
+	Bitboard pp3wide_after[COLOR_NB][2];
+#endif
+
 #if defined(USE_NNUE_KSDG3_SAVED_DELTA)
 	// Experiment 111 / production correctness fix.  The fixed-corpus maximum
 	// before the change was 12 removed and 12 added indices per perspective

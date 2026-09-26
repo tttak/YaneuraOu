@@ -186,6 +186,26 @@ void DumpHalfKAHM2SimpleStages(const Position& pos) {
   const std::int32_t deep = buffer.fc2[0] - shortcut;
 
   std::cout << "simple_hm2_stage bucket," << bucket << std::endl;
+#if defined(NNUE_SIMPLE_PP3WIDE)
+  const auto& accumulator = pos.state()->accumulator;
+  for (const Color perspective : {BLACK, WHITE}) {
+    const char* suffix = perspective == BLACK ? "black" : "white";
+    std::array<std::int16_t, 1536> pp{};
+    std::array<std::int16_t, 1536> main{};
+    feature_transformer->TestBuildPpAccumulator(
+        pos, perspective, pp.data());
+    for (std::size_t i = 0; i < main.size(); ++i)
+      main[i] = static_cast<std::int16_t>(
+          accumulator.accumulation[perspective][0][i] - pp[i]);
+    const std::string main_name = std::string("main_acc_") + suffix;
+    const std::string pp_name = std::string("pp_acc_") + suffix;
+    const std::string merged_name = std::string("merged_acc_") + suffix;
+    DumpHalfKAHM2SimpleVector(main_name.c_str(), main.data(), main.size());
+    DumpHalfKAHM2SimpleVector(pp_name.c_str(), pp.data(), pp.size());
+    DumpHalfKAHM2SimpleVector(merged_name.c_str(),
+        accumulator.accumulation[perspective][0], 1536);
+  }
+#endif
   DumpHalfKAHM2SimpleVector("ft", transformed, 1536);
   DumpHalfKAHM2SimpleVector("fc0_pre", buffer.fc0, 16);
   DumpHalfKAHM2SimpleVector("hidden_pre", buffer.fc0, 15);
@@ -1542,6 +1562,23 @@ void TestFeatures(Position& pos) {
   std::vector<std::uint64_t> num_resets(kRefreshTriggers.size());
   constexpr IndexType kUnknown = -1;
   std::vector<IndexType> trigger_map(RawFeatures::kDimensions, kUnknown);
+#if defined(NNUE_SIMPLE_PP3WIDE)
+  std::vector<std::uint16_t> pp_active_counts;
+  std::vector<std::uint16_t> pp_removed_counts;
+  std::vector<std::uint16_t> pp_added_counts;
+  std::array<bool, Features::Pp3WideShogi::kDimensions> pp_observed{};
+  std::uint64_t pp_dirty_mismatches = 0;
+  std::uint64_t pp_overflows = 0;
+  auto pp_board = [](const Position& p) {
+    Features::Pp3WideShogi::BoardState board{};
+    for (int c = 0; c < COLOR_NB; ++c) {
+      const auto color = static_cast<Color>(c);
+      board.pieces[c][0] = p.pieces(color, PAWN);
+      board.pieces[c][1] = p.pieces(color, LANCE);
+    }
+    return board;
+  };
+#endif
   auto make_index_sets = [&](const Position& pos) {
     std::vector<std::vector<std::set<IndexType>>> index_sets(
         kRefreshTriggers.size(), std::vector<std::set<IndexType>>(2));
@@ -1610,7 +1647,55 @@ void TestFeatures(Position& pos) {
 
       // 生成された指し手のなかからランダムに選び、その指し手で局面を進める。
       Move m = mg.begin()[prng.rand(mg.size())];
+#if defined(NNUE_SIMPLE_PP3WIDE)
+      const auto pp_before = pp_board(pos);
+      const Square pp_old_king[COLOR_NB] = {
+          pos.square<KING>(BLACK), pos.square<KING>(WHITE)};
+      for (const Color perspective : {BLACK, WHITE}) {
+        Features::Pp3WideShogi::IndexList active;
+        Features::Pp3WideShogi::append_active(
+            pp_before, perspective, pp_old_king[perspective], active);
+        pp_active_counts.push_back(active.count);
+        pp_overflows += active.overflow;
+        for (const auto index : active) pp_observed[index] = true;
+      }
+#endif
       pos.do_move(m, state[ply]);
+
+#if defined(NNUE_SIMPLE_PP3WIDE)
+      const auto pp_after = pp_board(pos);
+      for (const Color perspective : {BLACK, WHITE}) {
+        Features::Pp3WideShogi::IndexList old_active, new_active;
+        Features::Pp3WideShogi::IndexList full_removed, full_added;
+        Features::Pp3WideShogi::append_active(
+            pp_before, perspective, pp_old_king[perspective], old_active);
+        Features::Pp3WideShogi::append_active(
+            pp_after, perspective, pos.square<KING>(perspective), new_active);
+        Features::Pp3WideShogi::make_diff(
+            old_active, new_active, full_removed, full_added);
+        pp_removed_counts.push_back(full_removed.count);
+        pp_added_counts.push_back(full_added.count);
+        pp_overflows += old_active.overflow || new_active.overflow
+                     || full_removed.overflow || full_added.overflow;
+
+        const bool king_moved = pos.state()->dirtyPiece.pieceNo[0]
+            == PIECE_NUMBER_KING + perspective;
+        if (!king_moved) {
+          Features::Pp3WideShogi::IndexList local_removed, local_added;
+          Features::Pp3WideShogi::make_local_dirty_diff(
+              pp_before, pp_after, perspective, pp_old_king[perspective],
+              local_removed, local_added);
+          if (local_removed.count != full_removed.count
+              || local_added.count != full_added.count
+              || !std::equal(local_removed.begin(), local_removed.end(),
+                             full_removed.begin())
+              || !std::equal(local_added.begin(), local_added.end(),
+                             full_added.begin()))
+            ++pp_dirty_mismatches;
+          pp_overflows += local_removed.overflow || local_added.overflow;
+        }
+      }
+#endif
 
 #if defined(USE_NNUE_KSDG3_SAVED_DELTA)
       for (const Color perspective : {BLACK, WHITE})
@@ -1656,11 +1741,39 @@ void TestFeatures(Position& pos) {
   std::cout << "KSDG3 saved-delta overflow perspectives = "
             << ksdg3_saved_delta_overflows << std::endl;
 #endif
+#if defined(NNUE_SIMPLE_PP3WIDE)
+  auto print_pp_distribution = [](const char* name, auto values) {
+    std::sort(values.begin(), values.end());
+    const double mean = values.empty() ? 0.0
+        : std::accumulate(values.begin(), values.end(), 0.0) / values.size();
+    auto q = [&](double percentile) -> std::uint16_t {
+      if (values.empty()) return 0;
+      const std::size_t i = static_cast<std::size_t>(
+          percentile * static_cast<double>(values.size() - 1));
+      return values[i];
+    };
+    std::cout << "PP3Wide " << name << " count=" << values.size()
+              << " mean=" << mean << " median=" << q(0.50)
+              << " p90=" << q(0.90) << " p99=" << q(0.99)
+              << " max=" << q(1.0) << std::endl;
+  };
+  print_pp_distribution("active/perspective", pp_active_counts);
+  print_pp_distribution("removed/perspective/move", pp_removed_counts);
+  print_pp_distribution("added/perspective/move", pp_added_counts);
+  std::cout << "PP3Wide unique features observed="
+            << std::count(pp_observed.begin(), pp_observed.end(), true)
+            << '/' << Features::Pp3WideShogi::kDimensions
+            << " local-dirty mismatches=" << pp_dirty_mismatches
+            << " overflows=" << pp_overflows << std::endl;
+#endif
 }
 
 // NNUE Accumulatorの差分更新結果と全計算結果を比較するテスト
 #if !defined(NNUE_HALFKAHM2_SIMPLE)
 bool TestAccumulatorDelayedMaterializationPermanent(Position& pos);
+#endif
+#if defined(NNUE_SIMPLE_PP3WIDE)
+bool TestPp3WideDelayedMaterializationPermanent(Position& pos);
 #endif
 
 void TestAccumulator(Position& pos) {
@@ -1889,7 +2002,125 @@ void TestAccumulator(Position& pos) {
     std::cout << "NNUE delayed-materialization regression suite: failed."
               << std::endl;
 #endif
+#if defined(NNUE_SIMPLE_PP3WIDE)
+  if (!TestPp3WideDelayedMaterializationPermanent(pos))
+    std::cout << "PP3Wide delayed-materialization regression suite: failed."
+              << std::endl;
+#endif
 }
+
+#if defined(NNUE_SIMPLE_PP3WIDE)
+bool TestPp3WideDelayedMaterializationPermanent(Position& pos) {
+  struct Stats { const char* name; int tested = 0; int mismatches = 0; } stats[] = {
+      {"1 immediate evaluate"},
+      {"2 one child do/undo before evaluate"},
+      {"3 multiple children do/undo before evaluate"},
+      {"4 multi-ply dirty chain leaf/parent"},
+      {"5 Finny refresh/cache restore"},
+  };
+
+  auto compare = [&](Stats& stat) {
+	const bool current_was_computed = pos.state()->accumulator.computed_accumulation;
+	const bool previous_was_computed = pos.state()->previous
+	    && pos.state()->previous->accumulator.computed_accumulation;
+    ::YaneuraOu::Eval::evaluate(pos);
+    const Accumulator incremental = pos.state()->accumulator;
+    feature_transformer->TestRefreshAccumulatorFromScratch(pos);
+    pos.state()->accumulator.computed_score = false;
+    ::YaneuraOu::Eval::evaluate(pos);
+    const Accumulator scratch = pos.state()->accumulator;
+    const bool main_equal = std::memcmp(
+        incremental.accumulation, scratch.accumulation,
+        sizeof(incremental.accumulation)) == 0;
+    ++stat.tested;
+    if (!main_equal) {
+      ++stat.mismatches;
+      std::cout << "PP3Wide delayed mismatch case=" << stat.name
+
+                << " merged_main=" << (main_equal ? "OK" : "FAIL")
+		        << " current_pre=" << current_was_computed
+		        << " previous_pre=" << previous_was_computed
+                << " sfen=" << pos.sfen() << std::endl;
+    }
+    pos.state()->accumulator = incremental;
+  };
+
+  auto first_moves = [&](int count) {
+    std::vector<Move> moves;
+    for (const auto& move : MoveList<LEGAL_ALL>(pos)) {
+      moves.push_back(move);
+      if (static_cast<int>(moves.size()) == count) break;
+    }
+    return moves;
+  };
+
+  // 1. Immediate update.
+  {
+    StateInfo root, child;
+    pos.set_hirate(&root);
+    feature_transformer->TestRefreshAccumulatorFromScratch(pos);
+    const auto moves = first_moves(1);
+    if (!moves.empty()) { pos.do_move(moves[0], child); compare(stats[0]); }
+  }
+  // 2/3. Parent remains unmaterialized while temporary children overwrite
+  // Position state, then the parent is materialized after undo.
+  for (int variant = 0; variant < 2; ++variant) {
+    StateInfo root, parent, temporary;
+    pos.set_hirate(&root);
+    feature_transformer->TestRefreshAccumulatorFromScratch(pos);
+    const auto root_moves = first_moves(1);
+    if (root_moves.empty()) continue;
+    pos.do_move(root_moves[0], parent);
+    const auto children = first_moves(variant == 0 ? 1 : 4);
+    for (const Move child : children) {
+      pos.do_move(child, temporary);
+      pos.undo_move(child);
+    }
+    compare(stats[variant + 1]);
+  }
+  // 4. Deferred two-ply leaf, followed by the still-deferred parent.
+  {
+    StateInfo root, parent, leaf;
+    pos.set_hirate(&root);
+    feature_transformer->TestRefreshAccumulatorFromScratch(pos);
+    const auto m1 = first_moves(1);
+    if (!m1.empty()) {
+      pos.do_move(m1[0], parent);
+      const auto m2 = first_moves(1);
+      if (!m2.empty()) {
+        pos.do_move(m2[0], leaf);
+        compare(stats[3]);
+        pos.undo_move(m2[0]);
+        compare(stats[3]);
+      }
+    }
+  }
+  // 5. Force the normal Finny refresh path and compare with true scratch.
+  {
+    StateInfo root;
+    pos.set_hirate(&root);
+#if defined(USE_FINNY_TABLES)
+    feature_transformer->TestResetFinnyCache();
+    feature_transformer->TestRefreshAccumulatorWithFinny(pos);
+#else
+    feature_transformer->ForceRefreshAccumulator(pos);
+#endif
+    compare(stats[4]);
+  }
+
+  bool passed = true;
+  std::cout << "[PP3Wide delayed-materialization permanent regression]"
+            << std::endl;
+  for (const auto& stat : stats) {
+    passed &= stat.mismatches == 0;
+    std::cout << "  " << stat.name << " : "
+              << (stat.mismatches == 0 ? "passed" : "failed")
+              << ", tested positions = " << stat.tested
+              << ", mismatch count = " << stat.mismatches << std::endl;
+  }
+  return passed;
+}
+#endif
 
 // Experiment 109 regression: this short legal sequence was recovered from the
 // first EvalHash verifier mismatch.  It checks the sparse-feature transition
@@ -13636,6 +13867,24 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     DumpHalfKAHM2SimpleFeatures(position());
   } else if (sub_command == "simple_hm2_stages") {
     DumpHalfKAHM2SimpleStages(position());
+#if defined(NNUE_SIMPLE_PP3WIDE)
+  } else if (sub_command == "pp3wide_features") {
+    Features::Pp3WideShogi::BoardState board{};
+    for (int c = 0; c < COLOR_NB; ++c) {
+      const auto color = static_cast<Color>(c);
+      board.pieces[c][0] = position().pieces(color, PAWN);
+      board.pieces[c][1] = position().pieces(color, LANCE);
+    }
+    for (const Color perspective : {BLACK, WHITE}) {
+      Features::Pp3WideShogi::IndexList active;
+      Features::Pp3WideShogi::append_active(
+          board, perspective, position().square<KING>(perspective), active);
+      std::cout << "PP3WIDE " << (perspective == BLACK ? "BLACK" : "WHITE")
+                << " count=" << active.count << " indices=";
+      for (const auto index : active) std::cout << index << ',';
+      std::cout << std::endl;
+    }
+#endif
 #if defined(USE_EXPERIMENTAL_KP_PROGRESS_SHADOW)
   } else if (sub_command == "kp_progress_shadow") {
     std::string weights;

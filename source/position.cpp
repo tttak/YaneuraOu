@@ -1873,6 +1873,15 @@ void Position::do_move_impl(Move m, StateInfo& newSt, bool givesCheck, const T* 
     ASSERT_LV3(m.is_ok());
     ASSERT_LV3(&newSt != st);
 
+#if defined(NNUE_SIMPLE_PP3WIDE)
+    Bitboard pp3wide_before[COLOR_NB][2];
+    for (int c = 0; c < COLOR_NB; ++c) {
+        const auto color = static_cast<Color>(c);
+        pp3wide_before[c][0] = pieces(color, PAWN);
+        pp3wide_before[c][1] = pieces(color, LANCE);
+    }
+#endif
+
     // ----------------------
     //  StateInfoの更新
     // ----------------------
@@ -2352,6 +2361,16 @@ void Position::do_move_impl(Move m, StateInfo& newSt, bool givesCheck, const T* 
     st->hand_key  = h;
 
     st->hand = hand[them];
+
+#if defined(NNUE_SIMPLE_PP3WIDE)
+    for (int c = 0; c < COLOR_NB; ++c) {
+        const auto color = static_cast<Color>(c);
+        st->pp3wide_before[c][0] = pp3wide_before[c][0];
+        st->pp3wide_before[c][1] = pp3wide_before[c][1];
+        st->pp3wide_after[c][0] = pieces(color, PAWN);
+        st->pp3wide_after[c][1] = pieces(color, LANCE);
+    }
+#endif
 
     // このタイミングで王手関係の情報を更新しておいてやる。
     set_check_info<false>();

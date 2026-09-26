@@ -140,6 +140,15 @@ else ifneq ($(NNUE_FEATURE_VARIANT),A)
 	$(error NNUE_FEATURE_VARIANT must be A or D)
 endif
 
+# Experiment 120: optional local pawn/lance PP_3Wide-style sparse feature for
+# the HalfKA_HM2 Simple edition. NONE preserves the legacy binary and nn.bin.
+NNUE_SIMPLE_LOCAL_PAIR ?= NONE
+ifeq ($(NNUE_SIMPLE_LOCAL_PAIR),PP3WIDE)
+	CPPFLAGS += -DNNUE_SIMPLE_PP3WIDE
+else ifneq ($(NNUE_SIMPLE_LOCAL_PAIR),NONE)
+	$(error NNUE_SIMPLE_LOCAL_PAIR must be NONE or PP3WIDE)
+endif
+
 # Optional dense/context input, independent of the sparse A/D feature variant.
 # The default NONE does not define a macro and therefore preserves the legacy
 # binary, network hash, and nn.bin layout.

@@ -277,9 +277,16 @@ namespace NNUE {
     // 評価関数の構造を表す文字列を取得する
     std::string GetArchitectureString() {
 #if defined(NNUE_HALFKAHM2_SIMPLE)
+#if defined(NNUE_SIMPLE_PP3WIDE)
+        return "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
+               "+PP3WidePL[73305+15552->1536x2],"
+               "Network=SFNN-1536-HalfKAHM2-NoDG-PP3WPL-v3"
+               "{LayerStack=9}";
+#else
         return "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
                "[73305->1536x2],Network=SFNN-1536-HalfKAHM2-NoDG-v2"
                "{LayerStack=9}";
+#endif
 #else
         const std::string base = "Features=" + FeatureTransformer::GetStructureString() +
 			",Network=" + Network::GetStructureString();
