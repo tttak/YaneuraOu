@@ -34,12 +34,16 @@ struct Network {
         return (0x6333718Au ^ 0x484D3202u)
 #if defined(NNUE_SIMPLE_PP3WIDE)
             ^ 0x50335031u
+#elif defined(NNUE_SIMPLE_PP3WIDE64)
+            ^ 0x50335064u
 #endif
             ;
     }
     static std::string GetStructureString() {
 #if defined(NNUE_SIMPLE_PP3WIDE)
         return "SFNN-1536-HalfKAHM2-NoDG-PP3WPL-v3";
+#elif defined(NNUE_SIMPLE_PP3WIDE64)
+        return "SFNN-1536-HalfKAHM2-NoDG-PP3WPL64-v4";
 #else
         return "SFNN-1536-HalfKAHM2-NoDG-v2";
 #endif
@@ -69,9 +73,18 @@ struct Network {
     };
     static constexpr std::size_t kBufferSize = sizeof(Buffer);
     const OutputType* Propagate(const TransformedFeatureType* input,
-                                char* storage) const {
+                                char* storage
+#if defined(NNUE_SIMPLE_PP3WIDE64)
+                                , const std::int32_t* pp3wide64_residual = nullptr
+#endif
+                                ) const {
         auto& b = *reinterpret_cast<Buffer*>(storage);
         fc_0.Propagate(input, b.fc0);
+#if defined(NNUE_SIMPLE_PP3WIDE64)
+        if (pp3wide64_residual)
+            for (IndexType i = 0; i < 16; ++i)
+                b.fc0[i] += pp3wide64_residual[i];
+#endif
         ac_0.Propagate(b.fc0, b.ac0);
         ac_sqr_0.Propagate(b.fc0, b.concat);
         std::memcpy(b.concat + 15, b.ac0, 15 * sizeof(b.ac0[0]));

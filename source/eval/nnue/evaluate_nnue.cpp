@@ -282,6 +282,11 @@ namespace NNUE {
                "+PP3WidePL[73305+15552->1536x2],"
                "Network=SFNN-1536-HalfKAHM2-NoDG-PP3WPL-v3"
                "{LayerStack=9}";
+#elif defined(NNUE_SIMPLE_PP3WIDE64)
+        return "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
+               "+PP3WidePL64[73305->1536x2;15552->64x2->EWM64->Proj16],"
+               "Network=SFNN-1536-HalfKAHM2-NoDG-PP3WPL64-v4"
+               "{LayerStack=9}";
 #else
         return "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
                "[73305->1536x2],Network=SFNN-1536-HalfKAHM2-NoDG-v2"
@@ -723,7 +728,14 @@ namespace {
 #if defined(MEASURE_EVAL_HASH_BENCHMARK)
         EvalHash_DiagnosticOnPropagate();
 #endif
+#if defined(NNUE_SIMPLE_PP3WIDE64)
+        alignas(kCacheLineSize) std::int32_t pp3wide64_residual[16];
+        feature_transformer->TransformPp3Wide64(pos, pp3wide64_residual);
+        const auto output = network[bucket]->Propagate(
+            transformed_features, buffer, pp3wide64_residual);
+#else
         const auto output = network[bucket]->Propagate(transformed_features, buffer);
+#endif
         auto score = static_cast<Value>(output[0] / FV_SCALE);
         score = Math::clamp(score, -VALUE_MAX_EVAL, VALUE_MAX_EVAL);
         accumulator.score = score;

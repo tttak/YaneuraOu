@@ -15,7 +15,7 @@
 #include "nnue_common.h"
 #include "nnue_architecture.h"
 #include "features/index_list.h"
-#if defined(NNUE_SIMPLE_PP3WIDE)
+#if defined(NNUE_SIMPLE_PP3WIDE_ANY)
 #include "features/pp3wide_shogi.h"
 #endif
 #if defined(USE_EXPERIMENTAL_KP_PROGRESS_SHADOW)
@@ -193,6 +193,8 @@ class FeatureTransformer {
 		return (0x7f234cb8u ^ 1536u)
 #if defined(NNUE_SIMPLE_PP3WIDE)
 		       ^ 0x50335731u
+#elif defined(NNUE_SIMPLE_PP3WIDE64)
+		       ^ 0x50335764u
 #endif
 		       ;
 #elif defined(SFNNwoPSQT)
@@ -260,6 +262,8 @@ class FeatureTransformer {
 
 #if defined(NNUE_SIMPLE_PP3WIDE)
 		read_pp3wide_weights(stream);
+#elif defined(NNUE_SIMPLE_PP3WIDE64)
+		read_pp3wide64_parameters(stream);
 #endif
 #else
 		for (std::size_t i = 0; i < kHalfDimensions; ++i) biases_[i] = read_little_endian<BiasType>(stream);
@@ -288,6 +292,8 @@ class FeatureTransformer {
 				kHalfDimensions*sizeof(WeightType));
 #if defined(NNUE_SIMPLE_PP3WIDE)
 		write_pp3wide_weights(stream);
+#elif defined(NNUE_SIMPLE_PP3WIDE64)
+		write_pp3wide64_parameters(stream);
 #endif
 		return !stream.fail();
 	}
@@ -539,6 +545,74 @@ class FeatureTransformer {
 #endif
 	}
 
+#if defined(NNUE_SIMPLE_PP3WIDE64)
+	// Convert the independent 64-wide PP accumulator to two 32-wide EWM
+	// vectors (side-to-move first), then apply the shared int8 64->16
+	// projection.  The result is in the exact int32 raw unit used by fc_0.
+	void TransformPp3Wide64(const Position& pos,
+	                        std::int32_t* residual,
+	                        std::uint8_t* diagnostic_transformed = nullptr) const {
+		alignas(kCacheLineSize) std::uint8_t transformed[64];
+		TransformPp3Wide64Ewm(pos, transformed);
+		ProjectPp3Wide64(transformed, residual);
+		if (diagnostic_transformed)
+			std::memcpy(diagnostic_transformed, transformed,
+			            sizeof(transformed));
+	}
+
+	// Test-only entry points also document the two independent runtime costs.
+	// Production calls the combined wrapper above.
+	void TransformPp3Wide64Ewm(const Position& pos,
+	                           std::uint8_t* transformed) const {
+		const auto& accumulation =
+			pos.state()->accumulator.pp3wide64_accumulation;
+		const Color perspectives[2] = {
+			pos.side_to_move(), ~pos.side_to_move()};
+		constexpr int shift =
+#if defined(USE_SSE2)
+			7;
+#else
+			6;
+#endif
+		for (IndexType p = 0; p < 2; ++p) {
+			const auto* source = accumulation[perspectives[p]];
+			for (IndexType j = 0; j < 32; ++j) {
+				const int a = std::clamp<int>(source[j], 0, 127 * 2);
+				const int b = std::clamp<int>(source[j + 32], 0, 127 * 2);
+				const int value = ((a << shift) * b) >> 16;
+				transformed[p * 32 + j] = static_cast<std::uint8_t>(
+					std::clamp(value, 0, 255));
+			}
+		}
+	}
+
+	void ProjectPp3Wide64(const std::uint8_t* transformed,
+	                      std::int32_t* residual) const {
+		for (IndexType o = 0; o < 16; ++o) {
+			std::int32_t sum = 0;
+			const auto* weights = &pp3wide64_projection_[o * 64];
+			for (IndexType i = 0; i < 64; ++i)
+				sum += static_cast<std::int32_t>(transformed[i])
+				     * static_cast<std::int32_t>(weights[i]);
+			residual[o] = sum;
+		}
+	}
+
+	const std::int8_t* TestPp3Wide64Row(const IndexType index) const {
+		return &pp3wide64_weights_[index * 64];
+	}
+
+	void TestApplyPp3Wide64Rows(std::int16_t* destination,
+	                           const IndexType base) const {
+		Features::Pp3WideShogi::IndexList removed, added;
+		for (IndexType i = 0; i < 3; ++i)
+			removed.push_back((base + i) % Features::Pp3WideShogi::kDimensions);
+		for (IndexType i = 0; i < 4; ++i)
+			added.push_back((base + 17 + i) % Features::Pp3WideShogi::kDimensions);
+		pp64_apply_diff(destination, removed, added);
+	}
+#endif
+
    private:
 	static void order_packs([[maybe_unused]] uint64_t* v) {
 #if defined(USE_AVX512)  // _mm512_set_epi32 packs in the order [15 11 7 3 14 10 6 2 13 9 5 1 12 8 4 0]
@@ -555,6 +629,147 @@ class FeatureTransformer {
 		v[4] = tmp0, v[5] = tmp1;
 #endif
 	}
+
+#if defined(NNUE_SIMPLE_PP3WIDE64)
+	using Pp64Feature = Features::Pp3WideShogi::IndexList;
+	using Pp64Board = Features::Pp3WideShogi::BoardState;
+	static constexpr IndexType kPp64Width = 64;
+
+	void read_pp3wide64_parameters(std::istream& stream) {
+		stream.read(reinterpret_cast<char*>(pp3wide64_weights_),
+		            sizeof(pp3wide64_weights_));
+		stream.read(reinterpret_cast<char*>(pp3wide64_projection_),
+		            sizeof(pp3wide64_projection_));
+	}
+
+	void write_pp3wide64_parameters(std::ostream& stream) const {
+		stream.write(reinterpret_cast<const char*>(pp3wide64_weights_),
+		             sizeof(pp3wide64_weights_));
+		stream.write(reinterpret_cast<const char*>(pp3wide64_projection_),
+		             sizeof(pp3wide64_projection_));
+	}
+
+	static Pp64Board pp64_board_from_position(const Position& pos) {
+		Pp64Board board{};
+		for (int c = 0; c < COLOR_NB; ++c) {
+			const auto color = static_cast<Color>(c);
+			board.pieces[c][0] = pos.pieces(color, PAWN);
+			board.pieces[c][1] = pos.pieces(color, LANCE);
+		}
+		return board;
+	}
+
+	static Pp64Board pp64_board_from_state(const StateInfo& state,
+	                                      bool after) {
+		Pp64Board board{};
+		for (int c = 0; c < COLOR_NB; ++c)
+			for (int pc = 0; pc < 2; ++pc)
+				board.pieces[c][pc] = after ? state.pp3wide_after[c][pc]
+				                                  : state.pp3wide_before[c][pc];
+		return board;
+	}
+
+	void pp64_apply_diff(std::int16_t* destination,
+	                     const Pp64Feature& removed,
+	                     const Pp64Feature& added) const {
+#if defined(USE_AVX2)
+		for (IndexType j = 0; j < kPp64Width; j += 16) {
+			__m256i acc = _mm256_load_si256(
+				reinterpret_cast<const __m256i*>(destination + j));
+			for (const auto index : removed) {
+				const auto* row = &pp3wide64_weights_[index * kPp64Width + j];
+				const __m128i packed = _mm_loadu_si128(
+					reinterpret_cast<const __m128i*>(row));
+				acc = _mm256_sub_epi16(acc,
+					_mm256_slli_epi16(_mm256_cvtepi8_epi16(packed), 1));
+			}
+			for (const auto index : added) {
+				const auto* row = &pp3wide64_weights_[index * kPp64Width + j];
+				const __m128i packed = _mm_loadu_si128(
+					reinterpret_cast<const __m128i*>(row));
+				acc = _mm256_add_epi16(acc,
+					_mm256_slli_epi16(_mm256_cvtepi8_epi16(packed), 1));
+			}
+			_mm256_store_si256(
+				reinterpret_cast<__m256i*>(destination + j), acc);
+		}
+#else
+		for (const auto index : removed)
+			for (IndexType j = 0; j < kPp64Width; ++j)
+				destination[j] -= 2 * pp3wide64_weights_[index * kPp64Width + j];
+		for (const auto index : added)
+			for (IndexType j = 0; j < kPp64Width; ++j)
+				destination[j] += 2 * pp3wide64_weights_[index * kPp64Width + j];
+#endif
+	}
+
+	void pp64_refresh_rows(std::int16_t* destination,
+	                       const Pp64Feature& active) const {
+		std::memset(destination, 0, kPp64Width * sizeof(std::int16_t));
+		const Pp64Feature empty;
+		pp64_apply_diff(destination, empty, active);
+	}
+
+	void refresh_pp3wide64(const Position& pos) const {
+		auto& accumulator = pos.state()->accumulator;
+		const auto board = pp64_board_from_position(pos);
+		for (int c = 0; c < COLOR_NB; ++c) {
+			const auto perspective = static_cast<Color>(c);
+			Pp64Feature active;
+			Features::Pp3WideShogi::append_active(
+				board, perspective, pos.square<KING>(perspective), active);
+			pp64_refresh_rows(
+				accumulator.pp3wide64_accumulation[perspective], active);
+		}
+	}
+
+	void update_pp3wide64(const Position& pos) const {
+		const auto& state = *pos.state();
+		const auto& previous = state.previous->accumulator;
+		auto& current = pos.state()->accumulator;
+		const auto before = pp64_board_from_state(state, false);
+		const auto after = pp64_board_from_state(state, true);
+		bool board_changed = false;
+		for (int c = 0; c < COLOR_NB; ++c)
+			for (int pc = 0; pc < 2; ++pc)
+				board_changed |= before.pieces[c][pc] != after.pieces[c][pc];
+		for (int c = 0; c < COLOR_NB; ++c) {
+			const auto perspective = static_cast<Color>(c);
+			auto* destination =
+				current.pp3wide64_accumulation[perspective];
+			const bool king_moved = state.dirtyPiece.pieceNo[0]
+				== PIECE_NUMBER_KING + perspective;
+			const Square king = pos.square<KING>(perspective);
+			if (king_moved) {
+				Pp64Feature active;
+				Features::Pp3WideShogi::append_active(
+					after, perspective, king, active);
+				pp64_refresh_rows(destination, active);
+				continue;
+			}
+			std::memcpy(destination,
+			            previous.pp3wide64_accumulation[perspective],
+			            kPp64Width * sizeof(std::int16_t));
+			if (!board_changed)
+				continue;
+			Pp64Feature removed, added;
+			Features::Pp3WideShogi::make_local_dirty_diff(
+				before, after, perspective, king, removed, added);
+			if (removed.overflow || added.overflow) {
+				Pp64Feature old_active, new_active;
+				removed = Pp64Feature{};
+				added = Pp64Feature{};
+				Features::Pp3WideShogi::append_active(
+					before, perspective, king, old_active);
+				Features::Pp3WideShogi::append_active(
+					after, perspective, king, new_active);
+				Features::Pp3WideShogi::make_diff(
+					old_active, new_active, removed, added);
+			}
+			pp64_apply_diff(destination, removed, added);
+		}
+	}
+#endif
 
 	static void inverse_order_packs([[maybe_unused]] uint64_t* v) {
 #if defined(USE_AVX512)
@@ -859,6 +1074,41 @@ class FeatureTransformer {
 			acc[k] = vec_sub_16(acc[k], weight_vec_load(column + k));
 	}
 
+#if defined(NNUE_SIMPLE_PP3WIDE)
+	static inline vec_t pp_weight_vec_load(const std::int8_t* source) {
+#if defined(USE_AVX512)
+		const __m256i packed = _mm256_loadu_si256(
+			reinterpret_cast<const __m256i*>(source));
+		return _mm512_slli_epi16(_mm512_cvtepi8_epi16(packed), 1);
+#elif defined(USE_AVX2)
+		const __m128i packed = _mm_loadu_si128(
+			reinterpret_cast<const __m128i*>(source));
+		return _mm256_slli_epi16(_mm256_cvtepi8_epi16(packed), 1);
+#else
+		alignas(kCacheLineSize) BiasType expanded[kVectorHeight];
+		for (IndexType i = 0; i < kVectorHeight; ++i)
+			expanded[i] = static_cast<BiasType>(2 * static_cast<int>(source[i]));
+		return vec_load(reinterpret_cast<const vec_t*>(expanded));
+#endif
+	}
+
+	void add_pp_weight_to_tile(vec_t* acc, IndexType index,
+	                           IndexType tile_offset) const {
+		const auto* row = &pp3wide_weights_[index * kHalfDimensions + tile_offset];
+		for (IndexType k = 0; k < kTileRegs; ++k)
+			acc[k] = vec_add_16(
+				acc[k], pp_weight_vec_load(row + k * kVectorHeight));
+	}
+
+	void sub_pp_weight_from_tile(vec_t* acc, IndexType index,
+	                            IndexType tile_offset) const {
+		const auto* row = &pp3wide_weights_[index * kHalfDimensions + tile_offset];
+		for (IndexType k = 0; k < kTileRegs; ++k)
+			acc[k] = vec_sub_16(
+				acc[k], pp_weight_vec_load(row + k * kVectorHeight));
+	}
+#endif
+
 	static inline vec_t weight_vec_load(const vec_t* source) {
 #if defined(KP_PROGRESS_SHADOW_TAIL_COMPACT) && defined(USE_AVX512)
 		return _mm512_loadu_si512(source);
@@ -1100,6 +1350,8 @@ class FeatureTransformer {
 
 #if defined(NNUE_SIMPLE_PP3WIDE)
 		refresh_pp3wide(pos);
+#elif defined(NNUE_SIMPLE_PP3WIDE64)
+		refresh_pp3wide64(pos);
 #endif
 
 		accumulator.computed_accumulation = true;
@@ -1148,6 +1400,8 @@ class FeatureTransformer {
 
 #if defined(NNUE_SIMPLE_PP3WIDE)
 		refresh_pp3wide(pos);
+#elif defined(NNUE_SIMPLE_PP3WIDE64)
+		refresh_pp3wide64(pos);
 #endif
 
 		accumulator.computed_accumulation = true;
@@ -1160,6 +1414,45 @@ class FeatureTransformer {
 	void update_accumulator(const Position& pos) const {
 		const auto& prev_accumulator = pos.state()->previous->accumulator;
 		auto&      accumulator      = pos.state()->accumulator;
+#if defined(NNUE_SIMPLE_PP3WIDE)
+		// Prepare PP dirtiness once, before the 1536-wide tile loop.  The
+		// lists are then consumed in the same load/store pass as HalfKA.
+		const auto pp_before = pp_board_from_state(*pos.state(), false);
+		const auto pp_after = pp_board_from_state(*pos.state(), true);
+		bool pp_board_changed = false;
+		for (int c = 0; c < COLOR_NB; ++c)
+			for (int pc = 0; pc < 2; ++pc)
+				pp_board_changed |= pp_before.pieces[c][pc]
+				                 != pp_after.pieces[c][pc];
+		PpFeature pp_removed[COLOR_NB], pp_added[COLOR_NB], pp_active[COLOR_NB];
+		bool pp_active_ready[COLOR_NB]{};
+		for (int c = 0; c < COLOR_NB; ++c) {
+			const auto perspective = static_cast<Color>(c);
+			const bool king_moved = pos.state()->dirtyPiece.pieceNo[0]
+				== PIECE_NUMBER_KING + perspective;
+			const Square king = pos.square<KING>(perspective);
+			if (king_moved) {
+				Features::Pp3WideShogi::append_active(
+					pp_after, perspective, king, pp_active[c]);
+				pp_active_ready[c] = true;
+			} else if (pp_board_changed) {
+				Features::Pp3WideShogi::make_local_dirty_diff(
+					pp_before, pp_after, perspective, king,
+					pp_removed[c], pp_added[c]);
+				if (pp_removed[c].overflow || pp_added[c].overflow) {
+					PpFeature old_active, new_active;
+					pp_removed[c] = PpFeature{};
+					pp_added[c] = PpFeature{};
+					Features::Pp3WideShogi::append_active(
+						pp_before, perspective, king, old_active);
+					Features::Pp3WideShogi::append_active(
+						pp_after, perspective, king, new_active);
+					Features::Pp3WideShogi::make_diff(
+						old_active, new_active, pp_removed[c], pp_added[c]);
+				}
+			}
+		}
+#endif
 		for (IndexType i = 0; i < kRefreshTriggers.size(); ++i) {
 			Features::IndexList removed_indices[2], added_indices[2];
 			bool                reset[2];
@@ -1184,6 +1477,14 @@ class FeatureTransformer {
 #endif
 			for (int c = 0; c < COLOR_NB; ++c) {
 				const Color perspective = static_cast<Color>(c);
+#if defined(NNUE_SIMPLE_PP3WIDE)
+				if (i == 0 && reset[perspective] && !pp_active_ready[c]) {
+					Features::Pp3WideShogi::append_active(
+						pp_after, perspective, pos.square<KING>(perspective),
+						pp_active[c]);
+					pp_active_ready[c] = true;
+				}
+#endif
 #if defined(VECTOR)
 				auto* current = accumulator.accumulation[perspective][i];
 				if (reset[perspective]) {
@@ -1193,6 +1494,11 @@ class FeatureTransformer {
 						[&](vec_t* acc, IndexType tile_offset) {
 							for (const auto index : added_indices[perspective])
 								add_weight_to_tile(acc, index, tile_offset);
+#if defined(NNUE_SIMPLE_PP3WIDE)
+							if (i == 0)
+								for (const auto index : pp_active[c])
+									add_pp_weight_to_tile(acc, index, tile_offset);
+#endif
 						});
 				} else {
 					update_accumulator_tiled(
@@ -1203,6 +1509,14 @@ class FeatureTransformer {
 								sub_weight_from_tile(acc, index, tile_offset);
 							for (const auto index : added_indices[perspective])
 								add_weight_to_tile(acc, index, tile_offset);
+#if defined(NNUE_SIMPLE_PP3WIDE)
+							if (i == 0) {
+								for (const auto index : pp_removed[c])
+									sub_pp_weight_from_tile(acc, index, tile_offset);
+								for (const auto index : pp_added[c])
+									add_pp_weight_to_tile(acc, index, tile_offset);
+							}
+#endif
 						});
 				}
 #else
@@ -1233,12 +1547,25 @@ class FeatureTransformer {
 							accumulator.accumulation[perspective][i][j] += weights_[offset + j];
 					}
 				}
+#if defined(NNUE_SIMPLE_PP3WIDE)
+				if (i == 0) {
+					if (reset[perspective]) {
+						for (const auto index : pp_active[c])
+							pp_apply_row(accumulator.accumulation[perspective][i], index, +1);
+					} else {
+						for (const auto index : pp_removed[c])
+							pp_apply_row(accumulator.accumulation[perspective][i], index, -1);
+						for (const auto index : pp_added[c])
+							pp_apply_row(accumulator.accumulation[perspective][i], index, +1);
+					}
+				}
+#endif
 #endif
 			}
 		}
 
-#if defined(NNUE_SIMPLE_PP3WIDE)
-		update_pp3wide(pos);
+#if defined(NNUE_SIMPLE_PP3WIDE64)
+		update_pp3wide64(pos);
 #endif
 
 		accumulator.computed_accumulation = true;
@@ -1260,6 +1587,8 @@ class FeatureTransformer {
 		}
 #if defined(NNUE_SIMPLE_PP3WIDE)
 		refresh_pp3wide(pos);
+#elif defined(NNUE_SIMPLE_PP3WIDE64)
+		refresh_pp3wide64(pos);
 #endif
 		accumulator.computed_accumulation = true;
 		accumulator.computed_score = false;
@@ -1272,6 +1601,15 @@ class FeatureTransformer {
 		Features::Pp3WideShogi::append_active(
 			board, perspective, pos.square<KING>(perspective), active);
 		pp_refresh_rows(destination, active);
+	}
+#elif defined(NNUE_SIMPLE_PP3WIDE64)
+	void TestBuildPp64Accumulator(const Position& pos, Color perspective,
+	                              std::int16_t* destination) const {
+		const auto board = pp64_board_from_position(pos);
+		Pp64Feature active;
+		Features::Pp3WideShogi::append_active(
+			board, perspective, pos.square<KING>(perspective), active);
+		pp64_refresh_rows(destination, active);
 	}
 #endif
 #if defined(USE_FINNY_TABLES)
@@ -1297,6 +1635,10 @@ class FeatureTransformer {
 #if defined(NNUE_SIMPLE_PP3WIDE)
 	alignas(kCacheLineSize) std::int8_t
 		pp3wide_weights_[Features::Pp3WideShogi::kDimensions * kHalfDimensions];
+#elif defined(NNUE_SIMPLE_PP3WIDE64)
+	alignas(kCacheLineSize) std::int8_t
+		pp3wide64_weights_[Features::Pp3WideShogi::kDimensions * 64];
+	alignas(kCacheLineSize) std::int8_t pp3wide64_projection_[16 * 64];
 #endif
 #if defined(USE_FINNY_TABLES)
 	std::uint64_t finny_generation_ = 0;

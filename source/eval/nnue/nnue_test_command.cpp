@@ -180,7 +180,16 @@ void DumpHalfKAHM2SimpleStages(const Position& pos) {
       transformed[FeatureTransformer::kBufferSize];
   feature_transformer->Transform(pos, transformed, true);
   alignas(kCacheLineSize) char storage[Network::kBufferSize];
+#if defined(NNUE_SIMPLE_PP3WIDE64)
+  alignas(kCacheLineSize) std::int32_t pp3wide64_residual[16];
+  alignas(kCacheLineSize) std::uint8_t pp3wide64_transformed[64];
+  feature_transformer->TransformPp3Wide64(
+      pos, pp3wide64_residual, pp3wide64_transformed);
+  const auto* final_output = network[bucket]->Propagate(
+      transformed, storage, pp3wide64_residual);
+#else
   const auto* final_output = network[bucket]->Propagate(transformed, storage);
+#endif
   const auto& buffer = *reinterpret_cast<const Network::Buffer*>(storage);
   const std::int32_t shortcut = buffer.fc0[15];
   const std::int32_t deep = buffer.fc2[0] - shortcut;
@@ -205,8 +214,28 @@ void DumpHalfKAHM2SimpleStages(const Position& pos) {
     DumpHalfKAHM2SimpleVector(merged_name.c_str(),
         accumulator.accumulation[perspective][0], 1536);
   }
+#elif defined(NNUE_SIMPLE_PP3WIDE64)
+  const auto& accumulator = pos.state()->accumulator;
+  for (const Color perspective : {BLACK, WHITE}) {
+    const char* suffix = perspective == BLACK ? "black" : "white";
+    const std::string main_name = std::string("main_acc_") + suffix;
+    const std::string name = std::string("pp64_acc_") + suffix;
+    DumpHalfKAHM2SimpleVector(
+        main_name.c_str(), accumulator.accumulation[perspective][0], 1536);
+    DumpHalfKAHM2SimpleVector(
+        name.c_str(), accumulator.pp3wide64_accumulation[perspective], 64);
+  }
+  DumpHalfKAHM2SimpleVector("pp64_projection", pp3wide64_residual, 16);
+  DumpHalfKAHM2SimpleVector(
+      "pp64_transformed", pp3wide64_transformed, 64);
 #endif
   DumpHalfKAHM2SimpleVector("ft", transformed, 1536);
+#if defined(NNUE_SIMPLE_PP3WIDE64)
+  alignas(kCacheLineSize) std::int32_t main_fc0[16];
+  network[bucket]->fc_0.Propagate(transformed, main_fc0);
+  DumpHalfKAHM2SimpleVector("main_fc0_pre", main_fc0, 16);
+  DumpHalfKAHM2SimpleVector("merged_fc0_pre", buffer.fc0, 16);
+#endif
   DumpHalfKAHM2SimpleVector("fc0_pre", buffer.fc0, 16);
   DumpHalfKAHM2SimpleVector("hidden_pre", buffer.fc0, 15);
   DumpHalfKAHM2SimpleVector("shortcut", &shortcut, 1);
@@ -222,6 +251,57 @@ void DumpHalfKAHM2SimpleStages(const Position& pos) {
 
   std::cout << "simple_hm2_stage fv_scale," << FV_SCALE << std::endl;
 }
+
+#if defined(NNUE_SIMPLE_PP3WIDE64)
+void TestPp3Wide64Microbench(Position& pos, std::uint64_t repeats) {
+  if (repeats == 0) repeats = 1000000;
+  alignas(kCacheLineSize) std::uint8_t transformed[64]{};
+  alignas(kCacheLineSize) std::int32_t residual[16]{};
+  // Materialize exactly as production does before isolating the two kernels.
+  alignas(kCacheLineSize) TransformedFeatureType main[FeatureTransformer::kBufferSize];
+  feature_transformer->Transform(pos, main, true);
+  volatile std::uint64_t checksum = 0;
+  auto& lane = pos.state()->accumulator.pp3wide64_accumulation[BLACK][0];
+  const auto saved_lane = lane;
+  const auto ewm_begin = std::chrono::steady_clock::now();
+  for (std::uint64_t i = 0; i < repeats; ++i) {
+    lane = static_cast<std::int16_t>(saved_lane + (i & 1));
+    feature_transformer->TransformPp3Wide64Ewm(pos, transformed);
+    checksum += transformed[i & 63];
+  }
+  const auto ewm_end = std::chrono::steady_clock::now();
+  lane = saved_lane;
+  feature_transformer->TransformPp3Wide64Ewm(pos, transformed);
+  const auto projection_begin = std::chrono::steady_clock::now();
+  for (std::uint64_t i = 0; i < repeats; ++i) {
+    transformed[0] ^= static_cast<std::uint8_t>(i & 1);
+    feature_transformer->ProjectPp3Wide64(transformed, residual);
+    checksum += static_cast<std::uint64_t>(residual[i & 15]);
+  }
+  const auto projection_end = std::chrono::steady_clock::now();
+  alignas(kCacheLineSize) std::int16_t synthetic_accumulator[64]{};
+  const auto row_begin = std::chrono::steady_clock::now();
+  for (std::uint64_t i = 0; i < repeats; ++i) {
+    feature_transformer->TestApplyPp3Wide64Rows(
+        synthetic_accumulator, static_cast<IndexType>(i % 15552));
+    checksum += static_cast<std::uint64_t>(synthetic_accumulator[i & 63]);
+  }
+  const auto row_end = std::chrono::steady_clock::now();
+  const double ewm_ns = std::chrono::duration<double, std::nano>(
+      ewm_end - ewm_begin).count() / repeats;
+  const double projection_ns = std::chrono::duration<double, std::nano>(
+      projection_end - projection_begin).count() / repeats;
+  const double row_ns = std::chrono::duration<double, std::nano>(
+      row_end - row_begin).count() / repeats;
+  std::cout << std::fixed << std::setprecision(3)
+            << "PP64_MICRO repeats=" << repeats
+            << " ewm_ns=" << ewm_ns
+            << " projection_ns=" << projection_ns
+            << " row_update_7_rows_ns=" << row_ns
+            << " total_eval_ns=" << (ewm_ns + projection_ns)
+            << " checksum=" << checksum << std::endl;
+}
+#endif
 #endif
 
 struct MoveAccuracyRecord {
@@ -1562,13 +1642,17 @@ void TestFeatures(Position& pos) {
   std::vector<std::uint64_t> num_resets(kRefreshTriggers.size());
   constexpr IndexType kUnknown = -1;
   std::vector<IndexType> trigger_map(RawFeatures::kDimensions, kUnknown);
-#if defined(NNUE_SIMPLE_PP3WIDE)
+#if defined(NNUE_SIMPLE_PP3WIDE_ANY)
   std::vector<std::uint16_t> pp_active_counts;
   std::vector<std::uint16_t> pp_removed_counts;
   std::vector<std::uint16_t> pp_added_counts;
   std::array<bool, Features::Pp3WideShogi::kDimensions> pp_observed{};
   std::uint64_t pp_dirty_mismatches = 0;
+  std::uint64_t pp_reference_mismatches = 0;
+  std::uint64_t pp_reference_candidates = 0;
+  std::uint64_t pp_optimized_candidates = 0;
   std::uint64_t pp_overflows = 0;
+  std::array<std::uint64_t, 10> pp_move_category_counts{};
   auto pp_board = [](const Position& p) {
     Features::Pp3WideShogi::BoardState board{};
     for (int c = 0; c < COLOR_NB; ++c) {
@@ -1647,7 +1731,24 @@ void TestFeatures(Position& pos) {
 
       // 生成された指し手のなかからランダムに選び、その指し手で局面を進める。
       Move m = mg.begin()[prng.rand(mg.size())];
-#if defined(NNUE_SIMPLE_PP3WIDE)
+#if defined(NNUE_SIMPLE_PP3WIDE_ANY)
+      const PieceType pp_moved_type = type_of(pos.moved_piece_before(m));
+      const Piece pp_captured = pos.piece_on(m.to_sq());
+      const bool pp_capture = pp_captured != NO_PIECE;
+      const bool pp_plain = !m.is_drop() && !m.is_promote() && !pp_capture;
+      pp_move_category_counts[0] += pp_plain && pp_moved_type == PAWN;
+      pp_move_category_counts[1] += pp_plain && pp_moved_type == LANCE;
+      pp_move_category_counts[2] += pp_capture && pp_moved_type == PAWN;
+      pp_move_category_counts[3] += pp_capture && pp_moved_type == LANCE;
+      pp_move_category_counts[4] += m.is_drop() && pp_moved_type == PAWN;
+      pp_move_category_counts[5] += m.is_drop() && pp_moved_type == LANCE;
+      pp_move_category_counts[6] += m.is_promote() && pp_moved_type == PAWN;
+      pp_move_category_counts[7] += m.is_promote() && pp_moved_type == LANCE;
+      pp_move_category_counts[8] += pp_capture && is_promoted(pp_captured);
+      const bool pp_captures_unpromoted = pp_capture
+          && (type_of(pp_captured) == PAWN || type_of(pp_captured) == LANCE);
+      pp_move_category_counts[9] += pp_moved_type != PAWN
+          && pp_moved_type != LANCE && !pp_captures_unpromoted;
       const auto pp_before = pp_board(pos);
       const Square pp_old_king[COLOR_NB] = {
           pos.square<KING>(BLACK), pos.square<KING>(WHITE)};
@@ -1662,7 +1763,7 @@ void TestFeatures(Position& pos) {
 #endif
       pos.do_move(m, state[ply]);
 
-#if defined(NNUE_SIMPLE_PP3WIDE)
+#if defined(NNUE_SIMPLE_PP3WIDE_ANY)
       const auto pp_after = pp_board(pos);
       for (const Color perspective : {BLACK, WHITE}) {
         Features::Pp3WideShogi::IndexList old_active, new_active;
@@ -1682,9 +1783,23 @@ void TestFeatures(Position& pos) {
             == PIECE_NUMBER_KING + perspective;
         if (!king_moved) {
           Features::Pp3WideShogi::IndexList local_removed, local_added;
+          Features::Pp3WideShogi::IndexList reference_removed, reference_added;
           Features::Pp3WideShogi::make_local_dirty_diff(
               pp_before, pp_after, perspective, pp_old_king[perspective],
               local_removed, local_added);
+          Features::Pp3WideShogi::make_local_dirty_diff_reference(
+              pp_before, pp_after, perspective, pp_old_king[perspective],
+              reference_removed, reference_added);
+          Features::Pp3WideShogi::dirty_candidate_counts(
+              pp_before, pp_after, perspective, pp_old_king[perspective],
+              pp_reference_candidates, pp_optimized_candidates);
+          if (local_removed.count != reference_removed.count
+              || local_added.count != reference_added.count
+              || !std::equal(local_removed.begin(), local_removed.end(),
+                             reference_removed.begin())
+              || !std::equal(local_added.begin(), local_added.end(),
+                             reference_added.begin()))
+            ++pp_reference_mismatches;
           if (local_removed.count != full_removed.count
               || local_added.count != full_added.count
               || !std::equal(local_removed.begin(), local_removed.end(),
@@ -1693,6 +1808,7 @@ void TestFeatures(Position& pos) {
                              full_added.begin()))
             ++pp_dirty_mismatches;
           pp_overflows += local_removed.overflow || local_added.overflow;
+          pp_overflows += reference_removed.overflow || reference_added.overflow;
         }
       }
 #endif
@@ -1741,7 +1857,7 @@ void TestFeatures(Position& pos) {
   std::cout << "KSDG3 saved-delta overflow perspectives = "
             << ksdg3_saved_delta_overflows << std::endl;
 #endif
-#if defined(NNUE_SIMPLE_PP3WIDE)
+#if defined(NNUE_SIMPLE_PP3WIDE_ANY)
   auto print_pp_distribution = [](const char* name, auto values) {
     std::sort(values.begin(), values.end());
     const double mean = values.empty() ? 0.0
@@ -1764,7 +1880,23 @@ void TestFeatures(Position& pos) {
             << std::count(pp_observed.begin(), pp_observed.end(), true)
             << '/' << Features::Pp3WideShogi::kDimensions
             << " local-dirty mismatches=" << pp_dirty_mismatches
+            << " reference mismatches=" << pp_reference_mismatches
             << " overflows=" << pp_overflows << std::endl;
+  std::cout << "PP3Wide dirty pair candidates reference="
+            << pp_reference_candidates << " optimized="
+            << pp_optimized_candidates << " reduction="
+            << (pp_reference_candidates == 0 ? 0.0
+                : 100.0 * (1.0 - double(pp_optimized_candidates)
+                                      / double(pp_reference_candidates)))
+            << "%" << std::endl;
+  constexpr const char* pp_category_names[10] = {
+      "pawn move", "lance move", "pawn capture", "lance capture",
+      "pawn drop", "lance drop", "pawn promotion", "lance promotion",
+      "promoted-piece capture", "unrelated non-PP move"};
+  std::cout << "PP3Wide covered move categories:";
+  for (std::size_t i = 0; i < pp_move_category_counts.size(); ++i)
+    std::cout << ' ' << pp_category_names[i] << '=' << pp_move_category_counts[i];
+  std::cout << std::endl;
 #endif
 }
 
@@ -1772,7 +1904,7 @@ void TestFeatures(Position& pos) {
 #if !defined(NNUE_HALFKAHM2_SIMPLE)
 bool TestAccumulatorDelayedMaterializationPermanent(Position& pos);
 #endif
-#if defined(NNUE_SIMPLE_PP3WIDE)
+#if defined(NNUE_SIMPLE_PP3WIDE_ANY)
 bool TestPp3WideDelayedMaterializationPermanent(Position& pos);
 #endif
 
@@ -1869,6 +2001,21 @@ void TestAccumulator(Position& pos) {
           }
         }
       }
+
+#if defined(NNUE_SIMPLE_PP3WIDE64)
+      for (std::size_t index = 0; index < 64; ++index) {
+        const std::int64_t left_value =
+            left.pp3wide64_accumulation[perspective][index];
+        const std::int64_t right_value =
+            right.pp3wide64_accumulation[perspective][index];
+        if (left_value != right_value) {
+          print_value_failure(game, ply, move, perspective,
+                              "PP3Wide64 accumulation", index, left_name,
+                              left_value, right_name, right_value, 0, false);
+          return false;
+        }
+      }
+#endif
 
       const auto& left_factors = left.factors[perspective];
       const auto& right_factors = right.factors[perspective];
@@ -2002,14 +2149,14 @@ void TestAccumulator(Position& pos) {
     std::cout << "NNUE delayed-materialization regression suite: failed."
               << std::endl;
 #endif
-#if defined(NNUE_SIMPLE_PP3WIDE)
+#if defined(NNUE_SIMPLE_PP3WIDE_ANY)
   if (!TestPp3WideDelayedMaterializationPermanent(pos))
     std::cout << "PP3Wide delayed-materialization regression suite: failed."
               << std::endl;
 #endif
 }
 
-#if defined(NNUE_SIMPLE_PP3WIDE)
+#if defined(NNUE_SIMPLE_PP3WIDE_ANY)
 bool TestPp3WideDelayedMaterializationPermanent(Position& pos) {
   struct Stats { const char* name; int tested = 0; int mismatches = 0; } stats[] = {
       {"1 immediate evaluate"},
@@ -2032,12 +2179,21 @@ bool TestPp3WideDelayedMaterializationPermanent(Position& pos) {
     const bool main_equal = std::memcmp(
         incremental.accumulation, scratch.accumulation,
         sizeof(incremental.accumulation)) == 0;
+#if defined(NNUE_SIMPLE_PP3WIDE64)
+    const bool pp64_equal = std::memcmp(
+        incremental.pp3wide64_accumulation,
+        scratch.pp3wide64_accumulation,
+        sizeof(incremental.pp3wide64_accumulation)) == 0;
+#else
+    const bool pp64_equal = true;
+#endif
     ++stat.tested;
-    if (!main_equal) {
+    if (!main_equal || !pp64_equal) {
       ++stat.mismatches;
       std::cout << "PP3Wide delayed mismatch case=" << stat.name
 
                 << " merged_main=" << (main_equal ? "OK" : "FAIL")
+		        << " pp64=" << (pp64_equal ? "OK" : "FAIL")
 		        << " current_pre=" << current_was_computed
 		        << " previous_pre=" << previous_was_computed
                 << " sfen=" << pos.sfen() << std::endl;
@@ -13863,11 +14019,26 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     TestAccumulatorRegression109(position());
 #endif
 #if defined(NNUE_HALFKAHM2_SIMPLE)
+  } else if (sub_command == "simple_state_size") {
+    std::cout << "SIMPLE_STATE_SIZE sizeof(StateInfo)=" << sizeof(StateInfo)
+              << " sizeof(Accumulator)=" << sizeof(Accumulator)
+#if defined(NNUE_SIMPLE_PP3WIDE64)
+              << " pp64_accumulator_bytes=" << (2 * 64 * sizeof(std::int16_t))
+#else
+              << " pp64_accumulator_bytes=0"
+#endif
+              << std::endl;
   } else if (sub_command == "simple_hm2_features") {
     DumpHalfKAHM2SimpleFeatures(position());
   } else if (sub_command == "simple_hm2_stages") {
     DumpHalfKAHM2SimpleStages(position());
-#if defined(NNUE_SIMPLE_PP3WIDE)
+#if defined(NNUE_SIMPLE_PP3WIDE64)
+  } else if (sub_command == "pp3wide64_microbench") {
+    std::uint64_t repeats = 1000000;
+    stream >> repeats;
+    TestPp3Wide64Microbench(position(), repeats);
+#endif
+#if defined(NNUE_SIMPLE_PP3WIDE_ANY)
   } else if (sub_command == "pp3wide_features") {
     Features::Pp3WideShogi::BoardState board{};
     for (int c = 0; c < COLOR_NB; ++c) {

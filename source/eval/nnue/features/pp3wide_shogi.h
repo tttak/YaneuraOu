@@ -128,26 +128,110 @@ inline void make_local_dirty_diff(const BoardState& before,
         return table[piece.square * 4 + piece.state];
     };
 
+    std::array<LocalPiece, 22> disappeared{}, appeared{};
+    std::size_t disappeared_count = 0, appeared_count = 0;
+    for (std::size_t i = 0; i < old_count; ++i)
+        if (!present(new_present, old_local[i]))
+            disappeared[disappeared_count++] = old_local[i];
+    for (std::size_t i = 0; i < new_count; ++i)
+        if (!present(old_present, new_local[i]))
+            appeared[appeared_count++] = new_local[i];
+
+    auto identity_less = [](const LocalPiece& a, const LocalPiece& b) {
+        return a.square < b.square
+            || (a.square == b.square && a.state < b.state);
+    };
+    auto append_incident = [&](const auto& changed, std::size_t changed_count,
+                               const auto& all, std::size_t all_count,
+                               IndexList& output) {
+        for (std::size_t i = 0; i < changed_count; ++i)
+            for (std::size_t j = 0; j < all_count; ++j) {
+                if (changed[i] == all[j])
+                    continue;
+                // When both endpoints changed, emit the unordered pair once.
+                const bool other_changed = std::binary_search(
+                    changed.begin(), changed.begin() + changed_count, all[j],
+                    identity_less);
+                if (other_changed && identity_less(all[j], changed[i]))
+                    continue;
+                const LocalPiece& a = identity_less(all[j], changed[i])
+                    ? all[j] : changed[i];
+                const LocalPiece& b = identity_less(all[j], changed[i])
+                    ? changed[i] : all[j];
+                // PP3Wide contains only same-file and adjacent-file pairs.
+                if (b.square / 9 - a.square / 9 > 1)
+                    continue;
+                const IndexType index = feature_index(a, b);
+                if (index != kDimensions)
+                    output.push_back(index);
+            }
+    };
+
+    append_incident(disappeared, disappeared_count, old_local, old_count, removed);
+    append_incident(appeared, appeared_count, new_local, new_count, added);
+
+    std::sort(removed.values.begin(), removed.values.begin() + removed.count);
+    std::sort(added.values.begin(), added.values.begin() + added.count);
+}
+
+// Pre-P2 reference algorithm retained for permanent differential testing.
+inline void make_local_dirty_diff_reference(const BoardState& before,
+                                            const BoardState& after,
+                                            Color perspective,
+                                            Square friend_king,
+                                            IndexList& removed,
+                                            IndexList& added) {
+    std::array<LocalPiece, 22> old_local{}, new_local{};
+    const std::size_t old_count = collect_local(before, perspective, friend_king, old_local);
+    const std::size_t new_count = collect_local(after, perspective, friend_king, new_local);
+    std::array<bool, 81 * 4> old_present{}, new_present{};
+    for (std::size_t i = 0; i < old_count; ++i)
+        old_present[old_local[i].square * 4 + old_local[i].state] = true;
+    for (std::size_t i = 0; i < new_count; ++i)
+        new_present[new_local[i].square * 4 + new_local[i].state] = true;
+    auto present = [](const auto& table, const LocalPiece& piece) {
+        return table[piece.square * 4 + piece.state];
+    };
     for (std::size_t i = 0; i < old_count; ++i)
         for (std::size_t j = i + 1; j < old_count; ++j)
             if (!present(new_present, old_local[i])
                 || !present(new_present, old_local[j])) {
                 const IndexType index = feature_index(old_local[i], old_local[j]);
-                if (index != kDimensions)
-                    removed.push_back(index);
+                if (index != kDimensions) removed.push_back(index);
             }
-
     for (std::size_t i = 0; i < new_count; ++i)
         for (std::size_t j = i + 1; j < new_count; ++j)
             if (!present(old_present, new_local[i])
                 || !present(old_present, new_local[j])) {
                 const IndexType index = feature_index(new_local[i], new_local[j]);
-                if (index != kDimensions)
-                    added.push_back(index);
+                if (index != kDimensions) added.push_back(index);
             }
-
     std::sort(removed.values.begin(), removed.values.begin() + removed.count);
     std::sort(added.values.begin(), added.values.begin() + added.count);
+}
+
+inline void dirty_candidate_counts(const BoardState& before,
+                                   const BoardState& after,
+                                   Color perspective, Square friend_king,
+                                   std::uint64_t& reference,
+                                   std::uint64_t& optimized) {
+    std::array<LocalPiece, 22> old_local{}, new_local{};
+    const std::size_t old_count = collect_local(before, perspective, friend_king, old_local);
+    const std::size_t new_count = collect_local(after, perspective, friend_king, new_local);
+    std::array<bool, 81 * 4> old_present{}, new_present{};
+    for (std::size_t i = 0; i < old_count; ++i)
+        old_present[old_local[i].square * 4 + old_local[i].state] = true;
+    for (std::size_t i = 0; i < new_count; ++i)
+        new_present[new_local[i].square * 4 + new_local[i].state] = true;
+    std::size_t disappeared = 0, appeared = 0;
+    for (std::size_t i = 0; i < old_count; ++i)
+        disappeared += !new_present[old_local[i].square * 4 + old_local[i].state];
+    for (std::size_t i = 0; i < new_count; ++i)
+        appeared += !old_present[new_local[i].square * 4 + new_local[i].state];
+    reference += old_count * (old_count - 1) / 2
+               + new_count * (new_count - 1) / 2;
+    optimized += disappeared * old_count - disappeared * (disappeared + 1) / 2
+               + appeared * new_count - appeared * (appeared + 1) / 2;
 }
 
 inline void make_diff(const IndexList& before, const IndexList& after,

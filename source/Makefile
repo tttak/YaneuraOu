@@ -144,9 +144,11 @@ endif
 # the HalfKA_HM2 Simple edition. NONE preserves the legacy binary and nn.bin.
 NNUE_SIMPLE_LOCAL_PAIR ?= NONE
 ifeq ($(NNUE_SIMPLE_LOCAL_PAIR),PP3WIDE)
-	CPPFLAGS += -DNNUE_SIMPLE_PP3WIDE
+	CPPFLAGS += -DNNUE_SIMPLE_PP3WIDE -DNNUE_SIMPLE_PP3WIDE_ANY
+else ifeq ($(NNUE_SIMPLE_LOCAL_PAIR),PP3WIDE64)
+	CPPFLAGS += -DNNUE_SIMPLE_PP3WIDE64 -DNNUE_SIMPLE_PP3WIDE_ANY
 else ifneq ($(NNUE_SIMPLE_LOCAL_PAIR),NONE)
-	$(error NNUE_SIMPLE_LOCAL_PAIR must be NONE or PP3WIDE)
+	$(error NNUE_SIMPLE_LOCAL_PAIR must be NONE, PP3WIDE, or PP3WIDE64)
 endif
 
 # Optional dense/context input, independent of the sparse A/D feature variant.

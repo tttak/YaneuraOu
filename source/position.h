@@ -216,7 +216,7 @@ struct StateInfo {
 	Eval::NNUE::Accumulator accumulator;
 #endif
 
-#if defined(NNUE_SIMPLE_PP3WIDE)
+#if defined(NNUE_SIMPLE_PP3WIDE_ANY)
 	// Exact before/after board-only pawn/lance snapshots for delayed NNUE
 	// materialization. [absolute color][0=pawn, 1=lance].
 	Bitboard pp3wide_before[COLOR_NB][2];

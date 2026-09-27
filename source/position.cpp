@@ -1873,7 +1873,7 @@ void Position::do_move_impl(Move m, StateInfo& newSt, bool givesCheck, const T* 
     ASSERT_LV3(m.is_ok());
     ASSERT_LV3(&newSt != st);
 
-#if defined(NNUE_SIMPLE_PP3WIDE)
+#if defined(NNUE_SIMPLE_PP3WIDE_ANY)
     Bitboard pp3wide_before[COLOR_NB][2];
     for (int c = 0; c < COLOR_NB; ++c) {
         const auto color = static_cast<Color>(c);
@@ -2362,7 +2362,7 @@ void Position::do_move_impl(Move m, StateInfo& newSt, bool givesCheck, const T* 
 
     st->hand = hand[them];
 
-#if defined(NNUE_SIMPLE_PP3WIDE)
+#if defined(NNUE_SIMPLE_PP3WIDE_ANY)
     for (int c = 0; c < COLOR_NB; ++c) {
         const auto color = static_cast<Color>(c);
         st->pp3wide_before[c][0] = pp3wide_before[c][0];

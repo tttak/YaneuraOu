@@ -20,6 +20,14 @@ struct alignas(64) Accumulator {
   std::int16_t
       accumulation[2][kRefreshTriggers.size()][kTransformedFeatureDimensions];
 
+#if defined(NNUE_SIMPLE_PP3WIDE64)
+  // Experiment 121: PP3WidePL has an independent compact accumulator.  It is
+  // materialized together with the ordinary FT accumulator, so the existing
+  // computed_accumulation flag is the single validity bit for both paths.
+  alignas(64) std::int16_t pp3wide64_accumulation[2][64];
+#endif
+
+
   // 因子計算用 (FM項)
   struct FactorGroup {
       std::int64_t sum_v[32];   // Σv
