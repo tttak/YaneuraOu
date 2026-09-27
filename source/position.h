@@ -222,6 +222,40 @@ struct StateInfo {
 	Bitboard pp3wide_before[COLOR_NB][2];
 	Bitboard pp3wide_after[COLOR_NB][2];
 #endif
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY)
+#if defined(NNUE_LOCALPAIR_DIRTY_FASTPATH)
+    // Experiment 127: a normal shogi move can remove at most the mover and
+    // the captured board piece, and can add at most the moved/dropped piece.
+    // Each endpoint packs square[0:6], owner[7], class[8:10].  This metadata
+    // is sufficient to reconstruct the old local board from the current
+    // Position lazily, so production fast builds need no full before/after
+    // snapshots.
+    struct LocalPairDirtyDelta {
+        std::uint16_t removed[2];
+        std::uint16_t added[1];
+        std::uint8_t removed_count;
+        std::uint8_t added_count;
+        std::uint8_t flags; // bit0: king move
+    } localpairDirty;
+#if defined(NNUE_LOCALPAIR_FASTPATH_KEEP_SNAPSHOTS)
+    // Experiment 122 delayed-materialization snapshots.  Each entry packs
+    // square[0:6], owner[7], class[8:10].  A compact absolute identity list
+    // avoids retaining 32 full Bitboards in every StateInfo.
+    static constexpr std::size_t LocalPair64MaxPieces = 40;
+    std::uint16_t localpair64_before[LocalPair64MaxPieces];
+    std::uint16_t localpair64_after[LocalPair64MaxPieces];
+    std::uint8_t localpair64_before_count;
+    std::uint8_t localpair64_after_count;
+#endif
+#else
+    // Experiment 122-126 reference/current path.
+    static constexpr std::size_t LocalPair64MaxPieces = 40;
+    std::uint16_t localpair64_before[LocalPair64MaxPieces];
+    std::uint16_t localpair64_after[LocalPair64MaxPieces];
+    std::uint8_t localpair64_before_count;
+    std::uint8_t localpair64_after_count;
+#endif
+#endif
 
 #if defined(USE_NNUE_KSDG3_SAVED_DELTA)
 	// Experiment 111 / production correctness fix.  The fixed-corpus maximum

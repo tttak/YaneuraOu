@@ -36,6 +36,16 @@ struct Network {
             ^ 0x50335031u
 #elif defined(NNUE_SIMPLE_PP3WIDE64)
             ^ 0x50335064u
+#elif defined(NNUE_SIMPLE_LOCALPAIR64)
+            ^ 0x4C503634u
+#elif defined(NNUE_SIMPLE_LOCALPAIR64_R2)
+            ^ 0x4B534732u
+#elif defined(NNUE_SIMPLE_LOCALPAIR32_R5_D1)
+            ^ 0x47334431u
+#elif defined(NNUE_SIMPLE_LOCALPAIR32_R5)
+            ^ 0x47533332u
+#elif defined(NNUE_SIMPLE_LOCALPAIR64_R5)
+            ^ 0x47535235u
 #endif
             ;
     }
@@ -44,6 +54,16 @@ struct Network {
         return "SFNN-1536-HalfKAHM2-NoDG-PP3WPL-v3";
 #elif defined(NNUE_SIMPLE_PP3WIDE64)
         return "SFNN-1536-HalfKAHM2-NoDG-PP3WPL64-v4";
+#elif defined(NNUE_SIMPLE_LOCALPAIR64)
+        return "SFNN-1536-HalfKAHM2-NoDG-LocalPair64-v1";
+#elif defined(NNUE_SIMPLE_LOCALPAIR64_R2)
+        return "SFNN-1536-HalfKAHM2-NoDG-KSGLocalPair64-v1";
+#elif defined(NNUE_SIMPLE_LOCALPAIR32_R5_D1)
+        return "SFNN-1536-HalfKAHM2-NoDG-GSLocalPair32-R5-D1-v1";
+#elif defined(NNUE_SIMPLE_LOCALPAIR32_R5)
+        return "SFNN-1536-HalfKAHM2-NoDG-GSLocalPair32-R5-v1";
+#elif defined(NNUE_SIMPLE_LOCALPAIR64_R5)
+        return "SFNN-1536-HalfKAHM2-NoDG-GSLocalPair64-R5-v1";
 #else
         return "SFNN-1536-HalfKAHM2-NoDG-v2";
 #endif
@@ -74,13 +94,13 @@ struct Network {
     static constexpr std::size_t kBufferSize = sizeof(Buffer);
     const OutputType* Propagate(const TransformedFeatureType* input,
                                 char* storage
-#if defined(NNUE_SIMPLE_PP3WIDE64)
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
                                 , const std::int32_t* pp3wide64_residual = nullptr
 #endif
                                 ) const {
         auto& b = *reinterpret_cast<Buffer*>(storage);
         fc_0.Propagate(input, b.fc0);
-#if defined(NNUE_SIMPLE_PP3WIDE64)
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
         if (pp3wide64_residual)
             for (IndexType i = 0; i < 16; ++i)
                 b.fc0[i] += pp3wide64_residual[i];

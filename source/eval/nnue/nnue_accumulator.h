@@ -13,6 +13,17 @@
 namespace YaneuraOu {
 namespace Eval::NNUE {
 
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
+// The relation machinery is shared by the 64d and 32d LocalPair variants;
+// only the compact accumulator/transform width differs.
+inline constexpr IndexType kSimplePairDimensions =
+#if defined(NNUE_SIMPLE_LOCALPAIR32_R5)
+    32;
+#else
+    64;
+#endif
+#endif
+
 // 入力特徴量をアフィン変換した結果を保持するクラス
 // 最終的な出力である評価値も一緒に持たせておく
 // AVX-512命令を使用する場合に64bytesのアライメントが要求される。
@@ -20,11 +31,12 @@ struct alignas(64) Accumulator {
   std::int16_t
       accumulation[2][kRefreshTriggers.size()][kTransformedFeatureDimensions];
 
-#if defined(NNUE_SIMPLE_PP3WIDE64)
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
   // Experiment 121: PP3WidePL has an independent compact accumulator.  It is
   // materialized together with the ordinary FT accumulator, so the existing
   // computed_accumulation flag is the single validity bit for both paths.
-  alignas(64) std::int16_t pp3wide64_accumulation[2][64];
+  alignas(64) std::int16_t
+      pp3wide64_accumulation[2][kSimplePairDimensions];
 #endif
 
 

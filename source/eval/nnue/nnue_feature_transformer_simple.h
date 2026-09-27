@@ -15,8 +15,12 @@
 #include "nnue_common.h"
 #include "nnue_architecture.h"
 #include "features/index_list.h"
+#include "layers/simd.h"
 #if defined(NNUE_SIMPLE_PP3WIDE_ANY)
 #include "features/pp3wide_shogi.h"
+#endif
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY)
+#include "features/local_pair64_shogi.h"
 #endif
 #if defined(USE_EXPERIMENTAL_KP_PROGRESS_SHADOW)
 #include "kp_progress_shadow.h"
@@ -195,6 +199,18 @@ class FeatureTransformer {
 		       ^ 0x50335731u
 #elif defined(NNUE_SIMPLE_PP3WIDE64)
 		       ^ 0x50335764u
+#elif defined(NNUE_SIMPLE_LOCALPAIR64_ANY)
+#if defined(NNUE_SIMPLE_LOCALPAIR32_R5_D1)
+		       ^ 0x47334431u
+#elif defined(NNUE_SIMPLE_LOCALPAIR32_R5)
+		       ^ 0x47533332u
+#elif defined(NNUE_SIMPLE_LOCALPAIR64_R5)
+		       ^ 0x47535235u
+#elif defined(NNUE_SIMPLE_LOCALPAIR64_R2)
+		       ^ 0x4B534732u
+#else
+		       ^ 0x4C503634u
+#endif
 #endif
 		       ;
 #elif defined(SFNNwoPSQT)
@@ -264,6 +280,8 @@ class FeatureTransformer {
 		read_pp3wide_weights(stream);
 #elif defined(NNUE_SIMPLE_PP3WIDE64)
 		read_pp3wide64_parameters(stream);
+#elif defined(NNUE_SIMPLE_LOCALPAIR64_ANY)
+		read_pp3wide64_parameters(stream);
 #endif
 #else
 		for (std::size_t i = 0; i < kHalfDimensions; ++i) biases_[i] = read_little_endian<BiasType>(stream);
@@ -293,6 +311,8 @@ class FeatureTransformer {
 #if defined(NNUE_SIMPLE_PP3WIDE)
 		write_pp3wide_weights(stream);
 #elif defined(NNUE_SIMPLE_PP3WIDE64)
+		write_pp3wide64_parameters(stream);
+#elif defined(NNUE_SIMPLE_LOCALPAIR64_ANY)
 		write_pp3wide64_parameters(stream);
 #endif
 		return !stream.fail();
@@ -545,14 +565,14 @@ class FeatureTransformer {
 #endif
 	}
 
-#if defined(NNUE_SIMPLE_PP3WIDE64)
-	// Convert the independent 64-wide PP accumulator to two 32-wide EWM
-	// vectors (side-to-move first), then apply the shared int8 64->16
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
+	// Convert the independent compact PP accumulator to two half-width EWM
+	// vectors (side-to-move first), then apply the shared int8 width->16
 	// projection.  The result is in the exact int32 raw unit used by fc_0.
 	void TransformPp3Wide64(const Position& pos,
 	                        std::int32_t* residual,
 	                        std::uint8_t* diagnostic_transformed = nullptr) const {
-		alignas(kCacheLineSize) std::uint8_t transformed[64];
+		alignas(kCacheLineSize) std::uint8_t transformed[kPp64Width];
 		TransformPp3Wide64Ewm(pos, transformed);
 		ProjectPp3Wide64(transformed, residual);
 		if (diagnostic_transformed)
@@ -576,11 +596,11 @@ class FeatureTransformer {
 #endif
 		for (IndexType p = 0; p < 2; ++p) {
 			const auto* source = accumulation[perspectives[p]];
-			for (IndexType j = 0; j < 32; ++j) {
+			for (IndexType j = 0; j < kPp64Width / 2; ++j) {
 				const int a = std::clamp<int>(source[j], 0, 127 * 2);
-				const int b = std::clamp<int>(source[j + 32], 0, 127 * 2);
+				const int b = std::clamp<int>(source[j + kPp64Width / 2], 0, 127 * 2);
 				const int value = ((a << shift) * b) >> 16;
-				transformed[p * 32 + j] = static_cast<std::uint8_t>(
+				transformed[p * (kPp64Width / 2) + j] = static_cast<std::uint8_t>(
 					std::clamp(value, 0, 255));
 			}
 		}
@@ -589,26 +609,60 @@ class FeatureTransformer {
 	void ProjectPp3Wide64(const std::uint8_t* transformed,
 	                      std::int32_t* residual) const {
 		for (IndexType o = 0; o < 16; ++o) {
+			const auto* weights = &pp3wide64_projection_[o * kPp64Width];
+#if defined(USE_AVX2)
+			// Widen before multiplication.  maddubs would saturate each adjacent
+			// int16 pair for the legal uint8/int8 extrema and would therefore
+			// violate the scalar fixed-point contract.
+			__m256i sum = _mm256_setzero_si256();
+			for (IndexType i = 0; i < kPp64Width; i += 16) {
+				const __m128i input8 = _mm_loadu_si128(
+					reinterpret_cast<const __m128i*>(transformed + i));
+				const __m128i weight8 = _mm_loadu_si128(
+					reinterpret_cast<const __m128i*>(weights + i));
+				const __m256i input16 = _mm256_cvtepu8_epi16(input8);
+				const __m256i weight16 = _mm256_cvtepi8_epi16(weight8);
+				sum = _mm256_add_epi32(
+					sum, _mm256_madd_epi16(input16, weight16));
+			}
+			residual[o] = Simd::m256_hadd(sum, 0);
+#else
 			std::int32_t sum = 0;
-			const auto* weights = &pp3wide64_projection_[o * 64];
-			for (IndexType i = 0; i < 64; ++i)
+			for (IndexType i = 0; i < kPp64Width; ++i)
 				sum += static_cast<std::int32_t>(transformed[i])
 				     * static_cast<std::int32_t>(weights[i]);
 			residual[o] = sum;
+#endif
 		}
 	}
 
 	const std::int8_t* TestPp3Wide64Row(const IndexType index) const {
-		return &pp3wide64_weights_[index * 64];
+		return &pp3wide64_weights_[index * kPp64Width];
+	}
+
+	static constexpr IndexType TestPp3Wide64Width() { return kPp64Width; }
+
+	static constexpr IndexType TestPp3Wide64Dimensions() {
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY)
+		return Features::LocalPair64Shogi::kDimensions;
+#else
+		return Features::Pp3WideShogi::kDimensions;
+#endif
 	}
 
 	void TestApplyPp3Wide64Rows(std::int16_t* destination,
 	                           const IndexType base) const {
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY)
+		Features::LocalPair64Shogi::IndexList removed, added;
+		constexpr IndexType dimensions = Features::LocalPair64Shogi::kDimensions;
+#else
 		Features::Pp3WideShogi::IndexList removed, added;
+		constexpr IndexType dimensions = Features::Pp3WideShogi::kDimensions;
+#endif
 		for (IndexType i = 0; i < 3; ++i)
-			removed.push_back((base + i) % Features::Pp3WideShogi::kDimensions);
+			removed.push_back((base + i) % dimensions);
 		for (IndexType i = 0; i < 4; ++i)
-			added.push_back((base + 17 + i) % Features::Pp3WideShogi::kDimensions);
+			added.push_back((base + 17 + i) % dimensions);
 		pp64_apply_diff(destination, removed, added);
 	}
 #endif
@@ -630,10 +684,67 @@ class FeatureTransformer {
 #endif
 	}
 
-#if defined(NNUE_SIMPLE_PP3WIDE64)
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY)
+	using Pp64Feature = Features::LocalPair64Shogi::IndexList;
+	using Pp64Board = Features::LocalPair64Shogi::BoardState;
+#else
 	using Pp64Feature = Features::Pp3WideShogi::IndexList;
 	using Pp64Board = Features::Pp3WideShogi::BoardState;
-	static constexpr IndexType kPp64Width = 64;
+#endif
+	static constexpr IndexType kPp64Width = kSimplePairDimensions;
+	static constexpr IndexType kPp64Dimensions =
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY)
+		Features::LocalPair64Shogi::kDimensions;
+#else
+		Features::Pp3WideShogi::kDimensions;
+#endif
+
+	static void pp64_append_active(const Pp64Board& board, Color perspective,
+	                              Square king, Pp64Feature& active) {
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY)
+		Features::LocalPair64Shogi::append_active(
+			board, perspective, king, active);
+#else
+		Features::Pp3WideShogi::append_active(
+			board, perspective, king, active);
+#endif
+	}
+
+	static void pp64_make_dirty(const Pp64Board& before,
+	                           const Pp64Board& after, Color perspective,
+	                           Square king, Pp64Feature& removed,
+	                           Pp64Feature& added) {
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY)
+		Features::LocalPair64Shogi::make_local_dirty_diff(
+			before, after, perspective, king, removed, added);
+#else
+		Features::Pp3WideShogi::make_local_dirty_diff(
+			before, after, perspective, king, removed, added);
+#endif
+	}
+
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY) \
+ && defined(NNUE_LOCALPAIR_DIRTY_FASTPATH)
+	static void pp64_make_dirty_fast(const Position& pos,
+	                                 Color perspective, Square king,
+	                                 Pp64Feature& removed,
+	                                 Pp64Feature& added) {
+		Features::LocalPair64Shogi::make_local_dirty_diff_fast(
+			pos, pos.state()->localpairDirty, perspective, king,
+			removed, added);
+	}
+#endif
+
+	static void pp64_make_diff(const Pp64Feature& before,
+	                          const Pp64Feature& after, Pp64Feature& removed,
+	                          Pp64Feature& added) {
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY)
+		Features::LocalPair64Shogi::make_diff(before, after, removed, added);
+#else
+		Features::Pp3WideShogi::make_diff(before, after, removed, added);
+#endif
+	}
 
 	void read_pp3wide64_parameters(std::istream& stream) {
 		stream.read(reinterpret_cast<char*>(pp3wide64_weights_),
@@ -653,8 +764,43 @@ class FeatureTransformer {
 		Pp64Board board{};
 		for (int c = 0; c < COLOR_NB; ++c) {
 			const auto color = static_cast<Color>(c);
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY)
+#if defined(NNUE_SIMPLE_LOCALPAIR64_R5)
+			constexpr PieceType types[2] = {SILVER, GOLDS};
+			for (int pc = 0; pc < int(std::size(types)); ++pc) {
+				Bitboard bb = pos.pieces(color, types[pc]);
+				while (bb)
+					Features::LocalPair64Shogi::set_piece(
+						board, c, pc, bb.pop());
+			}
+#elif defined(NNUE_SIMPLE_LOCALPAIR64_R2)
+			constexpr PieceType types[3] = {KNIGHT, SILVER, GOLDS};
+			for (int pc = 0; pc < 3; ++pc) {
+				Bitboard bb = pos.pieces(color, types[pc]);
+				while (bb)
+					Features::LocalPair64Shogi::set_piece(
+						board, c, pc, bb.pop());
+			}
+#else
+			constexpr PieceType types[8] = {
+				LANCE, KNIGHT, SILVER, GOLDS,
+				BISHOP, HORSE, ROOK, DRAGON};
+#if defined(NNUE_LOCALPAIR64_DIRTY_SCAN_REFERENCE)
+			for (int pc = 0; pc < int(std::size(types)); ++pc)
+				board.pieces[c][pc] = pos.pieces(color, types[pc]);
+#else
+			for (int pc = 0; pc < int(std::size(types)); ++pc) {
+				Bitboard bb = pos.pieces(color, types[pc]);
+				while (bb)
+					Features::LocalPair64Shogi::set_piece(
+						board, c, pc, bb.pop());
+			}
+#endif
+#endif
+#else
 			board.pieces[c][0] = pos.pieces(color, PAWN);
 			board.pieces[c][1] = pos.pieces(color, LANCE);
+#endif
 		}
 		return board;
 	}
@@ -662,10 +808,35 @@ class FeatureTransformer {
 	static Pp64Board pp64_board_from_state(const StateInfo& state,
 	                                      bool after) {
 		Pp64Board board{};
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY)
+#if !defined(NNUE_LOCALPAIR_DIRTY_FASTPATH) \
+ || defined(NNUE_LOCALPAIR_FASTPATH_KEEP_SNAPSHOTS)
+		const auto* entries = after ? state.localpair64_after
+		                            : state.localpair64_before;
+		const auto count = after ? state.localpair64_after_count
+		                         : state.localpair64_before_count;
+		for (std::uint8_t i = 0; i < count; ++i) {
+			const auto packed = entries[i];
+			const auto sq = static_cast<Square>(packed & 0x7f);
+			const int owner = (packed >> 7) & 1;
+			const int pc = (packed >> 8) & 7;
+#if defined(NNUE_LOCALPAIR64_DIRTY_SCAN_REFERENCE)
+			board.pieces[owner][pc] |= Bitboard(sq);
+#else
+			board.at[static_cast<int>(sq)] = static_cast<std::uint8_t>(
+				1 + owner * Features::LocalPair64Shogi::kClasses + pc);
+#endif
+		}
+#else
+		(void)state;
+		(void)after;
+#endif
+#else
 		for (int c = 0; c < COLOR_NB; ++c)
 			for (int pc = 0; pc < 2; ++pc)
 				board.pieces[c][pc] = after ? state.pp3wide_after[c][pc]
 				                                  : state.pp3wide_before[c][pc];
+#endif
 		return board;
 	}
 
@@ -716,7 +887,7 @@ class FeatureTransformer {
 		for (int c = 0; c < COLOR_NB; ++c) {
 			const auto perspective = static_cast<Color>(c);
 			Pp64Feature active;
-			Features::Pp3WideShogi::append_active(
+			pp64_append_active(
 				board, perspective, pos.square<KING>(perspective), active);
 			pp64_refresh_rows(
 				accumulator.pp3wide64_accumulation[perspective], active);
@@ -727,44 +898,86 @@ class FeatureTransformer {
 		const auto& state = *pos.state();
 		const auto& previous = state.previous->accumulator;
 		auto& current = pos.state()->accumulator;
+#if !defined(NNUE_SIMPLE_LOCALPAIR64_ANY) \
+ || !defined(NNUE_LOCALPAIR_DIRTY_FASTPATH)
 		const auto before = pp64_board_from_state(state, false);
 		const auto after = pp64_board_from_state(state, true);
 		bool board_changed = false;
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY) \
+	&& !defined(NNUE_LOCALPAIR64_DIRTY_SCAN_REFERENCE)
+		board_changed = before.at != after.at;
+#else
 		for (int c = 0; c < COLOR_NB; ++c)
-			for (int pc = 0; pc < 2; ++pc)
+			for (int pc = 0; pc <
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY)
+				8
+#else
+				2
+#endif
+				; ++pc)
 				board_changed |= before.pieces[c][pc] != after.pieces[c][pc];
+#endif
+#endif
 		for (int c = 0; c < COLOR_NB; ++c) {
 			const auto perspective = static_cast<Color>(c);
 			auto* destination =
 				current.pp3wide64_accumulation[perspective];
-			const bool king_moved = state.dirtyPiece.pieceNo[0]
+			const bool king_moved =
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY) \
+ && defined(NNUE_LOCALPAIR_DIRTY_FASTPATH)
+				(state.localpairDirty.flags & 1) != 0;
+#else
+				state.dirtyPiece.pieceNo[0]
 				== PIECE_NUMBER_KING + perspective;
+#endif
 			const Square king = pos.square<KING>(perspective);
 			if (king_moved) {
 				Pp64Feature active;
-				Features::Pp3WideShogi::append_active(
-					after, perspective, king, active);
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY) \
+	&& !defined(NNUE_LOCALPAIR64_DIRTY_SCAN_REFERENCE)
+				// Lookup-only delayed snapshots intentionally omit bitboards.
+				// King moves already require a full refresh, so enumerate from
+				// the live Position instead of rebuilding bitboards every move.
+				const auto refresh_board = pp64_board_from_position(pos);
+				pp64_append_active(refresh_board, perspective, king, active);
+#else
+				pp64_append_active(after, perspective, king, active);
+#endif
 				pp64_refresh_rows(destination, active);
 				continue;
 			}
 			std::memcpy(destination,
 			            previous.pp3wide64_accumulation[perspective],
 			            kPp64Width * sizeof(std::int16_t));
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY) \
+ && defined(NNUE_LOCALPAIR_DIRTY_FASTPATH)
+			if (state.localpairDirty.removed_count == 0
+			    && state.localpairDirty.added_count == 0)
+				continue;
+#else
 			if (!board_changed)
 				continue;
+#endif
 			Pp64Feature removed, added;
-			Features::Pp3WideShogi::make_local_dirty_diff(
-				before, after, perspective, king, removed, added);
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY) \
+ && defined(NNUE_LOCALPAIR_DIRTY_FASTPATH)
+			pp64_make_dirty_fast(pos, perspective, king, removed, added);
+#else
+			pp64_make_dirty(before, after, perspective, king, removed, added);
+#endif
 			if (removed.overflow || added.overflow) {
 				Pp64Feature old_active, new_active;
 				removed = Pp64Feature{};
 				added = Pp64Feature{};
-				Features::Pp3WideShogi::append_active(
-					before, perspective, king, old_active);
-				Features::Pp3WideShogi::append_active(
-					after, perspective, king, new_active);
-				Features::Pp3WideShogi::make_diff(
-					old_active, new_active, removed, added);
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY) \
+ && defined(NNUE_LOCALPAIR_DIRTY_FASTPATH)
+				// The fast path can emit at most 2*24 rows, below capacity.
+				ASSERT(false);
+#else
+				pp64_append_active(before, perspective, king, old_active);
+				pp64_append_active(after, perspective, king, new_active);
+				pp64_make_diff(old_active, new_active, removed, added);
+#endif
 			}
 			pp64_apply_diff(destination, removed, added);
 		}
@@ -1350,7 +1563,7 @@ class FeatureTransformer {
 
 #if defined(NNUE_SIMPLE_PP3WIDE)
 		refresh_pp3wide(pos);
-#elif defined(NNUE_SIMPLE_PP3WIDE64)
+#elif defined(NNUE_SIMPLE_PAIR64_ANY)
 		refresh_pp3wide64(pos);
 #endif
 
@@ -1400,7 +1613,7 @@ class FeatureTransformer {
 
 #if defined(NNUE_SIMPLE_PP3WIDE)
 		refresh_pp3wide(pos);
-#elif defined(NNUE_SIMPLE_PP3WIDE64)
+#elif defined(NNUE_SIMPLE_PAIR64_ANY)
 		refresh_pp3wide64(pos);
 #endif
 
@@ -1564,7 +1777,7 @@ class FeatureTransformer {
 			}
 		}
 
-#if defined(NNUE_SIMPLE_PP3WIDE64)
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
 		update_pp3wide64(pos);
 #endif
 
@@ -1587,7 +1800,7 @@ class FeatureTransformer {
 		}
 #if defined(NNUE_SIMPLE_PP3WIDE)
 		refresh_pp3wide(pos);
-#elif defined(NNUE_SIMPLE_PP3WIDE64)
+#elif defined(NNUE_SIMPLE_PAIR64_ANY)
 		refresh_pp3wide64(pos);
 #endif
 		accumulator.computed_accumulation = true;
@@ -1602,12 +1815,12 @@ class FeatureTransformer {
 			board, perspective, pos.square<KING>(perspective), active);
 		pp_refresh_rows(destination, active);
 	}
-#elif defined(NNUE_SIMPLE_PP3WIDE64)
+#elif defined(NNUE_SIMPLE_PAIR64_ANY)
 	void TestBuildPp64Accumulator(const Position& pos, Color perspective,
 	                              std::int16_t* destination) const {
 		const auto board = pp64_board_from_position(pos);
 		Pp64Feature active;
-		Features::Pp3WideShogi::append_active(
+		pp64_append_active(
 			board, perspective, pos.square<KING>(perspective), active);
 		pp64_refresh_rows(destination, active);
 	}
@@ -1635,10 +1848,11 @@ class FeatureTransformer {
 #if defined(NNUE_SIMPLE_PP3WIDE)
 	alignas(kCacheLineSize) std::int8_t
 		pp3wide_weights_[Features::Pp3WideShogi::kDimensions * kHalfDimensions];
-#elif defined(NNUE_SIMPLE_PP3WIDE64)
+#elif defined(NNUE_SIMPLE_PAIR64_ANY)
 	alignas(kCacheLineSize) std::int8_t
-		pp3wide64_weights_[Features::Pp3WideShogi::kDimensions * 64];
-	alignas(kCacheLineSize) std::int8_t pp3wide64_projection_[16 * 64];
+		pp3wide64_weights_[kPp64Dimensions * kPp64Width];
+	alignas(kCacheLineSize) std::int8_t
+		pp3wide64_projection_[16 * kPp64Width];
 #endif
 #if defined(USE_FINNY_TABLES)
 	std::uint64_t finny_generation_ = 0;

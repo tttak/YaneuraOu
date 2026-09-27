@@ -287,6 +287,31 @@ namespace NNUE {
                "+PP3WidePL64[73305->1536x2;15552->64x2->EWM64->Proj16],"
                "Network=SFNN-1536-HalfKAHM2-NoDG-PP3WPL64-v4"
                "{LayerStack=9}";
+#elif defined(NNUE_SIMPLE_LOCALPAIR64)
+        return "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
+               "+LocalPair64-L4[73305->1536x2;184320->64x2->EWM64->Proj16],"
+               "Network=SFNN-1536-HalfKAHM2-NoDG-LocalPair64-v1"
+               "{LayerStack=9}";
+#elif defined(NNUE_SIMPLE_LOCALPAIR64_R2)
+        return "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
+               "+KSGLocalPair64-R2[73305->1536x2;25920->64x2->EWM64->Proj16],"
+               "Network=SFNN-1536-HalfKAHM2-NoDG-KSGLocalPair64-v1"
+               "{LayerStack=9}";
+#elif defined(NNUE_SIMPLE_LOCALPAIR32_R5_D1)
+        return "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
+               "+GSLocalPair32-R5-D1[73305->1536x2;4352->32x2->EWM32->Proj16],"
+               "Network=SFNN-1536-HalfKAHM2-NoDG-GSLocalPair32-R5-D1-v1"
+               "{LayerStack=9}";
+#elif defined(NNUE_SIMPLE_LOCALPAIR32_R5)
+        return "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
+               "+GSLocalPair32-R5[73305->1536x2;11520->32x2->EWM32->Proj16],"
+               "Network=SFNN-1536-HalfKAHM2-NoDG-GSLocalPair32-R5-v1"
+               "{LayerStack=9}";
+#elif defined(NNUE_SIMPLE_LOCALPAIR64_R5)
+        return "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
+               "+GSLocalPair64-R5[73305->1536x2;11520->64x2->EWM64->Proj16],"
+               "Network=SFNN-1536-HalfKAHM2-NoDG-GSLocalPair64-R5-v1"
+               "{LayerStack=9}";
 #else
         return "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
                "[73305->1536x2],Network=SFNN-1536-HalfKAHM2-NoDG-v2"
@@ -493,11 +518,11 @@ namespace {
 		}
 #endif
     
-    		result = Detail::ReadParameters<FeatureTransformer>(stream, feature_transformer);
+		result = Detail::ReadParameters<FeatureTransformer>(stream, feature_transformer);
     		if (result.is_not_ok()) {
     			sync_cout << "info string NNUE feature params read failed: " << result.to_string() << sync_endl;
-    			return result;
-    		}
+				return result;
+			}
 
 #if !defined(NNUE_HALFKAHM2_SIMPLE)
 			// Router の読み込み
@@ -508,7 +533,7 @@ namespace {
 
 #if defined(SFNNwoPSQT)
     		for (int i = 0; i < kLayerStacks; ++i) {
-    			result = Detail::ReadParameters<Network>(stream, network[i]);
+			result = Detail::ReadParameters<Network>(stream, network[i]);
     			if (result.is_not_ok()) {
     				sync_cout << "info string NNUE network params read failed at stack " << i << ": " << result.to_string() << sync_endl;
     				return result;
@@ -522,7 +547,7 @@ namespace {
     		}
 #endif
 
-    		if (stream && stream.peek() == std::ios::traits_type::eof())
+		if (stream && stream.peek() == std::ios::traits_type::eof())
     			return Tools::ResultCode::Ok;
     		else
     			return Tools::ResultCode::FileCloseError;
@@ -728,7 +753,7 @@ namespace {
 #if defined(MEASURE_EVAL_HASH_BENCHMARK)
         EvalHash_DiagnosticOnPropagate();
 #endif
-#if defined(NNUE_SIMPLE_PP3WIDE64)
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
         alignas(kCacheLineSize) std::int32_t pp3wide64_residual[16];
         feature_transformer->TransformPp3Wide64(pos, pp3wide64_residual);
         const auto output = network[bucket]->Propagate(

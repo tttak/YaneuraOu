@@ -22,6 +22,11 @@
 #include "eval/nnue/features/king_safety3_distinguishgolds.h"
 #include "eval/nnue/features/index_list.h"
 #endif
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY) \
+ && (!defined(NNUE_LOCALPAIR_DIRTY_FASTPATH) \
+     || defined(NNUE_LOCALPAIR_FASTPATH_KEEP_SNAPSHOTS))
+#include "eval/nnue/features/local_pair64_shogi.h"
+#endif
 
 #if defined(EVAL_KPPT) || defined(EVAL_KPP_KKPT) || defined(EVAL_NNUE)
 #include "eval/evaluate_common.h"
@@ -1881,6 +1886,125 @@ void Position::do_move_impl(Move m, StateInfo& newSt, bool givesCheck, const T* 
         pp3wide_before[c][1] = pieces(color, LANCE);
     }
 #endif
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY) \
+ && (!defined(NNUE_LOCALPAIR_DIRTY_FASTPATH) \
+     || defined(NNUE_LOCALPAIR_FASTPATH_KEEP_SNAPSHOTS))
+    std::uint16_t localpair64_before[StateInfo::LocalPair64MaxPieces];
+    std::uint8_t localpair64_before_count = 0;
+#if defined(NNUE_SIMPLE_LOCALPAIR64_R5)
+    constexpr PieceType localpair64_types[2] = {SILVER, GOLDS};
+    for (int c = 0; c < COLOR_NB; ++c) {
+        const auto color = static_cast<Color>(c);
+        for (int pc = 0; pc < int(std::size(localpair64_types)); ++pc) {
+            Bitboard bb = pieces(color, localpair64_types[pc]);
+            while (bb) {
+                const auto sq = bb.pop();
+                ASSERT(localpair64_before_count
+                       < StateInfo::LocalPair64MaxPieces);
+                localpair64_before[localpair64_before_count++] =
+                    static_cast<std::uint16_t>(sq)
+                    | static_cast<std::uint16_t>(c << 7)
+                    | static_cast<std::uint16_t>(pc << 8);
+            }
+        }
+    }
+#elif defined(NNUE_SIMPLE_LOCALPAIR64_R2)
+    constexpr PieceType localpair64_types[3] = {KNIGHT, SILVER, GOLDS};
+    for (int c = 0; c < COLOR_NB; ++c) {
+        const auto color = static_cast<Color>(c);
+        for (int pc = 0; pc < 3; ++pc) {
+            Bitboard bb = pieces(color, localpair64_types[pc]);
+            while (bb) {
+                const auto sq = bb.pop();
+                ASSERT(localpair64_before_count
+                       < StateInfo::LocalPair64MaxPieces);
+                localpair64_before[localpair64_before_count++] =
+                    static_cast<std::uint16_t>(sq)
+                    | static_cast<std::uint16_t>(c << 7)
+                    | static_cast<std::uint16_t>(pc << 8);
+            }
+        }
+    }
+#else
+    constexpr PieceType localpair64_types[8] = {
+        LANCE, KNIGHT, SILVER, GOLDS, BISHOP, HORSE, ROOK, DRAGON};
+    for (int c = 0; c < COLOR_NB; ++c) {
+        const auto color = static_cast<Color>(c);
+        for (int pc = 0; pc < int(std::size(localpair64_types)); ++pc) {
+            Bitboard bb = pieces(color, localpair64_types[pc]);
+            while (bb) {
+                const auto sq = bb.pop();
+                ASSERT(localpair64_before_count
+                       < StateInfo::LocalPair64MaxPieces);
+                localpair64_before[localpair64_before_count++] =
+                    static_cast<std::uint16_t>(sq)
+                    | static_cast<std::uint16_t>(c << 7)
+                    | static_cast<std::uint16_t>(pc << 8);
+            }
+        }
+    }
+#endif
+#endif
+
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY) \
+ && defined(NNUE_LOCALPAIR_DIRTY_FASTPATH)
+    // Capture only the physical endpoints that can affect the R5 relation.
+    // No relation rows are generated here, preserving lazy materialization.
+    std::uint16_t localpair_removed[2]{};
+    std::uint16_t localpair_added[1]{};
+    std::uint8_t localpair_removed_count = 0;
+    std::uint8_t localpair_added_count = 0;
+    std::uint8_t localpair_flags = 0;
+    const auto localpair_class = [](Piece pc) -> int {
+        if (pc == NO_PIECE) return -1;
+        switch (type_of(pc)) {
+        case SILVER: return 0;
+        case GOLD:
+        case PRO_PAWN:
+        case PRO_LANCE:
+        case PRO_KNIGHT:
+        case PRO_SILVER: return 1;
+        default: return -1;
+        }
+    };
+    const auto localpair_pack = [](Square sq, Piece pc, int pc_class) {
+        return static_cast<std::uint16_t>(sq)
+             | static_cast<std::uint16_t>(int(color_of(pc)) << 7)
+             | static_cast<std::uint16_t>(pc_class << 8);
+    };
+    if (m.is_drop()) {
+        const Piece added_pc = moved_piece_after(m);
+        const int added_class = localpair_class(added_pc);
+        if (added_class >= 0)
+            localpair_added[localpair_added_count++] =
+                localpair_pack(m.to_sq(), added_pc, added_class);
+    } else {
+        const Square from = m.from_sq();
+        const Square to = m.to_sq();
+        const Piece old_mover = piece_on(from);
+        const Piece captured_pc = piece_on(to);
+        const Piece new_mover = moved_piece_after(m);
+        if (type_of(old_mover) == KING) localpair_flags |= 1;
+        const int old_class = localpair_class(old_mover);
+        const int captured_class = localpair_class(captured_pc);
+        const int new_class = localpair_class(new_mover);
+        if (old_class >= 0)
+            localpair_removed[localpair_removed_count++] =
+                localpair_pack(from, old_mover, old_class);
+        if (captured_class >= 0)
+#if defined(NNUE_LOCALPAIR_FASTPATH_NEGATIVE_CONTROL)
+            // Experiment 127 only: deliberately omit captured R5 endpoints.
+            // The full-oracle regression must detect this mutation.
+            (void)captured_class;
+#else
+            localpair_removed[localpair_removed_count++] =
+                localpair_pack(to, captured_pc, captured_class);
+#endif
+        if (new_class >= 0)
+            localpair_added[localpair_added_count++] =
+                localpair_pack(to, new_mover, new_class);
+    }
+#endif
 
     // ----------------------
     //  StateInfoの更新
@@ -2370,6 +2494,60 @@ void Position::do_move_impl(Move m, StateInfo& newSt, bool givesCheck, const T* 
         st->pp3wide_after[c][0] = pieces(color, PAWN);
         st->pp3wide_after[c][1] = pieces(color, LANCE);
     }
+#endif
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY) \
+ && (!defined(NNUE_LOCALPAIR_DIRTY_FASTPATH) \
+     || defined(NNUE_LOCALPAIR_FASTPATH_KEEP_SNAPSHOTS))
+    st->localpair64_before_count = localpair64_before_count;
+    std::copy(localpair64_before,
+              localpair64_before + localpair64_before_count,
+              st->localpair64_before);
+    st->localpair64_after_count = 0;
+#if defined(NNUE_SIMPLE_LOCALPAIR64_R5) || defined(NNUE_SIMPLE_LOCALPAIR64_R2)
+    for (int c = 0; c < COLOR_NB; ++c) {
+        const auto color = static_cast<Color>(c);
+        for (int pc = 0; pc < int(std::size(localpair64_types)); ++pc) {
+            Bitboard bb = pieces(color, localpair64_types[pc]);
+            while (bb) {
+                const auto sq = bb.pop();
+                ASSERT(st->localpair64_after_count
+                       < StateInfo::LocalPair64MaxPieces);
+                st->localpair64_after[st->localpair64_after_count++] =
+                    static_cast<std::uint16_t>(sq)
+                    | static_cast<std::uint16_t>(c << 7)
+                    | static_cast<std::uint16_t>(pc << 8);
+            }
+        }
+    }
+#else
+    for (int c = 0; c < COLOR_NB; ++c) {
+        const auto color = static_cast<Color>(c);
+        for (int pc = 0; pc < int(std::size(localpair64_types)); ++pc) {
+            Bitboard bb = pieces(color, localpair64_types[pc]);
+            while (bb) {
+                const auto sq = bb.pop();
+                ASSERT(st->localpair64_after_count
+                       < StateInfo::LocalPair64MaxPieces);
+                st->localpair64_after[st->localpair64_after_count++] =
+                    static_cast<std::uint16_t>(sq)
+                    | static_cast<std::uint16_t>(c << 7)
+                    | static_cast<std::uint16_t>(pc << 8);
+            }
+        }
+    }
+#endif
+#endif
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY) \
+ && defined(NNUE_LOCALPAIR_DIRTY_FASTPATH)
+    st->localpairDirty.removed_count = localpair_removed_count;
+    st->localpairDirty.added_count = localpair_added_count;
+    st->localpairDirty.flags = localpair_flags;
+    std::copy(localpair_removed,
+              localpair_removed + localpair_removed_count,
+              st->localpairDirty.removed);
+    std::copy(localpair_added,
+              localpair_added + localpair_added_count,
+              st->localpairDirty.added);
 #endif
 
     // このタイミングで王手関係の情報を更新しておいてやる。

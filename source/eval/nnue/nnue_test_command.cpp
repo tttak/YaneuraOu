@@ -180,9 +180,10 @@ void DumpHalfKAHM2SimpleStages(const Position& pos) {
       transformed[FeatureTransformer::kBufferSize];
   feature_transformer->Transform(pos, transformed, true);
   alignas(kCacheLineSize) char storage[Network::kBufferSize];
-#if defined(NNUE_SIMPLE_PP3WIDE64)
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
   alignas(kCacheLineSize) std::int32_t pp3wide64_residual[16];
-  alignas(kCacheLineSize) std::uint8_t pp3wide64_transformed[64];
+  alignas(kCacheLineSize) std::uint8_t
+      pp3wide64_transformed[FeatureTransformer::TestPp3Wide64Width()];
   feature_transformer->TransformPp3Wide64(
       pos, pp3wide64_residual, pp3wide64_transformed);
   const auto* final_output = network[bucket]->Propagate(
@@ -214,7 +215,7 @@ void DumpHalfKAHM2SimpleStages(const Position& pos) {
     DumpHalfKAHM2SimpleVector(merged_name.c_str(),
         accumulator.accumulation[perspective][0], 1536);
   }
-#elif defined(NNUE_SIMPLE_PP3WIDE64)
+#elif defined(NNUE_SIMPLE_PAIR64_ANY)
   const auto& accumulator = pos.state()->accumulator;
   for (const Color perspective : {BLACK, WHITE}) {
     const char* suffix = perspective == BLACK ? "black" : "white";
@@ -223,14 +224,16 @@ void DumpHalfKAHM2SimpleStages(const Position& pos) {
     DumpHalfKAHM2SimpleVector(
         main_name.c_str(), accumulator.accumulation[perspective][0], 1536);
     DumpHalfKAHM2SimpleVector(
-        name.c_str(), accumulator.pp3wide64_accumulation[perspective], 64);
+        name.c_str(), accumulator.pp3wide64_accumulation[perspective],
+        FeatureTransformer::TestPp3Wide64Width());
   }
   DumpHalfKAHM2SimpleVector("pp64_projection", pp3wide64_residual, 16);
   DumpHalfKAHM2SimpleVector(
-      "pp64_transformed", pp3wide64_transformed, 64);
+      "pp64_transformed", pp3wide64_transformed,
+      FeatureTransformer::TestPp3Wide64Width());
 #endif
   DumpHalfKAHM2SimpleVector("ft", transformed, 1536);
-#if defined(NNUE_SIMPLE_PP3WIDE64)
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
   alignas(kCacheLineSize) std::int32_t main_fc0[16];
   network[bucket]->fc_0.Propagate(transformed, main_fc0);
   DumpHalfKAHM2SimpleVector("main_fc0_pre", main_fc0, 16);
@@ -252,10 +255,11 @@ void DumpHalfKAHM2SimpleStages(const Position& pos) {
   std::cout << "simple_hm2_stage fv_scale," << FV_SCALE << std::endl;
 }
 
-#if defined(NNUE_SIMPLE_PP3WIDE64)
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
 void TestPp3Wide64Microbench(Position& pos, std::uint64_t repeats) {
   if (repeats == 0) repeats = 1000000;
-  alignas(kCacheLineSize) std::uint8_t transformed[64]{};
+  constexpr auto kPairWidth = FeatureTransformer::TestPp3Wide64Width();
+  alignas(kCacheLineSize) std::uint8_t transformed[kPairWidth]{};
   alignas(kCacheLineSize) std::int32_t residual[16]{};
   // Materialize exactly as production does before isolating the two kernels.
   alignas(kCacheLineSize) TransformedFeatureType main[FeatureTransformer::kBufferSize];
@@ -267,7 +271,7 @@ void TestPp3Wide64Microbench(Position& pos, std::uint64_t repeats) {
   for (std::uint64_t i = 0; i < repeats; ++i) {
     lane = static_cast<std::int16_t>(saved_lane + (i & 1));
     feature_transformer->TransformPp3Wide64Ewm(pos, transformed);
-    checksum += transformed[i & 63];
+    checksum += transformed[i % kPairWidth];
   }
   const auto ewm_end = std::chrono::steady_clock::now();
   lane = saved_lane;
@@ -279,25 +283,41 @@ void TestPp3Wide64Microbench(Position& pos, std::uint64_t repeats) {
     checksum += static_cast<std::uint64_t>(residual[i & 15]);
   }
   const auto projection_end = std::chrono::steady_clock::now();
-  alignas(kCacheLineSize) std::int16_t synthetic_accumulator[64]{};
-  const auto row_begin = std::chrono::steady_clock::now();
+  alignas(kCacheLineSize) std::int16_t synthetic_accumulator[kPairWidth]{};
+  const auto row_hot_begin = std::chrono::steady_clock::now();
   for (std::uint64_t i = 0; i < repeats; ++i) {
     feature_transformer->TestApplyPp3Wide64Rows(
-        synthetic_accumulator, static_cast<IndexType>(i % 15552));
-    checksum += static_cast<std::uint64_t>(synthetic_accumulator[i & 63]);
+        synthetic_accumulator, 0);
+    checksum += static_cast<std::uint64_t>(
+        synthetic_accumulator[i % kPairWidth]);
   }
-  const auto row_end = std::chrono::steady_clock::now();
+  const auto row_hot_end = std::chrono::steady_clock::now();
+  std::uint32_t random_state = 0x12345678u;
+  const auto row_random_begin = std::chrono::steady_clock::now();
+  for (std::uint64_t i = 0; i < repeats; ++i) {
+    random_state = random_state * 1664525u + 1013904223u;
+    const auto base = static_cast<IndexType>(
+        random_state % FeatureTransformer::TestPp3Wide64Dimensions());
+    feature_transformer->TestApplyPp3Wide64Rows(
+        synthetic_accumulator, base);
+    checksum += static_cast<std::uint64_t>(
+        synthetic_accumulator[i % kPairWidth]);
+  }
+  const auto row_random_end = std::chrono::steady_clock::now();
   const double ewm_ns = std::chrono::duration<double, std::nano>(
       ewm_end - ewm_begin).count() / repeats;
   const double projection_ns = std::chrono::duration<double, std::nano>(
       projection_end - projection_begin).count() / repeats;
-  const double row_ns = std::chrono::duration<double, std::nano>(
-      row_end - row_begin).count() / repeats;
+  const double row_hot_ns = std::chrono::duration<double, std::nano>(
+      row_hot_end - row_hot_begin).count() / repeats;
+  const double row_random_ns = std::chrono::duration<double, std::nano>(
+      row_random_end - row_random_begin).count() / repeats;
   std::cout << std::fixed << std::setprecision(3)
             << "PP64_MICRO repeats=" << repeats
             << " ewm_ns=" << ewm_ns
             << " projection_ns=" << projection_ns
-            << " row_update_7_rows_ns=" << row_ns
+            << " row_update_hot_7_rows_ns=" << row_hot_ns
+            << " row_update_random_7_rows_ns=" << row_random_ns
             << " total_eval_ns=" << (ewm_ns + projection_ns)
             << " checksum=" << checksum << std::endl;
 }
@@ -1662,6 +1682,94 @@ void TestFeatures(Position& pos) {
     }
     return board;
   };
+#elif defined(NNUE_SIMPLE_LOCALPAIR64_ANY)
+  std::vector<std::uint16_t> pp_active_counts;
+  std::vector<std::uint16_t> pp_removed_counts;
+  std::vector<std::uint16_t> pp_added_counts;
+  std::vector<bool> pp_observed(Features::LocalPair64Shogi::kDimensions);
+  std::uint64_t pp_scan_vs_full_mismatches = 0;
+  std::uint64_t pp_direct_vs_full_mismatches = 0;
+  std::uint64_t pp_fast_vs_full_mismatches = 0;
+  std::uint64_t pp_scan_vs_direct_mismatches = 0;
+  std::uint64_t pp_overflows = 0;
+  std::uint64_t pp_scan_ns = 0;
+  std::uint64_t pp_direct_ns = 0;
+  std::uint64_t pp_fast_ns = 0;
+  std::uint64_t pp_square_lookup_ns = 0;
+  std::uint64_t pp_bitboard_lookup_ns = 0;
+  std::uint64_t pp_square_lookup_hits = 0;
+  std::uint64_t pp_bitboard_lookup_hits = 0;
+  std::uint64_t pp_dirty_calls = 0;
+  Features::LocalPair64Shogi::DirtyStats pp_scan_stats{};
+  Features::LocalPair64Shogi::DirtyStats pp_direct_stats{};
+  Features::LocalPair64Shogi::FastDirtyStats pp_fast_stats{};
+  std::uint64_t pp_relation_changing_moves = 0;
+  std::uint64_t pp_relation_unchanged_moves = 0;
+  std::uint64_t pp_king_refresh_moves = 0;
+  std::uint64_t pp_king_refresh_ns = 0;
+  std::uint64_t pp_king_refresh_calls = 0;
+  std::array<std::uint64_t, 17> pp_r5_case_counts{};
+  struct ReductionCandidateStats {
+    const char* name;
+    std::uint16_t class_mask;
+    int radius;
+    bool piece_dependent_radius;
+    std::uint32_t exact_features;
+    std::vector<std::uint16_t> active, changed, removed, added, lookups;
+  };
+#if defined(NNUE_SIMPLE_LOCALPAIR32_R5_D1)
+  std::array<ReductionCandidateStats, 2> reduction_candidates{{
+      {"R5-D1", 0x03, 1, false, 4352, {}, {}, {}, {}, {}},
+      {"R5-D2", 0x03, 2, false, 11520, {}, {}, {}, {}, {}},
+  }};
+#elif defined(NNUE_SIMPLE_LOCALPAIR64_R5)
+  std::array<ReductionCandidateStats, 1> reduction_candidates{{
+      {"R5", 0x03, 2, false, 11520, {}, {}, {}, {}, {}},
+  }};
+#elif defined(NNUE_SIMPLE_LOCALPAIR64_R2)
+  // This build's compact class ids are KNIGHT=0, SILVER=1,
+  // GOLD_LIKE=2.  The Experiment 122a masks below use the L4 class ids and
+  // therefore cannot be applied to this reduced BoardState.  Keep only the
+  // implemented R2 set here so the diagnostic cannot silently omit KNIGHT.
+  std::array<ReductionCandidateStats, 1> reduction_candidates{{
+      {"R2", 0x07, 2, false, 25920, {}, {}, {}, {}, {}},
+  }};
+#else
+  std::array<ReductionCandidateStats, 6> reduction_candidates{{
+      {"R1", 0xff, 1, false, 69632, {}, {}, {}, {}, {}},
+      {"R2", 0x0e, 2, false, 25920, {}, {}, {}, {}, {}},
+      {"R3", 0x0f, 2, false, 46080, {}, {}, {}, {}, {}},
+      {"R4", 0xfc, 2, false, 103680, {}, {}, {}, {}, {}},
+      {"R5", 0x0c, 2, false, 11520, {}, {}, {}, {}, {}},
+      {"R6", 0xff, 2, true, 155648, {}, {}, {}, {}, {}},
+  }};
+#endif
+  auto pp_board = [](const Position& p) {
+    Features::LocalPair64Shogi::BoardState board{};
+#if defined(NNUE_SIMPLE_LOCALPAIR64_R5) || defined(NNUE_SIMPLE_LOCALPAIR64_R2)
+    for (int sq = 0; sq < SQ_NB; ++sq) {
+      const auto square = static_cast<Square>(sq);
+      const Piece piece = p.piece_on(square);
+      if (piece == NO_PIECE) continue;
+      const int pc = Features::LocalPair64Shogi::piece_class(type_of(piece));
+      if (pc >= 0)
+        Features::LocalPair64Shogi::set_piece(
+            board, color_of(piece), pc, square);
+    }
+#else
+    constexpr PieceType types[8] = {
+        LANCE, KNIGHT, SILVER, GOLDS, BISHOP, HORSE, ROOK, DRAGON};
+    for (int c = 0; c < COLOR_NB; ++c) {
+      const auto color = static_cast<Color>(c);
+      for (int pc = 0; pc < int(std::size(types)); ++pc) {
+        Bitboard bb = p.pieces(color, types[pc]);
+        while (bb)
+          Features::LocalPair64Shogi::set_piece(board, c, pc, bb.pop());
+      }
+    }
+#endif
+    return board;
+  };
 #endif
   auto make_index_sets = [&](const Position& pos) {
     std::vector<std::vector<std::set<IndexType>>> index_sets(
@@ -1760,6 +1868,60 @@ void TestFeatures(Position& pos) {
         pp_overflows += active.overflow;
         for (const auto index : active) pp_observed[index] = true;
       }
+#elif defined(NNUE_SIMPLE_LOCALPAIR64_ANY)
+      const Piece pp_moved_before = pos.moved_piece_before(m);
+      const Piece pp_captured_before = pos.piece_on(m.to_sq());
+      const PieceType pp_moved_type = type_of(pp_moved_before);
+      const PieceType pp_captured_type = pp_captured_before == NO_PIECE
+          ? NO_PIECE_TYPE : type_of(pp_captured_before);
+      const bool pp_king_refresh_move = pp_moved_type == KING;
+#if defined(NNUE_SIMPLE_LOCALPAIR64_R5)
+      const bool pp_capture = pp_captured_before != NO_PIECE;
+      const bool pp_quiet = !m.is_drop() && !m.is_promote() && !pp_capture;
+      const int pp_moved_class =
+          Features::LocalPair64Shogi::piece_class(pp_moved_type);
+      const int pp_captured_class = pp_capture
+          ? Features::LocalPair64Shogi::piece_class(pp_captured_type) : -1;
+      pp_r5_case_counts[0] += pp_quiet && pp_moved_type == PAWN;
+      pp_r5_case_counts[1] += pp_quiet && pp_moved_type == LANCE;
+      pp_r5_case_counts[2] += pp_quiet && pp_moved_type == KNIGHT;
+      pp_r5_case_counts[3] += pp_quiet && pp_moved_type == BISHOP;
+      pp_r5_case_counts[4] += pp_quiet && pp_moved_type == ROOK;
+      pp_r5_case_counts[5] += !m.is_drop() && pp_moved_type == SILVER;
+      pp_r5_case_counts[6] += !m.is_drop() && pp_moved_type == GOLD;
+      pp_r5_case_counts[7] += pp_capture && pp_moved_type == SILVER;
+      pp_r5_case_counts[8] += pp_capture && pp_moved_type == GOLD;
+      pp_r5_case_counts[9] += pp_capture && pp_moved_class < 0
+                            && pp_captured_class >= 0;
+      pp_r5_case_counts[10] += m.is_promote() && pp_moved_type == SILVER;
+      pp_r5_case_counts[11] += m.is_promote()
+                             && (pp_moved_type == PAWN
+                                 || pp_moved_type == LANCE
+                                 || pp_moved_type == KNIGHT);
+      pp_r5_case_counts[12] += pp_moved_type == PRO_PAWN
+                             || pp_moved_type == PRO_LANCE
+                             || pp_moved_type == PRO_KNIGHT
+                             || pp_moved_type == PRO_SILVER;
+      pp_r5_case_counts[13] += pp_capture
+                             && (pp_captured_type == PRO_PAWN
+                                 || pp_captured_type == PRO_LANCE
+                                 || pp_captured_type == PRO_KNIGHT
+                                 || pp_captured_type == PRO_SILVER);
+      pp_r5_case_counts[14] += m.is_drop() && pp_moved_type == SILVER;
+      pp_r5_case_counts[15] += m.is_drop() && pp_moved_type == GOLD;
+      pp_r5_case_counts[16] += pp_king_refresh_move;
+#endif
+      const auto pp_before = pp_board(pos);
+      const Square pp_old_king[COLOR_NB] = {
+          pos.square<KING>(BLACK), pos.square<KING>(WHITE)};
+      for (const Color perspective : {BLACK, WHITE}) {
+        Features::LocalPair64Shogi::IndexList active;
+        Features::LocalPair64Shogi::append_active(
+            pp_before, perspective, pp_old_king[perspective], active);
+        pp_active_counts.push_back(active.count);
+        pp_overflows += active.overflow;
+        for (const auto index : active) pp_observed[index] = true;
+      }
 #endif
       pos.do_move(m, state[ply]);
 
@@ -1811,6 +1973,264 @@ void TestFeatures(Position& pos) {
           pp_overflows += reference_removed.overflow || reference_added.overflow;
         }
       }
+#elif defined(NNUE_SIMPLE_LOCALPAIR64_ANY)
+      const auto pp_after = pp_board(pos);
+      bool pp_relation_changed = false;
+      for (auto& candidate : reduction_candidates) {
+        auto included = [&](std::uint8_t code) {
+          return code && (candidate.class_mask
+              & (1u << ((code - 1) % Features::LocalPair64Shogi::kClasses)));
+        };
+        auto allowed = [&](int first_sq, std::uint8_t first_code,
+                           int second_sq, std::uint8_t second_code) {
+          const int df = std::abs(first_sq / 9 - second_sq / 9);
+          const int dr = std::abs(first_sq % 9 - second_sq % 9);
+          int radius = candidate.radius;
+          if (candidate.piece_dependent_radius) {
+            const int first_class = (first_code - 1)
+                % Features::LocalPair64Shogi::kClasses;
+            const int second_class = (second_code - 1)
+                % Features::LocalPair64Shogi::kClasses;
+            radius = first_class < 4 && second_class < 4 ? 1 : 2;
+          }
+          return std::max(df, dr) <= radius;
+        };
+        std::uint16_t active = 0;
+        for (int a = 0; a < 81; ++a) {
+          const auto ac = pp_after.at[a];
+          if (!included(ac)) continue;
+          for (int b = a + 1; b < 81; ++b) {
+            const auto bc = pp_after.at[b];
+            if (included(bc) && allowed(a, ac, b, bc)) ++active;
+          }
+        }
+        std::array<bool, 81> old_changed{}, new_changed{};
+        std::uint16_t changed = 0;
+        for (int sq = 0; sq < 81; ++sq) {
+          if (pp_before.at[sq] == pp_after.at[sq]) continue;
+          if (included(pp_before.at[sq])) { old_changed[sq] = true; ++changed; }
+          if (included(pp_after.at[sq])) { new_changed[sq] = true; ++changed; }
+        }
+        auto dirty_count = [&](const auto& board, const auto& changed_at,
+                               std::uint16_t& lookups) {
+          std::uint16_t count = 0;
+          for (int sq = 0; sq < 81; ++sq) {
+            const auto code = board.at[sq];
+            if (!changed_at[sq]) continue;
+            const int file = sq / 9;
+            const int rank = sq % 9;
+            const int radius = candidate.piece_dependent_radius
+                ? 2 : candidate.radius;
+            for (int df = -radius; df <= radius; ++df)
+              for (int dr = -radius; dr <= radius; ++dr) {
+                if (df == 0 && dr == 0) continue;
+                const int other_file = file + df;
+                const int other_rank = rank + dr;
+                if (other_file < 0 || other_file >= 9
+                    || other_rank < 0 || other_rank >= 9) continue;
+                ++lookups;
+                const int other_sq = other_file * 9 + other_rank;
+                const auto other_code = board.at[other_sq];
+                if (!included(other_code)
+                    || !allowed(sq, code, other_sq, other_code)) continue;
+                if (changed_at[other_sq] && other_sq < sq) continue;
+                ++count;
+              }
+          }
+          return count;
+        };
+        std::uint16_t lookups = 0;
+        const auto removed = dirty_count(pp_before, old_changed, lookups);
+        const auto added = dirty_count(pp_after, new_changed, lookups);
+        candidate.active.push_back(active);
+        candidate.changed.push_back(changed);
+        candidate.removed.push_back(removed);
+        candidate.added.push_back(added);
+        candidate.lookups.push_back(lookups);
+      }
+      for (const Color perspective : {BLACK, WHITE}) {
+        Features::LocalPair64Shogi::IndexList old_active, new_active;
+        Features::LocalPair64Shogi::IndexList full_removed, full_added;
+        Features::LocalPair64Shogi::IndexList scan_removed, scan_added;
+        Features::LocalPair64Shogi::IndexList direct_removed, direct_added;
+#if defined(NNUE_LOCALPAIR_DIRTY_FASTPATH)
+        Features::LocalPair64Shogi::IndexList fast_removed, fast_added;
+#endif
+        Features::LocalPair64Shogi::append_active(
+            pp_before, perspective, pp_old_king[perspective], old_active);
+        if (pp_king_refresh_move) {
+          const auto refresh_start = std::chrono::steady_clock::now();
+          Features::LocalPair64Shogi::append_active(
+              pp_after, perspective, pos.square<KING>(perspective), new_active);
+          pp_king_refresh_ns += static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - refresh_start).count());
+          ++pp_king_refresh_calls;
+        } else {
+          Features::LocalPair64Shogi::append_active(
+              pp_after, perspective, pos.square<KING>(perspective), new_active);
+        }
+        Features::LocalPair64Shogi::make_diff(
+            old_active, new_active, full_removed, full_added);
+        pp_relation_changed = pp_relation_changed
+            || full_removed.count != 0 || full_added.count != 0;
+        pp_removed_counts.push_back(full_removed.count);
+        pp_added_counts.push_back(full_added.count);
+        const bool king_moved = pos.state()->dirtyPiece.pieceNo[0]
+            == PIECE_NUMBER_KING + perspective;
+        if (!king_moved) {
+          auto dirty_start = std::chrono::steady_clock::now();
+          Features::LocalPair64Shogi::make_local_dirty_diff_scan(
+              pp_before, pp_after, perspective, pp_old_king[perspective],
+              scan_removed, scan_added);
+          pp_scan_ns += static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - dirty_start).count());
+          dirty_start = std::chrono::steady_clock::now();
+          Features::LocalPair64Shogi::make_local_dirty_diff_direct(
+              pp_before, pp_after, perspective, pp_old_king[perspective],
+              direct_removed, direct_added);
+          pp_direct_ns += static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - dirty_start).count());
+          ++pp_dirty_calls;
+#if defined(NNUE_LOCALPAIR_DIRTY_FASTPATH)
+          dirty_start = std::chrono::steady_clock::now();
+          Features::LocalPair64Shogi::make_local_dirty_diff_fast(
+              pos, pos.state()->localpairDirty, perspective,
+              pp_old_king[perspective], fast_removed, fast_added);
+          pp_fast_ns += static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - dirty_start).count());
+          Features::LocalPair64Shogi::IndexList profile_fast_removed;
+          Features::LocalPair64Shogi::IndexList profile_fast_added;
+          Features::LocalPair64Shogi::make_local_dirty_diff_fast(
+              pos, pos.state()->localpairDirty, perspective,
+              pp_old_king[perspective], profile_fast_removed,
+              profile_fast_added, &pp_fast_stats);
+          std::sort(fast_removed.values.begin(),
+                    fast_removed.values.begin() + fast_removed.count);
+          std::sort(fast_added.values.begin(),
+                    fast_added.values.begin() + fast_added.count);
+          if (fast_removed.count != full_removed.count
+              || fast_added.count != full_added.count
+              || !std::equal(fast_removed.begin(), fast_removed.end(),
+                             full_removed.begin())
+              || !std::equal(fast_added.begin(), fast_added.end(),
+                             full_added.begin()))
+            ++pp_fast_vs_full_mismatches;
+
+          // Isolate the candidate discovery choice.  Both paths see the same
+          // endpoint metadata and boards; feature-index/orientation work is
+          // intentionally excluded from this comparison.
+          const auto& delta = pos.state()->localpairDirty;
+          auto square_probe = [&](const auto& board,
+                                  const std::uint16_t* endpoint,
+                                  std::uint8_t count) {
+            std::uint64_t hits = 0;
+            for (std::uint8_t i = 0; i < count; ++i) {
+              const int sq = Features::LocalPair64Shogi::packed_square(
+                  endpoint[i]);
+              const auto& neighborhood =
+                  Features::LocalPair64Shogi::kNeighborhoods[sq];
+              for (std::uint8_t j = 0; j < neighborhood.count; ++j)
+                hits += board.at[neighborhood.squares[j]] != 0;
+            }
+            return hits;
+          };
+          auto bitboard_probe = [&](const auto& board,
+                                    const std::uint16_t* endpoint,
+                                    std::uint8_t count) {
+            Bitboard occupied(0);
+            for (int owner = 0; owner < COLOR_NB; ++owner)
+              for (int pc = 0;
+                   pc < Features::LocalPair64Shogi::kClasses; ++pc)
+                occupied |= board.pieces[owner][pc];
+            std::uint64_t hits = 0;
+            for (std::uint8_t i = 0; i < count; ++i) {
+              const int sq = Features::LocalPair64Shogi::packed_square(
+                  endpoint[i]);
+              hits += (occupied
+                  & Features::LocalPair64Shogi::kNeighborhoodMasks[sq])
+                    .pop_count();
+            }
+            return hits;
+          };
+          auto lookup_start = std::chrono::steady_clock::now();
+          pp_square_lookup_hits += square_probe(
+              pp_before, delta.removed, delta.removed_count);
+          pp_square_lookup_hits += square_probe(
+              pp_after, delta.added, delta.added_count);
+          pp_square_lookup_ns += static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - lookup_start).count());
+          lookup_start = std::chrono::steady_clock::now();
+          pp_bitboard_lookup_hits += bitboard_probe(
+              pp_before, delta.removed, delta.removed_count);
+          pp_bitboard_lookup_hits += bitboard_probe(
+              pp_after, delta.added, delta.added_count);
+          pp_bitboard_lookup_ns += static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - lookup_start).count());
+#endif
+          // Detailed stage counters/timers are collected in separate calls so
+          // their chrono/counter overhead does not contaminate P0/P1 timing.
+          Features::LocalPair64Shogi::IndexList profile_removed, profile_added;
+          Features::LocalPair64Shogi::make_local_dirty_diff_scan(
+              pp_before, pp_after, perspective, pp_old_king[perspective],
+              profile_removed, profile_added, &pp_scan_stats);
+          profile_removed = {};
+          profile_added = {};
+          Features::LocalPair64Shogi::make_local_dirty_diff_direct(
+              pp_before, pp_after, perspective, pp_old_king[perspective],
+              profile_removed, profile_added, &pp_direct_stats);
+          if (scan_removed.count != full_removed.count
+              || scan_added.count != full_added.count
+              || !std::equal(scan_removed.begin(), scan_removed.end(),
+                             full_removed.begin())
+              || !std::equal(scan_added.begin(), scan_added.end(),
+                             full_added.begin()))
+            ++pp_scan_vs_full_mismatches;
+          if (direct_removed.count != full_removed.count
+              || direct_added.count != full_added.count
+              || !std::equal(direct_removed.begin(), direct_removed.end(),
+                             full_removed.begin())
+              || !std::equal(direct_added.begin(), direct_added.end(),
+                             full_added.begin())) {
+            if (pp_direct_vs_full_mismatches == 0) {
+              std::cout << "LocalPair64 first direct mismatch perspective="
+                        << int(perspective)
+                        << " full_removed=" << full_removed.count
+                        << " direct_removed=" << direct_removed.count
+                        << " full_added=" << full_added.count
+                        << " direct_added=" << direct_added.count
+                        << " old_count="
+                        << Features::LocalPair64Shogi::collect_local_count_for_debug(pp_before)
+                        << " new_count="
+                        << Features::LocalPair64Shogi::collect_local_count_for_debug(pp_after)
+                        << std::endl;
+            }
+            ++pp_direct_vs_full_mismatches;
+          }
+          if (direct_removed.count != scan_removed.count
+              || direct_added.count != scan_added.count
+              || !std::equal(direct_removed.begin(), direct_removed.end(),
+                             scan_removed.begin())
+              || !std::equal(direct_added.begin(), direct_added.end(),
+                             scan_added.begin()))
+            ++pp_scan_vs_direct_mismatches;
+        }
+        pp_overflows += old_active.overflow || new_active.overflow
+                     || full_removed.overflow || full_added.overflow
+                     || scan_removed.overflow || scan_added.overflow
+                     || direct_removed.overflow || direct_added.overflow;
+      }
+      if (pp_king_refresh_move)
+        ++pp_king_refresh_moves;
+      else if (pp_relation_changed)
+        ++pp_relation_changing_moves;
+      else
+        ++pp_relation_unchanged_moves;
 #endif
 
 #if defined(USE_NNUE_KSDG3_SAVED_DELTA)
@@ -1897,6 +2317,149 @@ void TestFeatures(Position& pos) {
   for (std::size_t i = 0; i < pp_move_category_counts.size(); ++i)
     std::cout << ' ' << pp_category_names[i] << '=' << pp_move_category_counts[i];
   std::cout << std::endl;
+#elif defined(NNUE_SIMPLE_LOCALPAIR64_ANY)
+  auto print_pp_distribution = [](const char* name, auto values) {
+    std::sort(values.begin(), values.end());
+    const double mean = values.empty() ? 0.0
+        : std::accumulate(values.begin(), values.end(), 0.0) / values.size();
+    auto q = [&](double percentile) -> std::uint16_t {
+      if (values.empty()) return 0;
+      const std::size_t i = static_cast<std::size_t>(
+          percentile * static_cast<double>(values.size() - 1));
+      return values[i];
+    };
+    std::cout << "LocalPair64 " << name << " count=" << values.size()
+              << " mean=" << mean << " median=" << q(0.50)
+              << " p90=" << q(0.90) << " p99=" << q(0.99)
+              << " max=" << q(1.0) << std::endl;
+  };
+  print_pp_distribution("active/perspective", pp_active_counts);
+  print_pp_distribution("removed/perspective/move", pp_removed_counts);
+  print_pp_distribution("added/perspective/move", pp_added_counts);
+  std::cout << "LocalPair64 unique features observed="
+            << std::count(pp_observed.begin(), pp_observed.end(), true)
+            << '/' << Features::LocalPair64Shogi::kDimensions
+            << " scan-vs-full mismatches=" << pp_scan_vs_full_mismatches
+            << " direct-vs-full mismatches=" << pp_direct_vs_full_mismatches
+            << " fast-vs-full mismatches=" << pp_fast_vs_full_mismatches
+            << " scan-vs-direct mismatches=" << pp_scan_vs_direct_mismatches
+            << " overflows=" << pp_overflows << std::endl;
+  std::cout << "LocalPair64 P0 scan dirty ns/perspective-call="
+            << (pp_dirty_calls ? double(pp_scan_ns) / pp_dirty_calls : 0.0)
+            << " P1 direct="
+            << (pp_dirty_calls ? double(pp_direct_ns) / pp_dirty_calls : 0.0)
+#if defined(NNUE_LOCALPAIR_DIRTY_FASTPATH)
+            << " P3 fast="
+            << (pp_dirty_calls ? double(pp_fast_ns) / pp_dirty_calls : 0.0)
+#endif
+            << " calls=" << pp_dirty_calls << std::endl;
+  auto print_dirty_stats = [](const char* name,
+                              const Features::LocalPair64Shogi::DirtyStats& s) {
+    const double calls = s.calls ? double(s.calls) : 1.0;
+    std::cout << "LocalPair64 " << name
+              << " changed/call=" << s.changed_identities / calls
+              << " lookups/call=" << s.board_lookups / calls
+              << " relevant/call=" << s.relevant_candidates / calls
+              << " emitted-before-unique/call="
+              << s.emitted_before_unique / calls
+              << " removed/call=" << s.removed / calls
+              << " added/call=" << s.added / calls
+              << " changed-ns/call=" << s.changed_extract_ns / calls
+              << " lookup-index-ns/call="
+              << s.neighborhood_and_index_ns / calls
+              << " unique-ns/call=" << s.duplicate_removal_ns / calls
+              << " unchanged-calls=" << s.unchanged_calls
+              << " unchanged-ns/call="
+              << (s.unchanged_calls
+                    ? double(s.unchanged_total_ns) / s.unchanged_calls : 0.0)
+              << " changed-calls=" << s.changed_calls
+              << " changed-ns/call="
+              << (s.changed_calls
+                    ? double(s.changed_total_ns) / s.changed_calls : 0.0)
+              << std::endl;
+  };
+  print_dirty_stats("P0", pp_scan_stats);
+  print_dirty_stats("P1", pp_direct_stats);
+#if defined(NNUE_LOCALPAIR_DIRTY_FASTPATH)
+  {
+    const double calls = pp_fast_stats.calls
+        ? double(pp_fast_stats.calls) : 1.0;
+    std::cout << "LocalPair64 P3 fast immediate-returns="
+              << pp_fast_stats.immediate_returns
+              << " immediate-return-rate="
+              << 100.0 * pp_fast_stats.immediate_returns / calls << "%"
+              << " removed-endpoints/call="
+              << pp_fast_stats.removed_endpoints / calls
+              << " added-endpoints/call="
+              << pp_fast_stats.added_endpoints / calls
+              << " lookups/call=" << pp_fast_stats.board_lookups / calls
+              << " relevant/call="
+              << pp_fast_stats.relevant_candidates / calls
+              << " emitted/call=" << pp_fast_stats.emitted / calls
+              << " classification-ns/call="
+              << pp_fast_stats.classification_ns / calls
+              << " neighborhood-ns/call="
+              << pp_fast_stats.neighborhood_ns / calls
+              << " total-ns/call=" << pp_fast_stats.total_ns / calls
+              << std::endl;
+    std::cout << "LocalPair64 candidate lookup square-ns/call="
+              << double(pp_square_lookup_ns) / calls
+              << " bitboard-ns/call="
+              << double(pp_bitboard_lookup_ns) / calls
+              << " square-hits=" << pp_square_lookup_hits
+              << " bitboard-hits=" << pp_bitboard_lookup_hits
+              << std::endl;
+  }
+#endif
+  std::cout << "LocalPair64 move paths total=" << num_moves
+            << " relation-changing=" << pp_relation_changing_moves
+            << " relation-unchanged=" << pp_relation_unchanged_moves
+            << " king-refresh=" << pp_king_refresh_moves << std::endl;
+  std::cout << "LocalPair64 king refresh ns/perspective-call="
+            << (pp_king_refresh_calls
+                  ? double(pp_king_refresh_ns) / pp_king_refresh_calls : 0.0)
+            << " calls=" << pp_king_refresh_calls << std::endl;
+#if defined(NNUE_SIMPLE_LOCALPAIR64_R5)
+  constexpr const char* r5_case_names[17] = {
+      "quiet-pawn", "quiet-lance", "quiet-knight", "quiet-bishop",
+      "quiet-rook", "silver-move", "gold-move", "silver-capture",
+      "gold-capture", "irrelevant-captures-relevant", "silver-promotion",
+      "pawn-lance-knight-promotion", "promoted-piece-move",
+      "promoted-piece-captured", "silver-drop", "gold-drop", "king-move"};
+  std::cout << "LocalPair64 R5 targeted coverage";
+  for (std::size_t i = 0; i < pp_r5_case_counts.size(); ++i)
+    std::cout << ' ' << r5_case_names[i] << '=' << pp_r5_case_counts[i];
+  std::cout << std::endl;
+#endif
+  auto print_reduction_distribution = [](const char* candidate,
+                                         const char* metric, auto values) {
+    std::sort(values.begin(), values.end());
+    const double mean = values.empty() ? 0.0
+        : std::accumulate(values.begin(), values.end(), 0.0) / values.size();
+    auto q = [&](double percentile) -> std::uint16_t {
+      if (values.empty()) return 0;
+      return values[static_cast<std::size_t>(
+          percentile * static_cast<double>(values.size() - 1))];
+    };
+    std::cout << "LocalPair reduction " << candidate << ' ' << metric
+              << " mean=" << mean << " median=" << q(.50)
+              << " p90=" << q(.90) << " p99=" << q(.99)
+              << " max=" << q(1.0) << std::endl;
+  };
+  for (const auto& candidate : reduction_candidates) {
+    std::cout << "LocalPair reduction " << candidate.name
+              << " exact_features=" << candidate.exact_features
+              << " latent_width=" << kSimplePairDimensions
+              << " latent_table_bytes="
+              << candidate.exact_features * kSimplePairDimensions
+              << std::endl;
+    print_reduction_distribution(candidate.name, "active", candidate.active);
+    print_reduction_distribution(candidate.name, "changed", candidate.changed);
+    print_reduction_distribution(candidate.name, "removed", candidate.removed);
+    print_reduction_distribution(candidate.name, "added", candidate.added);
+    print_reduction_distribution(candidate.name, "candidate-lookups",
+                                 candidate.lookups);
+  }
 #endif
 }
 
@@ -1904,7 +2467,7 @@ void TestFeatures(Position& pos) {
 #if !defined(NNUE_HALFKAHM2_SIMPLE)
 bool TestAccumulatorDelayedMaterializationPermanent(Position& pos);
 #endif
-#if defined(NNUE_SIMPLE_PP3WIDE_ANY)
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
 bool TestPp3WideDelayedMaterializationPermanent(Position& pos);
 #endif
 
@@ -2002,8 +2565,9 @@ void TestAccumulator(Position& pos) {
         }
       }
 
-#if defined(NNUE_SIMPLE_PP3WIDE64)
-      for (std::size_t index = 0; index < 64; ++index) {
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
+      for (std::size_t index = 0;
+           index < FeatureTransformer::TestPp3Wide64Width(); ++index) {
         const std::int64_t left_value =
             left.pp3wide64_accumulation[perspective][index];
         const std::int64_t right_value =
@@ -2149,14 +2713,14 @@ void TestAccumulator(Position& pos) {
     std::cout << "NNUE delayed-materialization regression suite: failed."
               << std::endl;
 #endif
-#if defined(NNUE_SIMPLE_PP3WIDE_ANY)
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
   if (!TestPp3WideDelayedMaterializationPermanent(pos))
-    std::cout << "PP3Wide delayed-materialization regression suite: failed."
+    std::cout << "Pair64 delayed-materialization regression suite: failed."
               << std::endl;
 #endif
 }
 
-#if defined(NNUE_SIMPLE_PP3WIDE_ANY)
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
 bool TestPp3WideDelayedMaterializationPermanent(Position& pos) {
   struct Stats { const char* name; int tested = 0; int mismatches = 0; } stats[] = {
       {"1 immediate evaluate"},
@@ -2179,7 +2743,7 @@ bool TestPp3WideDelayedMaterializationPermanent(Position& pos) {
     const bool main_equal = std::memcmp(
         incremental.accumulation, scratch.accumulation,
         sizeof(incremental.accumulation)) == 0;
-#if defined(NNUE_SIMPLE_PP3WIDE64)
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
     const bool pp64_equal = std::memcmp(
         incremental.pp3wide64_accumulation,
         scratch.pp3wide64_accumulation,
@@ -2265,7 +2829,7 @@ bool TestPp3WideDelayedMaterializationPermanent(Position& pos) {
   }
 
   bool passed = true;
-  std::cout << "[PP3Wide delayed-materialization permanent regression]"
+  std::cout << "[Pair64 delayed-materialization permanent regression]"
             << std::endl;
   for (const auto& stat : stats) {
     passed &= stat.mismatches == 0;
@@ -14022,8 +14586,9 @@ void TestCommand(IEngine& engine, std::istream& stream) {
   } else if (sub_command == "simple_state_size") {
     std::cout << "SIMPLE_STATE_SIZE sizeof(StateInfo)=" << sizeof(StateInfo)
               << " sizeof(Accumulator)=" << sizeof(Accumulator)
-#if defined(NNUE_SIMPLE_PP3WIDE64)
-              << " pp64_accumulator_bytes=" << (2 * 64 * sizeof(std::int16_t))
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
+              << " pp64_accumulator_bytes="
+              << (2 * kSimplePairDimensions * sizeof(std::int16_t))
 #else
               << " pp64_accumulator_bytes=0"
 #endif
@@ -14032,7 +14597,7 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     DumpHalfKAHM2SimpleFeatures(position());
   } else if (sub_command == "simple_hm2_stages") {
     DumpHalfKAHM2SimpleStages(position());
-#if defined(NNUE_SIMPLE_PP3WIDE64)
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
   } else if (sub_command == "pp3wide64_microbench") {
     std::uint64_t repeats = 1000000;
     stream >> repeats;
@@ -14051,6 +14616,41 @@ void TestCommand(IEngine& engine, std::istream& stream) {
       Features::Pp3WideShogi::append_active(
           board, perspective, position().square<KING>(perspective), active);
       std::cout << "PP3WIDE " << (perspective == BLACK ? "BLACK" : "WHITE")
+                << " count=" << active.count << " indices=";
+      for (const auto index : active) std::cout << index << ',';
+      std::cout << std::endl;
+    }
+#elif defined(NNUE_SIMPLE_LOCALPAIR64_ANY)
+  } else if (sub_command == "localpair64_features") {
+    Features::LocalPair64Shogi::BoardState board{};
+#if defined(NNUE_SIMPLE_LOCALPAIR64_R5) || defined(NNUE_SIMPLE_LOCALPAIR64_R2)
+    for (int sq = 0; sq < SQ_NB; ++sq) {
+      const auto square = static_cast<Square>(sq);
+      const Piece piece = position().piece_on(square);
+      if (piece == NO_PIECE) continue;
+      const int pc = Features::LocalPair64Shogi::piece_class(type_of(piece));
+      if (pc >= 0)
+        Features::LocalPair64Shogi::set_piece(
+            board, color_of(piece), pc, square);
+    }
+#else
+    constexpr PieceType types[8] = {
+        LANCE, KNIGHT, SILVER, GOLDS, BISHOP, HORSE, ROOK, DRAGON};
+    for (int c = 0; c < COLOR_NB; ++c) {
+      const auto color = static_cast<Color>(c);
+      for (int pc = 0; pc < int(std::size(types)); ++pc) {
+        Bitboard bb = position().pieces(color, types[pc]);
+        while (bb)
+          Features::LocalPair64Shogi::set_piece(board, c, pc, bb.pop());
+      }
+    }
+#endif
+    for (const Color perspective : {BLACK, WHITE}) {
+      Features::LocalPair64Shogi::IndexList active;
+      Features::LocalPair64Shogi::append_active(
+          board, perspective, position().square<KING>(perspective), active);
+      std::cout << "LOCALPAIR64 "
+                << (perspective == BLACK ? "BLACK" : "WHITE")
                 << " count=" << active.count << " indices=";
       for (const auto index : active) std::cout << index << ',';
       std::cout << std::endl;
