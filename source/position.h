@@ -235,7 +235,9 @@ struct StateInfo {
         std::uint16_t added[1];
         std::uint8_t removed_count;
         std::uint8_t added_count;
-        std::uint8_t flags; // bit0: king move
+        // bit0: king move, bit1: the moving king crossed the horizontal
+        // mirror boundary used by LocalPair feature orientation.
+        std::uint8_t flags;
     } localpairDirty;
 #if defined(NNUE_LOCALPAIR_FASTPATH_KEEP_SNAPSHOTS)
     // Experiment 122 delayed-materialization snapshots.  Each entry packs

@@ -1984,7 +1984,16 @@ void Position::do_move_impl(Move m, StateInfo& newSt, bool givesCheck, const T* 
         const Piece old_mover = piece_on(from);
         const Piece captured_pc = piece_on(to);
         const Piece new_mover = moved_piece_after(m);
-        if (type_of(old_mover) == KING) localpair_flags |= 1;
+        if (type_of(old_mover) == KING) {
+            localpair_flags |= 1;
+            const auto mirror_side = [](Color perspective, Square king) {
+                int normalized = static_cast<int>(king);
+                if (perspective == WHITE) normalized = 80 - normalized;
+                return normalized >= static_cast<int>(SQ_61);
+            };
+            if (mirror_side(Us, from) != mirror_side(Us, to))
+                localpair_flags |= 2;
+        }
         const int old_class = localpair_class(old_mover);
         const int captured_class = localpair_class(captured_pc);
         const int new_class = localpair_class(new_mover);

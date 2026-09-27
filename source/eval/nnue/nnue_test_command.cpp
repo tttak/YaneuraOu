@@ -1706,6 +1706,8 @@ void TestFeatures(Position& pos) {
   std::uint64_t pp_relation_changing_moves = 0;
   std::uint64_t pp_relation_unchanged_moves = 0;
   std::uint64_t pp_king_refresh_moves = 0;
+  std::uint64_t pp_king_mirror_crossing_moves = 0;
+  std::uint64_t pp_king_same_mirror_moves = 0;
   std::uint64_t pp_king_refresh_ns = 0;
   std::uint64_t pp_king_refresh_calls = 0;
   std::array<std::uint64_t, 17> pp_r5_case_counts{};
@@ -2058,7 +2060,15 @@ void TestFeatures(Position& pos) {
 #endif
         Features::LocalPair64Shogi::append_active(
             pp_before, perspective, pp_old_king[perspective], old_active);
-        if (pp_king_refresh_move) {
+        const auto mirror_side = [perspective](Square king) {
+          int normalized = static_cast<int>(king);
+          if (perspective == WHITE) normalized = 80 - normalized;
+          return normalized >= static_cast<int>(SQ_61);
+        };
+        const bool mirror_boundary_crossed =
+            mirror_side(pp_old_king[perspective])
+            != mirror_side(pos.square<KING>(perspective));
+        if (mirror_boundary_crossed) {
           const auto refresh_start = std::chrono::steady_clock::now();
           Features::LocalPair64Shogi::append_active(
               pp_after, perspective, pos.square<KING>(perspective), new_active);
@@ -2076,9 +2086,10 @@ void TestFeatures(Position& pos) {
             || full_removed.count != 0 || full_added.count != 0;
         pp_removed_counts.push_back(full_removed.count);
         pp_added_counts.push_back(full_added.count);
-        const bool king_moved = pos.state()->dirtyPiece.pieceNo[0]
-            == PIECE_NUMBER_KING + perspective;
-        if (!king_moved) {
+        // A same-mirror-side king move leaves LocalPair orientation intact.
+        // Exercise all three incremental dirty implementations for that case;
+        // only the perspective that actually crosses the boundary may refresh.
+        if (!mirror_boundary_crossed) {
           auto dirty_start = std::chrono::steady_clock::now();
           Features::LocalPair64Shogi::make_local_dirty_diff_scan(
               pp_before, pp_after, perspective, pp_old_king[perspective],
@@ -2226,7 +2237,23 @@ void TestFeatures(Position& pos) {
                      || direct_removed.overflow || direct_added.overflow;
       }
       if (pp_king_refresh_move)
+      {
         ++pp_king_refresh_moves;
+        bool mirror_crossed = false;
+        for (const Color perspective : {BLACK, WHITE}) {
+          const auto mirror_side = [perspective](Square king) {
+            int normalized = static_cast<int>(king);
+            if (perspective == WHITE) normalized = 80 - normalized;
+            return normalized >= static_cast<int>(SQ_61);
+          };
+          mirror_crossed |= mirror_side(pp_old_king[perspective])
+                         != mirror_side(pos.square<KING>(perspective));
+        }
+        if (mirror_crossed)
+          ++pp_king_mirror_crossing_moves;
+        else
+          ++pp_king_same_mirror_moves;
+      }
       else if (pp_relation_changed)
         ++pp_relation_changing_moves;
       else
@@ -2414,11 +2441,23 @@ void TestFeatures(Position& pos) {
   std::cout << "LocalPair64 move paths total=" << num_moves
             << " relation-changing=" << pp_relation_changing_moves
             << " relation-unchanged=" << pp_relation_unchanged_moves
-            << " king-refresh=" << pp_king_refresh_moves << std::endl;
-  std::cout << "LocalPair64 king refresh ns/perspective-call="
+            << " king-move=" << pp_king_refresh_moves << std::endl;
+  std::cout << "LocalPair64 optimized king refresh ns/perspective-call="
             << (pp_king_refresh_calls
                   ? double(pp_king_refresh_ns) / pp_king_refresh_calls : 0.0)
             << " calls=" << pp_king_refresh_calls << std::endl;
+  std::cout << "LocalPair64 king mirror boundary moves total="
+            << pp_king_refresh_moves
+            << " crossed=" << pp_king_mirror_crossing_moves
+            << " same-side=" << pp_king_same_mirror_moves
+            << " crossing-rate="
+            << (pp_king_refresh_moves
+                  ? 100.0 * pp_king_mirror_crossing_moves
+                        / pp_king_refresh_moves
+                  : 0.0)
+            << "% current-refresh-calls=" << 2 * pp_king_refresh_moves
+            << " required-refresh-calls=" << pp_king_mirror_crossing_moves
+            << std::endl;
 #if defined(NNUE_SIMPLE_LOCALPAIR64_R5)
   constexpr const char* r5_case_names[17] = {
       "quiet-pawn", "quiet-lance", "quiet-knight", "quiet-bishop",

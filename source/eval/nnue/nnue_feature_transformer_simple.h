@@ -925,13 +925,21 @@ class FeatureTransformer {
 			const bool king_moved =
 #if defined(NNUE_SIMPLE_LOCALPAIR64_ANY) \
  && defined(NNUE_LOCALPAIR_DIRTY_FASTPATH)
-				(state.localpairDirty.flags & 1) != 0;
+				state.dirtyPiece.pieceNo[0]
+				== PIECE_NUMBER_KING + perspective;
 #else
 				state.dirtyPiece.pieceNo[0]
 				== PIECE_NUMBER_KING + perspective;
 #endif
 			const Square king = pos.square<KING>(perspective);
-			if (king_moved) {
+			const bool mirror_boundary_crossed =
+#if defined(NNUE_SIMPLE_LOCALPAIR64_ANY) \
+ && defined(NNUE_LOCALPAIR_DIRTY_FASTPATH)
+				(state.localpairDirty.flags & 2) != 0;
+#else
+				king_moved;
+#endif
+			if (king_moved && mirror_boundary_crossed) {
 				Pp64Feature active;
 #if defined(NNUE_SIMPLE_LOCALPAIR64_ANY) \
 	&& !defined(NNUE_LOCALPAIR64_DIRTY_SCAN_REFERENCE)
