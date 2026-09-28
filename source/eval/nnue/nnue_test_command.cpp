@@ -9,6 +9,9 @@
 #include "../../evaluate.h"
 #include "evaluate_nnue.h"
 #include "nnue_test_command.h"
+#if defined(NNUE_HALFKAHM2_SIMPLE)
+#include "simple_bucket_selector.h"
+#endif
 #if defined(ENABLE_NNUE_SIDE_INPUT_SAFE_ESCAPE)
 #define NNUE_SIDE_INPUT_KING_SQUARE(pos, color) (pos).square<KING>(color)
 #define NNUE_SIDE_INPUT_NAMESPACE_BEGIN namespace YaneuraOu {
@@ -1662,6 +1665,45 @@ void TestFeatures(Position& pos) {
   std::vector<std::uint64_t> num_resets(kRefreshTriggers.size());
   constexpr IndexType kUnknown = -1;
   std::vector<IndexType> trigger_map(RawFeatures::kDimensions, kUnknown);
+#if defined(NNUE_HALFKAHM2_SIMPLE)
+  struct BucketChurn {
+    std::array<std::uint64_t, 9> population{};
+    std::array<std::array<std::uint64_t, 9>, 9> transition{};
+    std::array<std::uint64_t, 4> delta{}; // unchanged, 1, 2, 3+
+    std::array<std::array<std::uint64_t, 2>, 5> category{}; // total, changed
+  } bucket_churn[3];
+  std::array<std::uint64_t, 8> k1_forward_crossings{};
+  std::array<std::uint64_t, 8> k1_backward_crossings{};
+  std::uint64_t bucket_reference_positions = 0;
+  std::uint64_t bucket_reference_mismatch_k1 = 0;
+  std::uint64_t bucket_reference_mismatch_k5 = 0;
+  constexpr int bucket_phase_thresholds[8] =
+      {200,800,1600,2000,2500,3000,3700,4400};
+  const auto bucket_reference = [&](const Position& p) {
+    const int promoted = (p.pieces(PRO_PAWN) | p.pieces(PRO_LANCE)
+        | p.pieces(PRO_KNIGHT) | p.pieces(PRO_SILVER)
+        | p.pieces(HORSE) | p.pieces(DRAGON)).pop_count();
+    int hand_n = 0, major_n = 0, score = 200 * promoted;
+    constexpr int values[] = {0,100,300,300,500,800,1000,600};
+    for (Color color : {BLACK, WHITE})
+      for (PieceType pt : {PAWN,LANCE,KNIGHT,SILVER,GOLD,BISHOP,ROOK}) {
+        const int n = hand_count(p.hand_of(color), pt);
+        hand_n += n;
+        major_n += (pt == BISHOP || pt == ROOK) * n;
+        score += values[static_cast<int>(pt)] * n;
+      }
+    int k1 = 0;
+    while (k1 < 8 && score >= bucket_phase_thresholds[k1]) ++k1;
+    int k5;
+    if (promoted <= 0) {
+      if (hand_n <= 2) k5 = hand_n <= 0 ? 0 : major_n <= 0 ? 1 : 4;
+      else if (hand_n <= 6) k5 = hand_n <= 4 ? 2 : 3;
+      else k5 = 6;
+    } else if (promoted <= 1) k5 = hand_n <= 7 ? 5 : 7;
+    else k5 = 8;
+    return std::pair<int,int>{k1,k5};
+  };
+#endif
 #if defined(NNUE_SIMPLE_PP3WIDE_ANY)
   std::vector<std::uint16_t> pp_active_counts;
   std::vector<std::uint16_t> pp_removed_counts;
@@ -1832,6 +1874,20 @@ void TestFeatures(Position& pos) {
 
   for (std::uint64_t i = 0; i < num_games; ++i) {
     auto index_sets = make_index_sets(pos);
+#if defined(NNUE_HALFKAHM2_SIMPLE)
+    int previous_bucket[3] = {SimpleBucket::k3k3(pos),
+                              SimpleBucket::phase9(pos),
+                              SimpleBucket::kingfree_tree(pos)};
+    int previous_phase_score = SimpleBucket::phase_score(pos);
+    {
+      const auto reference = bucket_reference(pos);
+      ++bucket_reference_positions;
+      bucket_reference_mismatch_k1 += reference.first != previous_bucket[1];
+      bucket_reference_mismatch_k5 += reference.second != previous_bucket[2];
+    }
+    for (int mode = 0; mode < 3; ++mode)
+      ++bucket_churn[mode].population[previous_bucket[mode]];
+#endif
     for (ply = 0; ply < MAX_PLY; ++ply) {
       MoveList<LEGAL_ALL> mg(pos); // 全合法手の生成
 
@@ -1841,6 +1897,16 @@ void TestFeatures(Position& pos) {
 
       // 生成された指し手のなかからランダムに選び、その指し手で局面を進める。
       Move m = mg.begin()[prng.rand(mg.size())];
+#if defined(NNUE_HALFKAHM2_SIMPLE)
+      const bool bucket_capture = pos.piece_on(m.to_sq()) != NO_PIECE;
+      const bool bucket_drop = m.is_drop();
+      const bool bucket_promotion = m.is_promote();
+      const bool bucket_king = type_of(pos.moved_piece_before(m)) == KING;
+      const bool bucket_quiet = !bucket_capture && !bucket_drop
+                             && !bucket_promotion;
+      const bool bucket_categories[5] = {bucket_quiet, bucket_capture,
+          bucket_drop, bucket_promotion, bucket_king};
+#endif
 #if defined(NNUE_SIMPLE_PP3WIDE_ANY)
       const PieceType pp_moved_type = type_of(pos.moved_piece_before(m));
       const Piece pp_captured = pos.piece_on(m.to_sq());
@@ -1926,6 +1992,37 @@ void TestFeatures(Position& pos) {
       }
 #endif
       pos.do_move(m, state[ply]);
+#if defined(NNUE_HALFKAHM2_SIMPLE)
+      const int current_bucket[3] = {SimpleBucket::k3k3(pos),
+                                     SimpleBucket::phase9(pos),
+                                     SimpleBucket::kingfree_tree(pos)};
+      {
+        const auto reference = bucket_reference(pos);
+        ++bucket_reference_positions;
+        bucket_reference_mismatch_k1 += reference.first != current_bucket[1];
+        bucket_reference_mismatch_k5 += reference.second != current_bucket[2];
+      }
+      for (int mode = 0; mode < 3; ++mode) {
+        auto& stat = bucket_churn[mode];
+        ++stat.population[current_bucket[mode]];
+        ++stat.transition[previous_bucket[mode]][current_bucket[mode]];
+        const int d = std::abs(current_bucket[mode] - previous_bucket[mode]);
+        ++stat.delta[d == 0 ? 0 : d == 1 ? 1 : d == 2 ? 2 : 3];
+        for (int kind = 0; kind < 5; ++kind) if (bucket_categories[kind]) {
+          ++stat.category[kind][0];
+          stat.category[kind][1] += d != 0;
+        }
+        previous_bucket[mode] = current_bucket[mode];
+      }
+      const int current_phase_score = SimpleBucket::phase_score(pos);
+      for (int t = 0; t < 8; ++t) {
+        k1_forward_crossings[t] += previous_phase_score < bucket_phase_thresholds[t]
+                               && current_phase_score >= bucket_phase_thresholds[t];
+        k1_backward_crossings[t] += previous_phase_score >= bucket_phase_thresholds[t]
+                                && current_phase_score < bucket_phase_thresholds[t];
+      }
+      previous_phase_score = current_phase_score;
+#endif
 
 #if defined(NNUE_SIMPLE_PP3WIDE_ANY)
       const auto pp_after = pp_board(pos);
@@ -2300,6 +2397,43 @@ void TestFeatures(Position& pos) {
             << (100.0 * num_observed_indices / RawFeatures::kDimensions)
             << "% of " << RawFeatures::kDimensions
             << ") features" << std::endl;
+#if defined(NNUE_HALFKAHM2_SIMPLE)
+  const char* mode_names[3] = {"K0", "K1", "K5"};
+  const char* category_names[5] =
+      {"quiet", "capture", "drop", "promotion", "king"};
+  for (int mode = 0; mode < 3; ++mode) {
+    const auto& stat = bucket_churn[mode];
+    const auto changed = stat.delta[1] + stat.delta[2] + stat.delta[3];
+    std::cout << "BUCKET130_CHURN mode=" << mode_names[mode]
+              << " moves=" << num_moves << " unchanged=" << stat.delta[0]
+              << " changed=" << changed << " rate="
+              << (100.0 * changed / num_moves) << " delta1=" << stat.delta[1]
+              << " delta2=" << stat.delta[2] << " delta3plus=" << stat.delta[3]
+              << std::endl;
+    std::cout << "BUCKET130_POP mode=" << mode_names[mode];
+    for (int b = 0; b < 9; ++b) std::cout << " B" << b << '=' << stat.population[b];
+    std::cout << std::endl;
+    for (int from = 0; from < 9; ++from) {
+      std::cout << "BUCKET130_TRANS mode=" << mode_names[mode]
+                << " from=" << from;
+      for (int to = 0; to < 9; ++to) std::cout << " B" << to << '=' << stat.transition[from][to];
+      std::cout << std::endl;
+    }
+    for (int kind = 0; kind < 5; ++kind)
+      std::cout << "BUCKET130_CATEGORY mode=" << mode_names[mode]
+                << " type=" << category_names[kind]
+                << " total=" << stat.category[kind][0]
+                << " changed=" << stat.category[kind][1] << std::endl;
+  }
+  for (int t = 0; t < 8; ++t)
+    std::cout << "BUCKET130_THRESHOLD threshold="
+              << bucket_phase_thresholds[t] << " forward=" << k1_forward_crossings[t]
+              << " backward=" << k1_backward_crossings[t] << std::endl;
+  std::cout << "BUCKET130_REFERENCE positions=" << bucket_reference_positions
+            << " k1_mismatches=" << bucket_reference_mismatch_k1
+            << " k5_mismatches=" << bucket_reference_mismatch_k5
+            << std::endl;
+#endif
 #if defined(USE_NNUE_KSDG3_SAVED_DELTA)
   std::cout << "KSDG3 saved-delta overflow perspectives = "
             << ksdg3_saved_delta_overflows << std::endl;
@@ -14636,6 +14770,45 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     DumpHalfKAHM2SimpleFeatures(position());
   } else if (sub_command == "simple_hm2_stages") {
     DumpHalfKAHM2SimpleStages(position());
+  } else if (sub_command == "simple_bucket130") {
+    std::uint64_t repeats = 1000000;
+    stream >> repeats;
+    const auto& pos = position();
+    std::cout << "SIMPLE_BUCKET130 k0=" << SimpleBucket::k3k3(pos)
+              << " phase_score=" << SimpleBucket::phase_score(pos)
+              << " k1=" << SimpleBucket::phase9(pos)
+              << " hand_count=" << SimpleBucket::hand_piece_count(pos)
+              << " major_hand_count=" << SimpleBucket::major_hand_count(pos)
+              << " promoted_count=" << SimpleBucket::promoted_count(pos)
+              << " k5=" << SimpleBucket::kingfree_tree(pos) << std::endl;
+    volatile std::uint64_t checksum = 0;
+    using BucketSelector = int (*)(const Position&);
+    BucketSelector volatile k0_selector = &SimpleBucket::k3k3;
+    BucketSelector volatile k1_selector = &SimpleBucket::phase9;
+    BucketSelector volatile k5_selector = &SimpleBucket::kingfree_tree;
+    const auto run = [&](BucketSelector volatile& selector) {
+      const auto begin = std::chrono::steady_clock::now();
+      for (std::uint64_t i = 0; i < repeats; ++i) checksum += selector(pos);
+      const auto end = std::chrono::steady_clock::now();
+      return std::chrono::duration<double, std::nano>(end - begin).count()
+             / repeats;
+    };
+    const int cached_k1 = SimpleBucket::phase9(pos);
+    const int cached_k5 = SimpleBucket::kingfree_tree(pos);
+    std::cout << "SIMPLE_BUCKET130_NS k0="
+              << run(k0_selector)
+              << " k1_direct="
+              << run(k1_selector)
+              << " k5_direct="
+              << run(k5_selector)
+              << " cached_read=";
+    const auto cached_begin = std::chrono::steady_clock::now();
+    for (std::uint64_t i = 0; i < repeats; ++i)
+      checksum += (i & 1) ? cached_k1 : cached_k5;
+    const auto cached_end = std::chrono::steady_clock::now();
+    std::cout << std::chrono::duration<double, std::nano>(cached_end - cached_begin).count()
+                    / repeats
+              << " checksum=" << checksum << std::endl;
 #if defined(NNUE_SIMPLE_PAIR64_ANY)
   } else if (sub_command == "pp3wide64_microbench") {
     std::uint64_t repeats = 1000000;

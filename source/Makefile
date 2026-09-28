@@ -194,6 +194,18 @@ else ifneq ($(NNUE_SIMPLE_LOCAL_PAIR),NONE)
 	$(error NNUE_SIMPLE_LOCAL_PAIR must be NONE, PP3WIDE, PP3WIDE64, LOCALPAIR64_L4, LOCALPAIR64_R2, LOCALPAIR64_R5, LOCALPAIR32_R5, or LOCALPAIR32_R5_D1)
 endif
 
+# Experiment 130: Simple 9-stack routing.  K3K3 is byte-for-byte compatible
+# with the production architecture; PHASE9 and KINGFREE_TREE only change the
+# selector contract and therefore receive distinct architecture hashes.
+NNUE_SIMPLE_BUCKET ?= K3K3
+ifeq ($(NNUE_SIMPLE_BUCKET),PHASE9)
+	CPPFLAGS += -DNNUE_SIMPLE_BUCKET_PHASE9
+else ifeq ($(NNUE_SIMPLE_BUCKET),KINGFREE_TREE)
+	CPPFLAGS += -DNNUE_SIMPLE_BUCKET_KINGFREE_TREE
+else ifneq ($(NNUE_SIMPLE_BUCKET),K3K3)
+	$(error NNUE_SIMPLE_BUCKET must be K3K3, PHASE9, or KINGFREE_TREE)
+endif
+
 # Experiment 127: runtime-only dirty generation fast path for the two R5-32
 # architectures.  NO reproduces the Experiment 126 before/after snapshot path;
 # YES stores only the at-most 2 removed / 1 added physical endpoints.  This

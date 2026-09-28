@@ -47,26 +47,38 @@ struct Network {
 #elif defined(NNUE_SIMPLE_LOCALPAIR64_R5)
             ^ 0x47535235u
 #endif
+#if defined(NNUE_SIMPLE_BUCKET_PHASE9)
+            ^ 0x50483931u
+#elif defined(NNUE_SIMPLE_BUCKET_KINGFREE_TREE)
+            ^ 0x4B465435u
+#endif
             ;
     }
     static std::string GetStructureString() {
+        std::string result;
 #if defined(NNUE_SIMPLE_PP3WIDE)
-        return "SFNN-1536-HalfKAHM2-NoDG-PP3WPL-v3";
+        result = "SFNN-1536-HalfKAHM2-NoDG-PP3WPL-v3";
 #elif defined(NNUE_SIMPLE_PP3WIDE64)
-        return "SFNN-1536-HalfKAHM2-NoDG-PP3WPL64-v4";
+        result = "SFNN-1536-HalfKAHM2-NoDG-PP3WPL64-v4";
 #elif defined(NNUE_SIMPLE_LOCALPAIR64)
-        return "SFNN-1536-HalfKAHM2-NoDG-LocalPair64-v1";
+        result = "SFNN-1536-HalfKAHM2-NoDG-LocalPair64-v1";
 #elif defined(NNUE_SIMPLE_LOCALPAIR64_R2)
-        return "SFNN-1536-HalfKAHM2-NoDG-KSGLocalPair64-v1";
+        result = "SFNN-1536-HalfKAHM2-NoDG-KSGLocalPair64-v1";
 #elif defined(NNUE_SIMPLE_LOCALPAIR32_R5_D1)
-        return "SFNN-1536-HalfKAHM2-NoDG-GSLocalPair32-R5-D1-v1";
+        result = "SFNN-1536-HalfKAHM2-NoDG-GSLocalPair32-R5-D1-v1";
 #elif defined(NNUE_SIMPLE_LOCALPAIR32_R5)
-        return "SFNN-1536-HalfKAHM2-NoDG-GSLocalPair32-R5-v1";
+        result = "SFNN-1536-HalfKAHM2-NoDG-GSLocalPair32-R5-v1";
 #elif defined(NNUE_SIMPLE_LOCALPAIR64_R5)
-        return "SFNN-1536-HalfKAHM2-NoDG-GSLocalPair64-R5-v1";
+        result = "SFNN-1536-HalfKAHM2-NoDG-GSLocalPair64-R5-v1";
 #else
-        return "SFNN-1536-HalfKAHM2-NoDG-v2";
+        result = "SFNN-1536-HalfKAHM2-NoDG-v2";
 #endif
+#if defined(NNUE_SIMPLE_BUCKET_PHASE9)
+        result += "-BucketPhase9";
+#elif defined(NNUE_SIMPLE_BUCKET_KINGFREE_TREE)
+        result += "-BucketKingFreeTree";
+#endif
+        return result;
     }
     Tools::Result ReadParameters(std::istream& stream) {
         const bool ok = fc_0.ReadParameters(stream).is_ok()

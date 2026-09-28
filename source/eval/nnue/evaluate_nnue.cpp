@@ -33,6 +33,9 @@
 #endif
 
 #include "evaluate_nnue.h"
+#if defined(NNUE_HALFKAHM2_SIMPLE)
+#include "simple_bucket_selector.h"
+#endif
 #if defined(ENABLE_NNUE_SHOGI_THREAT_SPARSE_PROTOTYPE)
 #include "nnue_shogi_threat_lazy.h"
 #endif
@@ -277,46 +280,53 @@ namespace NNUE {
     // 評価関数の構造を表す文字列を取得する
     std::string GetArchitectureString() {
 #if defined(NNUE_HALFKAHM2_SIMPLE)
+        std::string result;
 #if defined(NNUE_SIMPLE_PP3WIDE)
-        return "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
+        result = "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
                "+PP3WidePL[73305+15552->1536x2],"
                "Network=SFNN-1536-HalfKAHM2-NoDG-PP3WPL-v3"
                "{LayerStack=9}";
 #elif defined(NNUE_SIMPLE_PP3WIDE64)
-        return "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
+        result = "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
                "+PP3WidePL64[73305->1536x2;15552->64x2->EWM64->Proj16],"
                "Network=SFNN-1536-HalfKAHM2-NoDG-PP3WPL64-v4"
                "{LayerStack=9}";
 #elif defined(NNUE_SIMPLE_LOCALPAIR64)
-        return "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
+        result = "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
                "+LocalPair64-L4[73305->1536x2;184320->64x2->EWM64->Proj16],"
                "Network=SFNN-1536-HalfKAHM2-NoDG-LocalPair64-v1"
                "{LayerStack=9}";
 #elif defined(NNUE_SIMPLE_LOCALPAIR64_R2)
-        return "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
+        result = "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
                "+KSGLocalPair64-R2[73305->1536x2;25920->64x2->EWM64->Proj16],"
                "Network=SFNN-1536-HalfKAHM2-NoDG-KSGLocalPair64-v1"
                "{LayerStack=9}";
 #elif defined(NNUE_SIMPLE_LOCALPAIR32_R5_D1)
-        return "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
+        result = "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
                "+GSLocalPair32-R5-D1[73305->1536x2;4352->32x2->EWM32->Proj16],"
                "Network=SFNN-1536-HalfKAHM2-NoDG-GSLocalPair32-R5-D1-v1"
                "{LayerStack=9}";
 #elif defined(NNUE_SIMPLE_LOCALPAIR32_R5)
-        return "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
+        result = "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
                "+GSLocalPair32-R5[73305->1536x2;11520->32x2->EWM32->Proj16],"
                "Network=SFNN-1536-HalfKAHM2-NoDG-GSLocalPair32-R5-v1"
                "{LayerStack=9}";
 #elif defined(NNUE_SIMPLE_LOCALPAIR64_R5)
-        return "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
+        result = "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
                "+GSLocalPair64-R5[73305->1536x2;11520->64x2->EWM64->Proj16],"
                "Network=SFNN-1536-HalfKAHM2-NoDG-GSLocalPair64-R5-v1"
                "{LayerStack=9}";
 #else
-        return "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
+        result = "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2_NoDG(Friend)"
                "[73305->1536x2],Network=SFNN-1536-HalfKAHM2-NoDG-v2"
                "{LayerStack=9}";
 #endif
+#if defined(NNUE_SIMPLE_BUCKET_PHASE9)
+        result.replace(result.find("{LayerStack=9}"), 0, "-BucketPhase9");
+#elif defined(NNUE_SIMPLE_BUCKET_KINGFREE_TREE)
+        result.replace(result.find("{LayerStack=9}"), 0, "-BucketKingFreeTree");
+#endif
+        return result;
 #else
         const std::string base = "Features=" + FeatureTransformer::GetStructureString() +
 			",Network=" + Network::GetStructureString();
@@ -621,14 +631,7 @@ namespace {
     // レイヤースタックの選択。双方の玉の段に応じて9通りに分岐させる。
     static int stack_index_for_nnue(const Position& pos) {
 #if defined(NNUE_HALFKAHM2_SIMPLE)
-        constexpr int kFToIndex[] = { 0, 0, 0, 3, 3, 3, 6, 6, 6 };
-        constexpr int kEToIndex[] = { 0, 0, 0, 1, 1, 1, 2, 2, 2 };
-        const auto stm = pos.side_to_move();
-        const auto f_king = pos.square<KING>(stm);
-        const auto e_king = pos.square<KING>(~stm);
-        const auto f_rank = stm == BLACK ? rank_of(f_king) : rank_of(Inv(f_king));
-        const auto e_rank = stm == BLACK ? rank_of(Inv(e_king)) : rank_of(e_king);
-        return kFToIndex[f_rank] + kEToIndex[e_rank];
+        return SimpleBucket::selected(pos);
 #else
 /*
         constexpr int kFToIndex[] = { 0, 0, 0, 3, 3, 3, 6, 6, 6 };
