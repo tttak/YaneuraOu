@@ -2643,6 +2643,9 @@ bool TestAccumulatorDelayedMaterializationPermanent(Position& pos);
 #if defined(NNUE_SIMPLE_PAIR64_ANY)
 bool TestPp3WideDelayedMaterializationPermanent(Position& pos);
 #endif
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+bool TestSimpleAccumulatorStackPhaseA(Position& pos);
+#endif
 
 void TestAccumulator(Position& pos) {
 #if defined(USE_EVAL_HASH)
@@ -2663,6 +2666,21 @@ void TestAccumulator(Position& pos) {
 
   PRNG prng(20171128);
   std::uint64_t num_moves = 0;
+
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+  struct AccumulatorSnapshot {
+    SimpleMainAccumulator accumulation{};
+  };
+  auto snapshot_accumulator = [](const Accumulator& source) {
+    AccumulatorSnapshot snapshot;
+    std::memcpy(snapshot.accumulation, source.accumulation,
+                sizeof(snapshot.accumulation));
+    return snapshot;
+  };
+#else
+  using AccumulatorSnapshot = Accumulator;
+  auto snapshot_accumulator = [](const Accumulator& source) { return source; };
+#endif
 
   auto print_state_failure = [&](const std::uint64_t game, const int ply,
                                  const char* reason, const Move* move) {
@@ -2714,8 +2732,8 @@ void TestAccumulator(Position& pos) {
               << (left_value - right_value) << std::endl;
   };
 
-  auto compare_accumulators = [&](const Accumulator& left,
-                                  const Accumulator& right,
+  auto compare_accumulators = [&](const AccumulatorSnapshot& left,
+                                  const AccumulatorSnapshot& right,
                                   const char* left_name,
                                   const char* right_name,
                                   const std::uint64_t game, const int ply,
@@ -2754,6 +2772,7 @@ void TestAccumulator(Position& pos) {
       }
 #endif
 
+#if !defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
       const auto& left_factors = left.factors[perspective];
       const auto& right_factors = right.factors[perspective];
       struct FactorComparison {
@@ -2784,6 +2803,7 @@ void TestAccumulator(Position& pos) {
           }
         }
       }
+#endif
     }
     return true;
   };
@@ -2837,7 +2857,7 @@ void TestAccumulator(Position& pos) {
         return;
       }
 
-      const Accumulator incremental = current->accumulator;
+      const AccumulatorSnapshot incremental = snapshot_accumulator(current->accumulator);
 
 #if defined(USE_FINNY_TABLES)
       feature_transformer->TestRefreshAccumulatorWithFinny(pos);
@@ -2846,7 +2866,7 @@ void TestAccumulator(Position& pos) {
         std::cout << "failed." << std::endl;
         return;
       }
-      const Accumulator finny = current->accumulator;
+      const AccumulatorSnapshot finny = snapshot_accumulator(current->accumulator);
 #endif
 
       // compute_eval(pos) follows the configured refresh policy and can use
@@ -2857,7 +2877,7 @@ void TestAccumulator(Position& pos) {
         std::cout << "failed." << std::endl;
         return;
       }
-      const Accumulator scratch = current->accumulator;
+      const AccumulatorSnapshot scratch = snapshot_accumulator(current->accumulator);
 
       if (!compare_accumulators(incremental, scratch, "incremental", "scratch",
                                 game, ply, move)) {
@@ -2891,7 +2911,333 @@ void TestAccumulator(Position& pos) {
     std::cout << "Pair64 delayed-materialization regression suite: failed."
               << std::endl;
 #endif
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+  if (!TestSimpleAccumulatorStackPhaseA(pos))
+    std::cout << "Simple AccumulatorStack Phase-A regression suite: failed."
+              << std::endl;
+#endif
 }
+
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+bool TestSimpleAccumulatorStackPhaseA(Position& pos) {
+  using LaneArray = std::array<std::int16_t,
+      2 * kRefreshTriggers.size() * kTransformedFeatureDimensions>;
+  struct Result {
+    bool accumulator = false;
+    bool transformed = false;
+    bool score = false;
+    Value incremental_score = VALUE_ZERO;
+    Value scratch_score = VALUE_ZERO;
+  };
+
+  auto capture = [](const Accumulator& source) {
+    LaneArray result{};
+    std::memcpy(result.data(), source.accumulation, sizeof(result));
+    return result;
+  };
+  auto compare_leaf = [&](const LaneArray& incremental, const Value score) {
+    alignas(kCacheLineSize) std::array<TransformedFeatureType,
+        FeatureTransformer::kBufferSize> incremental_transformed{};
+    feature_transformer->Transform(pos, incremental_transformed.data(), false);
+    feature_transformer->TestRefreshAccumulatorFromScratch(pos);
+    pos.state()->accumulator.computed_score = false;
+    const Value scratch_score = ::YaneuraOu::Eval::evaluate(pos);
+    const LaneArray scratch = capture(pos.state()->accumulator);
+    alignas(kCacheLineSize) std::array<TransformedFeatureType,
+        FeatureTransformer::kBufferSize> scratch_transformed{};
+    feature_transformer->Transform(pos, scratch_transformed.data(), false);
+    return Result{incremental == scratch,
+                  incremental_transformed == scratch_transformed,
+                  score == scratch_score,
+                  score, scratch_score};
+  };
+  auto first_move = [&](const bool require_king) {
+    for (const Move move : MoveList<LEGAL_ALL>(pos)) {
+      const bool king = !move.is_drop()
+                     && type_of(pos.piece_on(move.from_sq())) == KING;
+      if (king == require_king) return move;
+    }
+    return Move::none();
+  };
+
+  struct Case {
+    const char* name;
+    int tested = 0;
+    int mismatches = 0;
+  } cases[] = {
+      {"1 immediate evaluate"},
+      {"2 one child do/undo before evaluate"},
+      {"3 multiple children do/undo before evaluate"},
+      {"4 multi-ply deferred dirty chain"},
+      {"5 Finny refresh/cache restore"},
+      {"3-ply forward"}, {"4-ply forward"}, {"8-ply forward"},
+      {"3-ply king refresh"}, {"sibling do/undo"}, {"null move"}};
+
+#if defined(USE_EVAL_HASH)
+  const bool evalhash_chain_available = Eval::EvalHash_IsInitialized();
+  struct EvalHashChainCase {
+    const char* name;
+    int tested = 0;
+    int mismatches = 0;
+  } evalhash_cases[] = {
+      {"computed -> hit -> hit -> miss"},
+      {"computed -> hit -> hit -> hit -> miss"},
+      {"king refresh inside hit chain"}};
+#endif
+
+  auto run_chain = [&](Case& test, const int plies, const bool king_chain) {
+    StateInfo root;
+    std::array<StateInfo, 8> states{};
+    std::array<Move, 8> moves{};
+    if (king_chain)
+      pos.set("4k4/9/9/9/9/9/9/9/4K4 b - 1", &root);
+    else
+      pos.set_hirate(&root);
+    feature_transformer->TestRefreshAccumulatorFromScratch(pos);
+    auto stack = std::make_unique<SimpleAccumulatorStack>();
+    stack->reset(root.accumulator, &root);
+    bool complete = true;
+    for (int ply = 0; ply < plies; ++ply) {
+      moves[ply] = first_move(king_chain);
+      if (moves[ply] == Move::none()) { complete = false; break; }
+      pos.do_move(moves[ply], states[ply]);
+      stack->push(states[ply].accumulator, &states[ply]);
+    }
+    if (complete) {
+      const Value score = ::YaneuraOu::Eval::evaluate(pos);
+      const LaneArray incremental = capture(pos.state()->accumulator);
+      const Result result = compare_leaf(incremental, score);
+      ++test.tested;
+      if (!result.accumulator || !result.transformed || !result.score)
+        ++test.mismatches;
+    }
+    for (int ply = plies; complete && ply-- > 0;) {
+      const StateInfo* child = pos.state();
+      pos.undo_move(moves[ply]);
+      stack->pop(child);
+    }
+  };
+
+  run_chain(cases[0], 1, false);
+  run_chain(cases[3], 2, false);
+  run_chain(cases[5], 3, false);
+  run_chain(cases[6], 4, false);
+  run_chain(cases[7], 8, false);
+  run_chain(cases[8], 3, true);
+
+  // Leave a parent unmaterialized while one or more temporary children are
+  // pushed and popped, then materialize the parent.
+  for (int variant = 0; variant < 2; ++variant) {
+    StateInfo root, parent;
+    std::array<StateInfo, 4> temporary{};
+    pos.set_hirate(&root);
+    feature_transformer->TestRefreshAccumulatorFromScratch(pos);
+    auto stack = std::make_unique<SimpleAccumulatorStack>();
+    stack->reset(root.accumulator, &root);
+    const Move parent_move = first_move(false);
+    if (parent_move != Move::none()) {
+      pos.do_move(parent_move, parent);
+      stack->push(parent.accumulator, &parent);
+      std::vector<Move> children;
+      for (const Move move : MoveList<LEGAL_ALL>(pos)) {
+        children.push_back(move);
+        if (children.size() == (variant == 0 ? 1u : 4u)) break;
+      }
+      for (std::size_t i = 0; i < children.size(); ++i) {
+        pos.do_move(children[i], temporary[i]);
+        stack->push(temporary[i].accumulator, &temporary[i]);
+        const StateInfo* child = pos.state();
+        pos.undo_move(children[i]);
+        stack->pop(child);
+      }
+      const Value score = ::YaneuraOu::Eval::evaluate(pos);
+      const LaneArray incremental = capture(pos.state()->accumulator);
+      const Result result = compare_leaf(incremental, score);
+      auto& test = cases[variant + 1];
+      ++test.tested;
+      if (!result.accumulator || !result.transformed || !result.score)
+        ++test.mismatches;
+    }
+  }
+
+  // Existing Finny contents and a true scratch rebuild must agree.
+  {
+    StateInfo root;
+    pos.set_hirate(&root);
+#if defined(USE_FINNY_TABLES)
+    feature_transformer->TestResetFinnyCache();
+    feature_transformer->TestRefreshAccumulatorWithFinny(pos);
+#else
+    feature_transformer->ForceRefreshAccumulator(pos);
+#endif
+    const LaneArray finny = capture(pos.state()->accumulator);
+    feature_transformer->TestRefreshAccumulatorFromScratch(pos);
+    const LaneArray scratch = capture(pos.state()->accumulator);
+    ++cases[4].tested;
+    if (finny != scratch) ++cases[4].mismatches;
+  }
+
+  // Materialize child A, pop it, and reuse the same stack slot for child B.
+  {
+    StateInfo root, child_a, child_b;
+    pos.set_hirate(&root);
+    feature_transformer->TestRefreshAccumulatorFromScratch(pos);
+    auto stack = std::make_unique<SimpleAccumulatorStack>();
+    stack->reset(root.accumulator, &root);
+    std::vector<Move> root_moves;
+    for (const Move move : MoveList<LEGAL_ALL>(pos)) {
+      root_moves.push_back(move);
+      if (root_moves.size() == 2) break;
+    }
+    if (root_moves.size() == 2) {
+      pos.do_move(root_moves[0], child_a);
+      stack->push(child_a.accumulator, &child_a);
+      (void)::YaneuraOu::Eval::evaluate(pos);
+      const StateInfo* child = pos.state();
+      pos.undo_move(root_moves[0]);
+      stack->pop(child);
+
+      pos.do_move(root_moves[1], child_b);
+      stack->push(child_b.accumulator, &child_b);
+      const Value score = ::YaneuraOu::Eval::evaluate(pos);
+      const LaneArray incremental = capture(pos.state()->accumulator);
+      const Result result = compare_leaf(incremental, score);
+      ++cases[9].tested;
+      if (!result.accumulator || !result.transformed || !result.score)
+        ++cases[9].mismatches;
+      child = pos.state();
+      pos.undo_move(root_moves[1]);
+      stack->pop(child);
+    }
+  }
+
+  // Null move intentionally reuses the same feature-stack entry.
+  {
+    StateInfo root, null_state;
+    pos.set_hirate(&root);
+    feature_transformer->TestRefreshAccumulatorFromScratch(pos);
+    auto stack = std::make_unique<SimpleAccumulatorStack>();
+    stack->reset(root.accumulator, &root);
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+    root.accumulator.stack_score_valid = true;
+    root.accumulator.stack_cached_score = Value(123);
+#endif
+    const auto before = capture(root.accumulator);
+    const auto depth_before = stack->depth();
+    pos.do_null_move(null_state);
+    const bool pointer_reused = null_state.accumulator.accumulation
+                              == root.accumulator.accumulation;
+    const bool content_unchanged = before == capture(null_state.accumulator);
+    const bool depth_unchanged = stack->depth() == depth_before;
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+    const bool null_score_invalid = !null_state.accumulator.stack_score_valid;
+#else
+    const bool null_score_invalid = !null_state.accumulator.computed_score;
+#endif
+    pos.undo_null_move();
+    const bool restored = before == capture(root.accumulator)
+                       && stack->depth() == depth_before;
+    ++cases[10].tested;
+    if (!pointer_reused || !content_unchanged || !depth_unchanged
+        || !null_score_invalid || !restored)
+      ++cases[10].mismatches;
+  }
+
+#if defined(USE_EVAL_HASH)
+  // Phase C: warm only the intermediate keys, replay the same path as score
+  // hits without materializing their FT payloads, then force a terminal miss.
+  // The miss must replay the complete retained dirty suffix bit-exactly.
+  auto run_evalhash_chain = [&](EvalHashChainCase& test, const int warm_hits,
+                                const bool king_chain) {
+    constexpr int kMax = 4;
+    StateInfo root;
+    std::array<StateInfo, kMax> warm_states{}, replay_states{};
+    std::array<Move, kMax> moves{};
+    if (king_chain)
+      pos.set("4k4/9/9/9/9/9/9/9/4K4 b - 1", &root);
+    else
+      pos.set_hirate(&root);
+    feature_transformer->TestRefreshAccumulatorFromScratch(pos);
+    root.accumulator.computed_score = false;
+    auto stack = std::make_unique<SimpleAccumulatorStack>();
+    stack->reset(root.accumulator, &root);
+
+    const bool was_enabled = Eval::EvalHash_IsEnabled();
+    Eval::EvalHash_SetEnabled(true);
+    Eval::EvalHash_Clear();
+    bool complete = true;
+    for (int ply = 0; ply <= warm_hits; ++ply) {
+      moves[ply] = first_move(king_chain);
+      if (moves[ply] == Move::none()) { complete = false; break; }
+      pos.do_move(moves[ply], warm_states[ply]);
+      stack->push(warm_states[ply].accumulator, &warm_states[ply]);
+      if (ply < warm_hits)
+        (void)::YaneuraOu::Eval::evaluate(pos);
+    }
+    for (int ply = warm_hits + 1; complete && ply-- > 0;) {
+      const StateInfo* child = pos.state();
+      pos.undo_move(moves[ply]);
+      stack->pop(child);
+    }
+
+    bool hit_contract = complete;
+    Value score = VALUE_ZERO;
+    if (complete) {
+      for (int ply = 0; ply <= warm_hits; ++ply) {
+        pos.do_move(moves[ply], replay_states[ply]);
+        stack->push(replay_states[ply].accumulator, &replay_states[ply]);
+        score = ::YaneuraOu::Eval::evaluate(pos);
+        if (ply < warm_hits)
+          hit_contract &= !pos.state()->accumulator.computed_accumulation
+                       && !pos.state()->accumulator.computed_score;
+      }
+      const LaneArray incremental = capture(pos.state()->accumulator);
+      const bool final_materialized =
+        pos.state()->accumulator.computed_accumulation;
+      Eval::EvalHash_SetEnabled(false);
+      const Result result = compare_leaf(incremental, score);
+      ++test.tested;
+      if (!hit_contract || !final_materialized || !result.accumulator
+          || !result.transformed || !result.score)
+        ++test.mismatches;
+      for (int ply = warm_hits + 1; ply-- > 0;) {
+        const StateInfo* child = pos.state();
+        pos.undo_move(moves[ply]);
+        stack->pop(child);
+      }
+    }
+    Eval::EvalHash_SetEnabled(was_enabled);
+  };
+  if (evalhash_chain_available) run_evalhash_chain(evalhash_cases[0], 2, false);
+  if (evalhash_chain_available) run_evalhash_chain(evalhash_cases[1], 3, false);
+  if (evalhash_chain_available) run_evalhash_chain(evalhash_cases[2], 2, true);
+#endif
+
+  bool passed = true;
+  std::cout << "[Simple AccumulatorStack Phase-A regression]" << std::endl;
+  for (const auto& test : cases) {
+    passed &= test.tested != 0 && test.mismatches == 0;
+    std::cout << "  " << test.name << " : "
+              << (test.tested != 0 && test.mismatches == 0 ? "passed" : "failed")
+              << ", tested positions = " << test.tested
+              << ", mismatch count = " << test.mismatches << std::endl;
+  }
+#if defined(USE_EVAL_HASH)
+  std::cout << "[Simple AccumulatorStack EvalHash chain regression]"
+            << std::endl;
+  for (const auto& test : evalhash_cases) {
+    if (evalhash_chain_available)
+      passed &= test.tested != 0 && test.mismatches == 0;
+    std::cout << "  " << test.name << " : "
+              << (!evalhash_chain_available ? "skipped (table not initialized)" :
+                  test.tested != 0 && test.mismatches == 0 ? "passed" : "failed")
+              << ", tested positions = " << test.tested
+              << ", mismatch count = " << test.mismatches << std::endl;
+  }
+#endif
+  return passed;
+}
+#endif
 
 #if defined(NNUE_SIMPLE_PAIR64_ANY)
 bool TestPp3WideDelayedMaterializationPermanent(Position& pos) {
@@ -3820,6 +4166,7 @@ void ChecksumAccumulator(const Position& pos, std::uint64_t& checksum) {
         MixNnueBenchChecksum(
             checksum, accumulator.accumulation[perspective][trigger][index]);
 
+#if !defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
     const auto& factors = accumulator.factors[perspective];
     for (IndexType index = 0; index < 32; ++index) {
       MixNnueBenchChecksum(checksum, factors.halfka.sum_v[index]);
@@ -3827,6 +4174,7 @@ void ChecksumAccumulator(const Position& pos, std::uint64_t& checksum) {
       MixNnueBenchChecksum(checksum, factors.ksdg.sum_v[index]);
       MixNnueBenchChecksum(checksum, factors.ksdg.sum_v2[index]);
     }
+#endif
   }
 }
 
@@ -14759,6 +15107,18 @@ void TestCommand(IEngine& engine, std::istream& stream) {
   } else if (sub_command == "simple_state_size") {
     std::cout << "SIMPLE_STATE_SIZE sizeof(StateInfo)=" << sizeof(StateInfo)
               << " sizeof(Accumulator)=" << sizeof(Accumulator)
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+              << " sizeof(SimpleAccumulatorPayload)="
+              << sizeof(SimpleAccumulatorPayload)
+              << " sizeof(SimpleAccumulatorStack::Entry)="
+              << sizeof(SimpleAccumulatorStack::Entry)
+              << " sizeof(SimpleAccumulatorStack)="
+              << sizeof(SimpleAccumulatorStack)
+              << " stack_capacity=" << SimpleAccumulatorStack::capacity()
+#endif
+              << " offsetof(previous)=" << offsetof(StateInfo, previous)
+              << " offsetof(accumulator)=" << offsetof(StateInfo, accumulator)
+              << " offsetof(dirtyPiece)=" << offsetof(StateInfo, dirtyPiece)
 #if defined(NNUE_SIMPLE_PAIR64_ANY)
               << " pp64_accumulator_bytes="
               << (2 * kSimplePairDimensions * sizeof(std::int16_t))
@@ -14766,6 +15126,35 @@ void TestCommand(IEngine& engine, std::istream& stream) {
               << " pp64_accumulator_bytes=0"
 #endif
               << std::endl;
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+  } else if (sub_command == "simple_accumulator_stack_stats") {
+    std::string action;
+    stream >> action;
+    if (action == "reset") {
+      FeatureTransformer::ResetStackCounters();
+      std::cout << "SIMPLE_ACCUMULATOR_STACK_STATS reset" << std::endl;
+    } else {
+      const auto& c = FeatureTransformer::StackCounters();
+      const auto multi_count = c.dirty_chain_multi_count.load();
+      const auto dirty_total = c.dirty_chain_total.load();
+      std::cout << "SIMPLE_ACCUMULATOR_STACK_STATS"
+                << " computed_hits=" << c.computed_hits.load()
+                << " one_ply=" << c.one_ply.load()
+                << " multi_ply=" << c.multi_ply.load()
+                << " scratch_refresh=" << c.scratch_refresh.load()
+                << " finny_refresh=" << c.finny_refresh.load()
+				<< " finny_entry_hit=" << c.finny_entry_hit.load()
+				<< " finny_entry_miss=" << c.finny_entry_miss.load()
+                << " refresh_in_chain=" << c.refresh_in_chain.load()
+                << " legacy_parent_uncomputed="
+                << c.legacy_parent_uncomputed.load()
+                << " evalhash_multi_ply=" << c.evalhash_multi_ply.load()
+                << " max_dirty_chain=" << c.max_dirty_chain.load()
+                << " mean_multi_dirty_chain="
+                << (multi_count ? double(dirty_total) / multi_count : 0.0)
+                << std::endl;
+    }
+#endif
   } else if (sub_command == "simple_hm2_features") {
     DumpHalfKAHM2SimpleFeatures(position());
   } else if (sub_command == "simple_hm2_stages") {

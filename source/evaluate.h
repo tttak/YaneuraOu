@@ -416,6 +416,7 @@ namespace Eval {
 	// enables it by default; DISABLE_EVAL_HASH still removes the whole path.
 	void EvalHash_SetEnabled(bool enabled);
 	bool EvalHash_IsEnabled();
+	bool EvalHash_IsInitialized();
 #if defined(EVAL_HASH_ATOMIC64)
 	// Exhaustive score and architecture-specific signal-bit round-trip test.
 	bool EvalHash_Atomic64CodecSelftest();

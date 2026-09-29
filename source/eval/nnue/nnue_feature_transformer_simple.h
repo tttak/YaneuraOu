@@ -27,6 +27,7 @@
 #endif
 
 #include <algorithm>  // std::clamp
+#include <atomic>
 #include <cstring>  // std::memset()
 
 #if defined(USE_FINNY_TABLES)
@@ -321,16 +322,30 @@ class FeatureTransformer {
 	// Proceed with the difference calculation if possible
 	// 可能なら差分計算を進める
 	bool UpdateAccumulatorIfPossible(const Position& pos) const {
+	#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+		return update_accumulator_stack(pos);
+	#else
 		const auto now = pos.state();
 		if (now->accumulator.computed_accumulation) {
+	#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+			++StackCounters().computed_hits;
+	#endif
 			return true;
 		}
 		const auto prev = now->previous;
 		if (prev && prev->accumulator.computed_accumulation) {
 			update_accumulator(pos);
+	#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+			++StackCounters().one_ply;
+	#endif
 			return true;
 		}
+	#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+		++StackCounters().legacy_parent_uncomputed;
+		++StackCounters().scratch_refresh;
+	#endif
 		return false;
+	#endif
 	}
 
 	// Keep an exact accumulator chain when an external score cache bypasses
@@ -564,6 +579,40 @@ class FeatureTransformer {
 #endif
 #endif
 	}
+
+	#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+	struct StackMaterializationCounters {
+		std::atomic<std::uint64_t> computed_hits{0};
+		std::atomic<std::uint64_t> one_ply{0};
+		std::atomic<std::uint64_t> multi_ply{0};
+		std::atomic<std::uint64_t> scratch_refresh{0};
+		std::atomic<std::uint64_t> finny_refresh{0};
+		std::atomic<std::uint64_t> finny_entry_hit{0};
+		std::atomic<std::uint64_t> finny_entry_miss{0};
+		std::atomic<std::uint64_t> refresh_in_chain{0};
+		std::atomic<std::uint64_t> dirty_chain_total{0};
+		std::atomic<std::uint64_t> dirty_chain_multi_count{0};
+		std::atomic<std::uint64_t> max_dirty_chain{0};
+		std::atomic<std::uint64_t> legacy_parent_uncomputed{0};
+		std::atomic<std::uint64_t> evalhash_multi_ply{0};
+	};
+
+	static StackMaterializationCounters& StackCounters() {
+		static StackMaterializationCounters counters;
+		return counters;
+	}
+
+	static void ResetStackCounters() {
+		auto& c = StackCounters();
+		c.computed_hits = 0; c.one_ply = 0; c.multi_ply = 0;
+		c.scratch_refresh = 0; c.finny_refresh = 0; c.refresh_in_chain = 0;
+		c.finny_entry_hit = 0; c.finny_entry_miss = 0;
+		c.dirty_chain_total = 0; c.dirty_chain_multi_count = 0;
+		c.max_dirty_chain = 0;
+		c.legacy_parent_uncomputed = 0;
+		c.evalhash_multi_ply = 0;
+	}
+#endif
 
 #if defined(NNUE_SIMPLE_PAIR64_ANY)
 	// Convert the independent compact PP accumulator to two half-width EWM
@@ -1487,6 +1536,12 @@ class FeatureTransformer {
 		FinnyEntry& entry,
 		const Features::IndexList& active_indices,
 		IndexType trigger_index) const {
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+		if (entry.initialized)
+			++StackCounters().finny_entry_hit;
+		else
+			++StackCounters().finny_entry_miss;
+#endif
 		if (!entry.initialized) {
 #if defined(VECTOR)
 			const auto* source = trigger_index == 0 ? biases_ : nullptr;
@@ -1534,14 +1589,153 @@ class FeatureTransformer {
 		}
 	}
 
-	void refresh_accumulator_with_finny_cache(const Position& pos) const {
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+	void update_stack_transition(const StateInfo& transition) const {
+		auto& destination = const_cast<Accumulator&>(transition.accumulator);
+		auto& source = const_cast<Accumulator&>(transition.previous->accumulator);
+		EnsureSimpleAccumulatorStorage(source);
+		EnsureSimpleAccumulatorStorage(destination);
+
+		static_assert(kRefreshTriggers.size() == 1,
+		              "Experiment 136 Phase A requires HalfKA_HM2-only");
+		using HalfKa = Features::HalfKA_hm2<Features::Side::kFriend>;
+		const auto& dirty = transition.dirtyPiece;
+		for (int c = 0; c < COLOR_NB; ++c) {
+			const auto perspective = static_cast<Color>(c);
+			Features::IndexList removed, added;
+			const Square king = destination.stack_king_square[perspective];
+			for (int n = 0; n < dirty.dirty_num; ++n) {
+				const auto oldPiece = static_cast<BonaPiece>(
+				  dirty.changed_piece[n].old_piece.from[perspective]);
+				const auto newPiece = static_cast<BonaPiece>(
+				  dirty.changed_piece[n].new_piece.from[perspective]);
+				removed.push_back(HalfKa::MakeIndex(king, oldPiece));
+				added.push_back(HalfKa::MakeIndex(king, newPiece));
+			}
+
+#if defined(VECTOR)
+			update_accumulator_tiled(
+			  source.accumulation[perspective][0],
+			  destination.accumulation[perspective][0],
+			  [&](vec_t* acc, IndexType tileOffset) {
+				  for (const auto index : removed)
+					  sub_weight_from_tile(acc, index, tileOffset);
+				  for (const auto index : added)
+					  add_weight_to_tile(acc, index, tileOffset);
+			  });
+#else
+			std::memcpy(destination.accumulation[perspective][0],
+			            source.accumulation[perspective][0],
+			            kHalfDimensions * sizeof(BiasType));
+			for (const auto index : removed)
+				for (IndexType lane = 0; lane < kHalfDimensions; ++lane)
+					destination.accumulation[perspective][0][lane]
+					  -= weights_[kWeightRowStride * index + lane];
+			for (const auto index : added)
+				for (IndexType lane = 0; lane < kHalfDimensions; ++lane)
+					destination.accumulation[perspective][0][lane]
+					  += weights_[kWeightRowStride * index + lane];
+#endif
+		}
+		destination.computed_accumulation = true;
+		destination.computed_score = false;
+		if (destination.stack_computed) *destination.stack_computed = true;
+	}
+
+	bool update_accumulator_stack(const Position& pos) const {
+		auto* current = pos.state();
+		if (current->accumulator.computed_accumulation) {
+	#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+			auto& counters = StackCounters();
+			++counters.computed_hits;
+	#endif
+			return true;
+		}
+
+		std::array<StateInfo*, MAX_PLY + 1> chain{};
+		std::size_t length = 0;
+		auto* cursor = current;
+		while (cursor && !cursor->accumulator.computed_accumulation
+		       && length < chain.size()) {
+			chain[length++] = cursor;
+			cursor = cursor->previous;
+		}
+		if (!cursor || length == chain.size()) {
+	#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+			auto& counters = StackCounters();
+			++counters.scratch_refresh;
+	#endif
+			return false;
+		}
+
+		// A king move changes the HalfKA_HM2 row coordinate.  Phase A keeps the
+		// safe existing contract: refresh the requested leaf rather than trying
+		// to reconstruct an intermediate board.
+		for (std::size_t i = 0; i < length; ++i) {
+			const auto& dirty = chain[i]->dirtyPiece;
+			if (dirty.dirty_num && dirty.pieceNo[0] >= PIECE_NUMBER_KING) {
+	#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+				auto& counters = StackCounters();
+				++counters.refresh_in_chain;
+				++counters.scratch_refresh;
+	#endif
+				refresh_accumulator(pos);
+				return true;
+			}
+		}
+
+		for (std::size_t i = length; i-- > 0;)
+			update_stack_transition(*chain[i]);
+
+	#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+		auto& counters = StackCounters();
+		if (length == 1)
+			++counters.one_ply;
+		else {
+			++counters.multi_ply;
+			bool evalhash_caused = false;
+	#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+			for (std::size_t i = 0; i < length; ++i)
+				evalhash_caused |= chain[i]->accumulator.stack_score_valid;
+	#endif
+			if (evalhash_caused)
+				++counters.evalhash_multi_ply;
+			counters.dirty_chain_total.fetch_add(length,
+			  std::memory_order_relaxed);
+			++counters.dirty_chain_multi_count;
+			auto observed = counters.max_dirty_chain.load(std::memory_order_relaxed);
+			while (observed < length
+			       && !counters.max_dirty_chain.compare_exchange_weak(
+				         observed, length, std::memory_order_relaxed)) {}
+		}
+	#endif
+		return true;
+	}
+#endif
+
+	// Phase B: Finny owns only the cache.  The caller explicitly supplies the
+	// accumulator destination so the same cache algorithm can target either a
+	// legacy StateInfo payload or a Worker-stack entry.
+	void refresh_accumulator_with_finny_cache(
+		const Position& pos, Accumulator& accumulator) const {
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+		++StackCounters().finny_refresh;
+#endif
 		static thread_local std::unique_ptr<FinnyCache> cache;
 		if (!cache)
 			cache = std::make_unique<FinnyCache>();
 		if (cache->owner != this || cache->generation != finny_generation_)
 			cache->reset(this, finny_generation_);
 
-		auto& accumulator = pos.state()->accumulator;
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+		EnsureSimpleAccumulatorStorage(accumulator);
+		accumulator.stack_king_square[BLACK] = static_cast<Square>(
+		  (pos.eval_list()->piece_list_fb()[PIECE_NUMBER_KING + BLACK]
+		   - f_king) % SQ_NB);
+		accumulator.stack_king_square[WHITE] = static_cast<Square>(
+		  (pos.eval_list()->piece_list_fw()[PIECE_NUMBER_KING + WHITE]
+		   - f_king) % SQ_NB);
+#endif
 		for (IndexType i = 0; i < kRefreshTriggers.size(); ++i) {
 			Features::IndexList active_indices[2];
 			const auto trigger = kRefreshTriggers[i];
@@ -1576,6 +1770,9 @@ class FeatureTransformer {
 #endif
 
 		accumulator.computed_accumulation = true;
+	#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+		if (accumulator.stack_computed) *accumulator.stack_computed = true;
+	#endif
 		accumulator.computed_score = false;
 	}
 #endif
@@ -1585,12 +1782,22 @@ class FeatureTransformer {
 	void refresh_accumulator(const Position& pos) const {
 #if defined(USE_FINNY_TABLES)
 		if constexpr (kUseFinnyTables) {
-			refresh_accumulator_with_finny_cache(pos);
+			refresh_accumulator_with_finny_cache(
+				pos, const_cast<Accumulator&>(pos.state()->accumulator));
 			return;
 		}
 #endif
 
 		auto& accumulator = pos.state()->accumulator;
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+		EnsureSimpleAccumulatorStorage(accumulator);
+		accumulator.stack_king_square[BLACK] = static_cast<Square>(
+		  (pos.eval_list()->piece_list_fb()[PIECE_NUMBER_KING + BLACK]
+		   - f_king) % SQ_NB);
+		accumulator.stack_king_square[WHITE] = static_cast<Square>(
+		  (pos.eval_list()->piece_list_fw()[PIECE_NUMBER_KING + WHITE]
+		   - f_king) % SQ_NB);
+#endif
 		for (IndexType i = 0; i < kRefreshTriggers.size(); ++i) {
 			Features::IndexList active_indices[2];
 			RawFeatures::AppendActiveIndices(pos, kRefreshTriggers[i], active_indices);
@@ -1626,6 +1833,9 @@ class FeatureTransformer {
 #endif
 
 		accumulator.computed_accumulation = true;
+	#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+		if (accumulator.stack_computed) *accumulator.stack_computed = true;
+	#endif
 		// Stockfishでは fc27d15(2020-09-07) にcomputed_scoreが排除されているので確認
 		accumulator.computed_score = false;
 	}
@@ -1835,7 +2045,8 @@ class FeatureTransformer {
 #endif
 #if defined(USE_FINNY_TABLES)
 	void TestRefreshAccumulatorWithFinny(const Position& pos) const {
-		refresh_accumulator_with_finny_cache(pos);
+		refresh_accumulator_with_finny_cache(
+			pos, const_cast<Accumulator&>(pos.state()->accumulator));
 	}
 	void TestResetFinnyCache() const {
 		// The upstream simple cache is function-local and generation-keyed.

@@ -531,6 +531,12 @@ protected:
     Eval::NNUE::AccumulatorCaches refreshTable;
 #endif
 
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+    // Experiment 136 Phase A.  This stack is strictly per Worker; Position
+    // continues to own dirtyPiece and all board/search restoration state.
+    Eval::NNUE::SimpleAccumulatorStack simpleAccumulatorStack;
+#endif
+
 	friend class YaneuraOu::ThreadPool;
 #if STOCKFISH
     friend class SearchManager;

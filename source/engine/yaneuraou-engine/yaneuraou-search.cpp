@@ -978,6 +978,7 @@ void Search::YaneuraOuWorker::start_searching() {
 #if defined(MEASURE_LAZY_SMP_DUPLICATION)
     Search::LazySmpDuplicateStats::reset(threads.size());
 #endif
+
 #if defined(USE_LAZY_SMP_DUPLICATE_LMR)
     Search::LazySmpDuplicateLmr::reset(threads.size());
 #endif
@@ -2118,6 +2119,10 @@ void YaneuraOuWorker::do_move(
 
     pos.do_move(move, st, givesCheck, &tt);
 
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+    simpleAccumulatorStack.push(st.accumulator, &st);
+#endif
+
 #endif
 
     if (ss != nullptr)
@@ -2145,7 +2150,15 @@ void YaneuraOuWorker::do_null_move(Position& pos, StateInfo& st) { pos.do_null_m
 
 void YaneuraOuWorker::undo_move(Position& pos, const Move move) {
 
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+    const StateInfo* const childState = pos.state();
+#endif
+
 	pos.undo_move(move);
+
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+    simpleAccumulatorStack.pop(childState);
+#endif
 
 #if defined(EVAL_SFNN)
     //accumulatorStack.pop();
@@ -5782,6 +5795,12 @@ Value Search::YaneuraOuWorker::diagnostic_qsearch(
     diagnosticQsearchStandPatObserved = false;
 #if defined(USE_SFNN)
     accumulatorStack.reset();
+#endif
+
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+    // Every Worker owns a separate stack. Reset before the helper-thread
+    // early return so no Worker retains another Worker's root payload.
+    simpleAccumulatorStack.reset(rootState.accumulator, &rootState);
 #endif
     const Value result = qsearch<PV>(pos, ss, -VALUE_INFINITE, VALUE_INFINITE);
     searched_nodes = nodes.load(std::memory_order_relaxed);

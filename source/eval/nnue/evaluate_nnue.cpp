@@ -1056,6 +1056,7 @@ void EvalHash_SetEnabled(bool enabled) {
     g_evalHashRequested = enabled;
 }
 bool EvalHash_IsEnabled() { return g_evalHashRequested && g_evalHashInitialized; }
+bool EvalHash_IsInitialized() { return g_evalHashInitialized; }
 
 #if defined(EVAL_HASH_ATOMIC64)
 bool EvalHash_Atomic64CodecSelftest() {
@@ -1120,6 +1121,15 @@ struct EvalHashDiagnosticCounters {
     std::atomic<std::uint64_t> router_flag_hits{0};
     std::atomic<std::uint64_t> lca_flag_hits{0};
     std::atomic<std::uint64_t> cross_flag_hits{0};
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+    std::atomic<std::uint64_t> hit_accumulator_valid{0};
+    std::atomic<std::uint64_t> hit_accumulator_invalid{0};
+    std::atomic<std::uint64_t> miss_after_one_unmaterialized_hit{0};
+    std::atomic<std::uint64_t> miss_after_multi_unmaterialized_hits{0};
+    std::atomic<std::uint64_t> retained_ancestor_hits{0};
+    std::atomic<std::uint64_t> unmaterialized_hit_chain_total{0};
+    std::atomic<std::uint64_t> max_unmaterialized_hit_chain{0};
+#endif
 };
 EvalHashDiagnosticCounters g_evalHashDiagnostic;
 std::atomic<bool> g_evalHashDiagnosticEnabled{true};
@@ -1451,6 +1461,13 @@ void EvalHash_DiagnosticReset() {
     d.continuity_updates=0; d.continuity_refreshes=0; d.continuity_ns=0;
     d.signal_mismatches=0; d.signal_vs_refresh_mismatches=0;
     d.router_flag_hits=0; d.lca_flag_hits=0; d.cross_flag_hits=0;
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+    d.hit_accumulator_valid=0; d.hit_accumulator_invalid=0;
+    d.miss_after_one_unmaterialized_hit=0;
+    d.miss_after_multi_unmaterialized_hits=0;
+    d.retained_ancestor_hits=0; d.unmaterialized_hit_chain_total=0;
+    d.max_unmaterialized_hit_chain=0;
+#endif
 #if defined(EVAL_HASH_VERIFY_HITS)
     g_evalHashShadowScores.clear();
 #endif
@@ -1482,6 +1499,19 @@ void EvalHash_DiagnosticReport() {
               << "hit_rate " << std::setprecision(10)
               << (probes ? static_cast<double>(hits)/probes : 0.0) << std::endl
               << "stores " << d.stores.load() << std::endl
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+              << "hit_accumulator_valid " << d.hit_accumulator_valid.load() << std::endl
+              << "hit_accumulator_invalid " << d.hit_accumulator_invalid.load() << std::endl
+              << "miss_after_one_unmaterialized_hit "
+              << d.miss_after_one_unmaterialized_hit.load() << std::endl
+              << "miss_after_multi_unmaterialized_hits "
+              << d.miss_after_multi_unmaterialized_hits.load() << std::endl
+              << "retained_ancestor_hits " << d.retained_ancestor_hits.load() << std::endl
+              << "unmaterialized_hit_chain_total "
+              << d.unmaterialized_hit_chain_total.load() << std::endl
+              << "max_unmaterialized_hit_chain "
+              << d.max_unmaterialized_hit_chain.load() << std::endl
+#endif
               << "compute_score_calls " << d.compute_score_calls.load() << std::endl
               << "transform_calls " << d.transform_calls.load() << std::endl
               << "propagate_calls " << d.propagate_calls.load() << std::endl
@@ -1753,6 +1783,21 @@ Value evaluate(const Position& pos) {
 #if defined(MEASURE_EVAL_HASH_BENCHMARK)
         diag_inc(g_evalHashDiagnostic.hits);
 #endif
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+        // A score hit never certifies the FT payload.  Record the two validity
+        // domains independently and leave computed_accumulation untouched.
+#if defined(MEASURE_EVAL_HASH_BENCHMARK)
+        auto& stackAccumulator = pos.state()->accumulator;
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+        stackAccumulator.stack_score_valid = true;
+        stackAccumulator.stack_cached_score = cachedScore;
+#endif
+        if (stackAccumulator.computed_accumulation)
+            diag_inc(g_evalHashDiagnostic.hit_accumulator_valid);
+        else
+            diag_inc(g_evalHashDiagnostic.hit_accumulator_invalid);
+#endif
+#endif
         // あった！
 #if defined(ENABLE_NNUE_SIGNAL_LOG)
         NNUE::SetLastNnueSignalAccess(NNUE::NnueSignalEvalSource::EvalHashHit);
@@ -1810,6 +1855,41 @@ Value evaluate(const Position& pos) {
         return Value(entry.score);
 #endif
     }
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+#if defined(MEASURE_EVAL_HASH_BENCHMARK) && defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+    {
+        std::uint64_t hitChain = 0;
+        // The current node is the miss.  Count the consecutive score-hit
+        // ancestors retained immediately behind it.
+        auto* chainState = pos.state()->previous;
+        while (chainState && !chainState->accumulator.computed_accumulation
+               && chainState->accumulator.stack_score_valid) {
+            ++hitChain;
+            chainState = chainState->previous;
+        }
+        if (hitChain == 1)
+            diag_inc(g_evalHashDiagnostic.miss_after_one_unmaterialized_hit);
+        else if (hitChain >= 2)
+            diag_inc(g_evalHashDiagnostic.miss_after_multi_unmaterialized_hits);
+        if (hitChain) {
+            g_evalHashDiagnostic.unmaterialized_hit_chain_total.fetch_add(
+              hitChain, std::memory_order_relaxed);
+            if (chainState && chainState->accumulator.computed_accumulation)
+                diag_inc(g_evalHashDiagnostic.retained_ancestor_hits);
+            auto old = g_evalHashDiagnostic.max_unmaterialized_hit_chain.load(
+              std::memory_order_relaxed);
+            while (old < hitChain
+                   && !g_evalHashDiagnostic.max_unmaterialized_hit_chain
+                         .compare_exchange_weak(old, hitChain,
+                                                std::memory_order_relaxed)) {}
+        }
+    }
+#endif
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+    pos.state()->accumulator.stack_score_valid = false;
+    pos.state()->accumulator.stack_cached_score = VALUE_ZERO;
+#endif
+#endif
 #if defined(MEASURE_EVAL_HASH_BENCHMARK)
     diag_inc(g_evalHashDiagnostic.misses);
     }

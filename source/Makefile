@@ -206,6 +206,29 @@ else ifneq ($(NNUE_SIMPLE_BUCKET),K3K3)
 	$(error NNUE_SIMPLE_BUCKET must be K3K3, PHASE9, or KINGFREE_TREE)
 endif
 
+# Experiment 136: Simple HalfKA_HM2-only hybrid accumulator stack prototype.
+# This is deliberately opt-in.  It is incompatible with the optional Simple
+# side branches and non-K3K3 routers in Phase A.
+NNUE_SIMPLE_ACCUMULATOR_STACK ?= NO
+NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS ?= NO
+ifeq ($(NNUE_SIMPLE_ACCUMULATOR_STACK),YES)
+	CPPFLAGS += -DNNUE_SIMPLE_ACCUMULATOR_STACK
+	ifneq ($(NNUE_SIMPLE_LOCAL_PAIR),NONE)
+		$(error NNUE_SIMPLE_ACCUMULATOR_STACK Phase A requires NNUE_SIMPLE_LOCAL_PAIR=NONE)
+	endif
+	ifneq ($(NNUE_SIMPLE_BUCKET),K3K3)
+		$(error NNUE_SIMPLE_ACCUMULATOR_STACK Phase A requires NNUE_SIMPLE_BUCKET=K3K3)
+	endif
+else ifneq ($(NNUE_SIMPLE_ACCUMULATOR_STACK),NO)
+	$(error NNUE_SIMPLE_ACCUMULATOR_STACK must be YES or NO)
+endif
+
+ifeq ($(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS),YES)
+	CPPFLAGS += -DNNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS
+else ifneq ($(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS),NO)
+	$(error NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS must be YES or NO)
+endif
+
 # Experiment 127: runtime-only dirty generation fast path for the two R5-32
 # architectures.  NO reproduces the Experiment 126 before/after snapshot path;
 # YES stores only the at-most 2 removed / 1 added physical endpoints.  This

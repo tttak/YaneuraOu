@@ -2093,6 +2093,16 @@ void Position::do_move_impl(Move m, StateInfo& newSt, bool givesCheck, const T* 
     st->sum.p[0][0] = VALUE_NOT_EVALUATED;
 #endif
 #if defined(EVAL_NNUE)
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+    // The destination payload is bound by the owning Worker after do_move().
+    // Non-search/test callers lazily obtain thread-local scratch storage.
+    st->accumulator.accumulation = nullptr;
+    st->accumulator.stack_computed = nullptr;
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+    st->accumulator.stack_score_valid = false;
+    st->accumulator.stack_cached_score = VALUE_ZERO;
+#endif
+#endif
     st->accumulator.computed_accumulation = false;
     st->accumulator.computed_score        = false;
 #if defined(EVAL_HASH_VERIFY_HITS)
@@ -2488,6 +2498,16 @@ void Position::do_move_impl(Move m, StateInfo& newSt, bool givesCheck, const T* 
 
     // 相手番に変更する。
     sideToMove = them;
+
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+    // Record destination-state king coordinates after the board transition.
+    // Multi-ply materialization must not read a newer leaf king for an older
+    // dirty entry.
+    st->accumulator.stack_king_square[BLACK] = static_cast<Square>(
+      (evalList.piece_list_fb()[PIECE_NUMBER_KING + BLACK] - f_king) % SQ_NB);
+    st->accumulator.stack_king_square[WHITE] = static_cast<Square>(
+      (evalList.piece_list_fw()[PIECE_NUMBER_KING + WHITE] - f_king) % SQ_NB);
+#endif
 
     // 更新されたhash keyをStateInfoに書き戻す。
     st->board_key = k;
@@ -2980,6 +3000,14 @@ void Position::do_null_move(StateInfo& newSt, const T& tt) {
 #if defined(USE_CLASSIC_EVAL) && defined(EVAL_NNUE)
     // NNUEの場合、KPPT型と違って、手番が違う場合、計算なしに済ますわけにはいかない。
     st->accumulator.computed_score = false;
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+    // Null move reuses the feature payload, but its position key/side-to-move
+    // score contract is different.  Never reuse the parent's cached score.
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+    st->accumulator.stack_score_valid = false;
+    st->accumulator.stack_cached_score = VALUE_ZERO;
+#endif
+#endif
 #if defined(EVAL_HASH_VERIFY_HITS)
     st->accumulator.debug_accumulator_source = 4;
     st->accumulator.debug_was_null_move = true;
