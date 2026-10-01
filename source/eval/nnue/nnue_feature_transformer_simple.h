@@ -595,6 +595,26 @@ class FeatureTransformer {
 		std::atomic<std::uint64_t> max_dirty_chain{0};
 		std::atomic<std::uint64_t> legacy_parent_uncomputed{0};
 		std::atomic<std::uint64_t> evalhash_multi_ply{0};
+		std::atomic<std::uint64_t> r5_full_rebuild{0};
+		std::atomic<std::uint64_t> r5_mirror_rebuild{0};
+		std::atomic<std::uint64_t> r5_one_ply{0};
+		std::atomic<std::uint64_t> r5_multi_ply{0};
+		std::atomic<std::uint64_t> r5_rows_applied{0};
+		std::atomic<std::uint64_t> r5_replay_segments[2]{};
+		std::atomic<std::uint64_t> r5_replay_original[2]{};
+		std::atomic<std::uint64_t> r5_replay_removed[2]{};
+		std::atomic<std::uint64_t> r5_replay_added[2]{};
+		std::atomic<std::uint64_t> r5_replay_net[2]{};
+		std::atomic<std::uint64_t> r5_replay_distinct[2]{};
+		std::atomic<std::uint64_t> r5_replay_unique[2]{};
+		std::atomic<std::uint64_t> r5_cancel_remove_add[2]{};
+		std::atomic<std::uint64_t> r5_cancel_add_remove[2]{};
+		std::atomic<std::uint64_t> r5_fusion_fallback{0};
+		std::atomic<std::uint64_t> r5_mirror_unique{0};
+		std::atomic<std::uint64_t> r5_mirror_repeat{0};
+		std::atomic<std::uint64_t> r5_boundary_cache_hit{0};
+		std::atomic<std::uint64_t> r5_chain_length_total{0};
+		std::atomic<std::uint64_t> r5_chain_length_max{0};
 	};
 
 	static StackMaterializationCounters& StackCounters() {
@@ -611,6 +631,26 @@ class FeatureTransformer {
 		c.max_dirty_chain = 0;
 		c.legacy_parent_uncomputed = 0;
 		c.evalhash_multi_ply = 0;
+		c.r5_full_rebuild = 0; c.r5_mirror_rebuild = 0;
+		c.r5_one_ply = 0; c.r5_multi_ply = 0;
+		c.r5_rows_applied = 0;
+		for (int p = 0; p < 2; ++p) {
+			c.r5_replay_segments[p] = 0;
+			c.r5_replay_original[p] = 0;
+			c.r5_replay_removed[p] = 0;
+			c.r5_replay_added[p] = 0;
+			c.r5_replay_net[p] = 0;
+			c.r5_replay_distinct[p] = 0;
+			c.r5_replay_unique[p] = 0;
+			c.r5_cancel_remove_add[p] = 0;
+			c.r5_cancel_add_remove[p] = 0;
+		}
+		c.r5_fusion_fallback = 0;
+		c.r5_mirror_unique = 0;
+		c.r5_mirror_repeat = 0;
+		c.r5_boundary_cache_hit = 0;
+		c.r5_chain_length_total = 0;
+		c.r5_chain_length_max = 0;
 	}
 #endif
 
@@ -854,6 +894,522 @@ class FeatureTransformer {
 		return board;
 	}
 
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK) \
+ && defined(NNUE_SIMPLE_LOCALPAIR32_R5) \
+ && defined(NNUE_LOCALPAIR_DIRTY_FASTPATH)
+	// The leaf Position is the only live board during delayed materialization.
+	// Reverse the saved physical endpoints to reach the computed ancestor, then
+	// replay them forward.  The view deliberately exposes the same lookup API
+	// consumed by the production R5 fast-dirty generator.
+	struct Pp64BoardView {
+		const Pp64Board& board;
+		Piece piece_on(Square sq) const {
+			const auto code = board.at[static_cast<int>(sq)];
+			if (!code) return NO_PIECE;
+			const int state = code - 1;
+			return make_piece(static_cast<Color>(state / 2),
+			                  state % 2 == 0 ? SILVER : GOLD);
+		}
+		Bitboard pieces(Color color, PieceType type) const {
+			return board.pieces[color][type == SILVER ? 0 : 1];
+		}
+	};
+
+	static void pp64_board_erase(Pp64Board& board, std::uint16_t packed) {
+		const auto sq = static_cast<Square>(
+		  Features::LocalPair64Shogi::packed_square(packed));
+		const int state = Features::LocalPair64Shogi::packed_state(packed);
+		board.pieces[state / 2][state % 2] &= ~Bitboard(sq);
+		board.at[static_cast<int>(sq)] = 0;
+	}
+
+	static void pp64_board_add(Pp64Board& board, std::uint16_t packed) {
+		const auto sq = static_cast<Square>(
+		  Features::LocalPair64Shogi::packed_square(packed));
+		const int state = Features::LocalPair64Shogi::packed_state(packed);
+		Features::LocalPair64Shogi::set_piece(
+		  board, state / 2, state % 2, sq);
+	}
+
+	static void pp64_board_reverse(Pp64Board& board,
+	                             const StateInfo& transition) {
+		const auto& delta = transition.localpairDirty;
+		for (std::uint8_t i = 0; i < delta.added_count; ++i)
+			pp64_board_erase(board, delta.added[i]);
+		for (std::uint8_t i = 0; i < delta.removed_count; ++i)
+			pp64_board_add(board, delta.removed[i]);
+	}
+
+	static void pp64_board_forward(Pp64Board& board,
+	                             const StateInfo& transition) {
+		const auto& delta = transition.localpairDirty;
+		for (std::uint8_t i = 0; i < delta.removed_count; ++i)
+			pp64_board_erase(board, delta.removed[i]);
+		for (std::uint8_t i = 0; i < delta.added_count; ++i)
+			pp64_board_add(board, delta.added[i]);
+	}
+
+	// A typical deferred chain has only a handful of R5 changes.  Linear
+	// reduction avoids sorting/heap allocation; exceeding this fixed sparse
+	// capacity falls back to the proven per-ply replay path.
+	struct R5NetRows {
+		struct Row { std::uint16_t index; std::int16_t count; };
+		static constexpr std::size_t kCapacity = 256;
+		// At most two changed endpoints inspect 24 neighbors each per ply.
+		// Even an all-duplicate MAX_PLY chain cannot overflow signed_count.
+		static_assert(2 * 24 * MAX_PLY < 32767,
+		              "R5 signed replay count must fit int16");
+		std::array<Row, kCapacity> rows{};
+		std::uint16_t size = 0;
+		std::uint32_t original = 0;
+		std::uint32_t removed = 0;
+		std::uint32_t added = 0;
+		std::uint32_t remove_add = 0;
+		std::uint32_t add_remove = 0;
+		bool overflow = false;
+
+		void clear() {
+			size = 0;
+			original = removed = added = remove_add = add_remove = 0;
+			overflow = false;
+		}
+		void append(IndexType index, int sign) {
+			++original;
+			if (sign < 0) ++removed; else ++added;
+			for (std::uint16_t i = 0; i < size; ++i)
+				if (rows[i].index == index) {
+					if (rows[i].count < 0 && sign > 0) ++remove_add;
+					if (rows[i].count > 0 && sign < 0) ++add_remove;
+					rows[i].count = static_cast<std::int16_t>(rows[i].count + sign);
+					return;
+				}
+			if (size == kCapacity) { overflow = true; return; }
+			rows[size++] = {static_cast<std::uint16_t>(index),
+			                static_cast<std::int16_t>(sign)};
+		}
+		void append(const Pp64Feature& removed, const Pp64Feature& added) {
+			for (const auto index : removed) append(index, -1);
+			for (const auto index : added) append(index, +1);
+		}
+		std::uint32_t unique_nonzero() const {
+			std::uint32_t n = 0;
+			for (std::uint16_t i = 0; i < size; ++i)
+				n += rows[i].count != 0;
+			return n;
+		}
+		std::uint32_t net_ops() const {
+			std::uint32_t n = 0;
+			for (std::uint16_t i = 0; i < size; ++i)
+				n += static_cast<std::uint32_t>(std::abs(rows[i].count));
+			return n;
+		}
+	};
+
+	void pp64_apply_net_rows(std::int16_t* destination,
+	                         const R5NetRows& net) const {
+#if defined(USE_AVX2)
+		for (IndexType lane = 0; lane < kPp64Width; lane += 16) {
+			__m256i acc = _mm256_load_si256(
+			  reinterpret_cast<const __m256i*>(destination + lane));
+			for (std::uint16_t i = 0; i < net.size; ++i) {
+				const auto& item = net.rows[i];
+				if (!item.count) continue;
+				const auto* row = &pp3wide64_weights_[item.index * kPp64Width + lane];
+				const __m128i packed = _mm_loadu_si128(
+				  reinterpret_cast<const __m128i*>(row));
+				__m256i value = _mm256_slli_epi16(
+				  _mm256_cvtepi8_epi16(packed), 1);
+				if (item.count != 1)
+					value = _mm256_mullo_epi16(
+					  value, _mm256_set1_epi16(item.count));
+				acc = _mm256_add_epi16(acc, value);
+			}
+			_mm256_store_si256(reinterpret_cast<__m256i*>(destination + lane), acc);
+		}
+#else
+		for (std::uint16_t i = 0; i < net.size; ++i) {
+			const auto& item = net.rows[i];
+			if (!item.count) continue;
+			for (IndexType lane = 0; lane < kPp64Width; ++lane)
+				destination[lane] = static_cast<std::int16_t>(
+				  destination[lane] + 2 * int(item.count)
+				  * pp3wide64_weights_[item.index * kPp64Width + lane]);
+		}
+#endif
+	}
+
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+	static void pp64_record_replay_segment(const R5NetRows (&net)[2]) {
+		auto& counters = StackCounters();
+		for (int c = 0; c < 2; ++c) {
+			if (!net[c].original) continue;
+			++counters.r5_replay_segments[c];
+			counters.r5_replay_original[c].fetch_add(net[c].original,
+			  std::memory_order_relaxed);
+			counters.r5_replay_removed[c].fetch_add(net[c].removed,
+			  std::memory_order_relaxed);
+			counters.r5_replay_added[c].fetch_add(net[c].added,
+			  std::memory_order_relaxed);
+			counters.r5_replay_net[c].fetch_add(net[c].net_ops(),
+			  std::memory_order_relaxed);
+			counters.r5_replay_distinct[c].fetch_add(net[c].size,
+			  std::memory_order_relaxed);
+			counters.r5_replay_unique[c].fetch_add(net[c].unique_nonzero(),
+			  std::memory_order_relaxed);
+			counters.r5_cancel_remove_add[c].fetch_add(net[c].remove_add,
+			  std::memory_order_relaxed);
+			counters.r5_cancel_add_remove[c].fetch_add(net[c].add_remove,
+			  std::memory_order_relaxed);
+		}
+	}
+	static void pp64_note_mirror_rebuild(Accumulator& accumulator, int c) {
+		auto& counters = StackCounters();
+		if (accumulator.r5_mirror_builds[c]++ == 0)
+			++counters.r5_mirror_unique;
+		else
+			++counters.r5_mirror_repeat;
+	}
+#endif
+
+#if NNUE_SIMPLE_R5_REPLAY == 2
+	void pp64_flush_net(Accumulator& destination, Accumulator& source,
+	                    const R5NetRows (&net)[2]) const {
+		EnsureSimpleAccumulatorStorage(source);
+		EnsureSimpleAccumulatorStorage(destination);
+		for (int c = 0; c < 2; ++c) {
+			auto* output = destination.pp3wide64_accumulation[c];
+			if (&destination != &source)
+				std::memcpy(output, source.pp3wide64_accumulation[c],
+				            kPp64Width * sizeof(std::int16_t));
+			pp64_apply_net_rows(output, net[c]);
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+			StackCounters().r5_rows_applied.fetch_add(
+			  net[c].unique_nonzero(), std::memory_order_relaxed);
+#endif
+		}
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+		pp64_record_replay_segment(net);
+#endif
+	}
+
+	bool pp64_update_stack_chain_fused(
+	  const Position& pos,
+	  const std::array<StateInfo*, MAX_PLY + 1>& chain,
+	  std::size_t length) const {
+		auto board = pp64_board_from_position(pos);
+		for (std::size_t i = 0; i < length; ++i)
+			pp64_board_reverse(board, *chain[i]);
+		auto* segment_source = &chain[length - 1]->previous->accumulator;
+		R5NetRows net[2];
+		for (std::size_t i = length; i-- > 0;) {
+			auto& transition = *chain[i];
+			pp64_board_forward(board, transition);
+			auto& destination = transition.accumulator;
+			const auto& delta = transition.localpairDirty;
+			if (delta.flags & 2) {
+				// Orientation changes here.  Never merge rows across this move.
+				auto& parent = transition.previous->accumulator;
+				pp64_flush_net(parent, *segment_source, net);
+				net[BLACK].clear();
+				net[WHITE].clear();
+				EnsureSimpleAccumulatorStorage(destination);
+				for (int c = 0; c < 2; ++c) {
+					const auto perspective = static_cast<Color>(c);
+					auto* output = destination.pp3wide64_accumulation[c];
+					const Square king = perspective == BLACK
+					  ? destination.stack_king_square[c]
+					  : static_cast<Square>(80 - int(destination.stack_king_square[c]));
+					const bool moved_king = transition.dirtyPiece.dirty_num
+					  && transition.dirtyPiece.pieceNo[0]
+					     == PIECE_NUMBER_KING + perspective;
+					if (moved_king) {
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+						++StackCounters().r5_full_rebuild;
+						++StackCounters().r5_mirror_rebuild;
+						pp64_note_mirror_rebuild(destination, c);
+#endif
+						Pp64Feature active;
+						pp64_append_active(board, perspective, king, active);
+						pp64_refresh_rows(output, active);
+					} else {
+						std::memcpy(output, parent.pp3wide64_accumulation[c],
+						            kPp64Width * sizeof(std::int16_t));
+						if (delta.removed_count || delta.added_count) {
+							Pp64Feature removed, added;
+							Features::LocalPair64Shogi::make_local_dirty_diff_fast(
+							  Pp64BoardView{board}, delta, perspective, king,
+							  removed, added);
+							ASSERT(!removed.overflow && !added.overflow);
+							pp64_apply_diff(output, removed, added);
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+							net[c].append(removed, added);
+							StackCounters().r5_rows_applied.fetch_add(
+							  removed.count + added.count, std::memory_order_relaxed);
+#endif
+						}
+					}
+				}
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+				pp64_record_replay_segment(net);
+#endif
+				destination.computed_r5 = true;
+				segment_source = &destination;
+				net[BLACK].clear();
+				net[WHITE].clear();
+				continue;
+			}
+			if (delta.removed_count == 0 && delta.added_count == 0)
+				continue;
+			for (int c = 0; c < 2; ++c) {
+				const auto perspective = static_cast<Color>(c);
+				const Square king = perspective == BLACK
+				  ? destination.stack_king_square[c]
+				  : static_cast<Square>(80 - int(destination.stack_king_square[c]));
+				Pp64Feature removed, added;
+				Features::LocalPair64Shogi::make_local_dirty_diff_fast(
+				  Pp64BoardView{board}, delta, perspective, king,
+				  removed, added);
+				ASSERT(!removed.overflow && !added.overflow);
+				net[c].append(removed, added);
+				if (net[c].overflow) {
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+					++StackCounters().r5_fusion_fallback;
+#endif
+					return false;
+				}
+			}
+		}
+		auto& leaf = chain[0]->accumulator;
+		pp64_flush_net(leaf, *segment_source, net);
+		leaf.computed_r5 = true;
+		return true;
+	}
+#endif
+
+   public:
+	// Fixed synthetic multiset cases: opposite updates, repeated identical
+	// rows and a multi-endpoint capture/promotion/drop-shaped transition.  The
+	// independent scratch sum enumerates final multiplicity from zero.
+	unsigned TestR5ReplayFusionRows() const {
+		struct Event { std::uint8_t slot; std::int8_t sign; };
+		IndexType indices[4]{};
+		int found = 0;
+		for (IndexType index = 0; index < kPp64Dimensions && found < 4;
+		     ++index) {
+			bool nonzero = false;
+			for (IndexType lane = 0; lane < kPp64Width; ++lane)
+				nonzero |= pp3wide64_weights_[index * kPp64Width + lane] != 0;
+			if (nonzero) indices[found++] = index;
+		}
+		if (found != 4) return 1;
+		constexpr Event events[5][6] = {
+			{{0,-1},{0,+1},{0,0},{0,0},{0,0},{0,0}},
+			{{2,+1},{2,-1},{0,0},{0,0},{0,0},{0,0}},
+			{{2,+1},{2,+1},{2,-1},{3,+1},{0,0},{0,0}},
+			{{0,-1},{1,-1},{2,+1},{3,+1},{0,+1},{0,0}},
+			{{2,+1},{2,+1},{0,0},{0,0},{0,0},{0,0}},
+		};
+		constexpr int counts[5] = {2, 2, 4, 5, 2};
+		unsigned mismatches = 0;
+		for (int test = 0; test < 5; ++test) {
+			alignas(64) std::int16_t per_ply[kPp64Width]{};
+			alignas(64) std::int16_t fused[kPp64Width]{};
+			alignas(64) std::int16_t scratch[kPp64Width]{};
+			Pp64Feature base;
+			base.push_back(indices[0]);
+			base.push_back(indices[1]);
+			pp64_refresh_rows(per_ply, base);
+			std::memcpy(fused, per_ply, sizeof(fused));
+			int active[4] = {1, 1, 0, 0};
+			R5NetRows net;
+			for (int i = 0; i < counts[test]; ++i) {
+				const auto event = events[test][i];
+				const IndexType index = indices[event.slot];
+				Pp64Feature removed, added;
+				if (event.sign < 0) removed.push_back(index);
+				else added.push_back(index);
+				pp64_apply_diff(per_ply, removed, added);
+				net.append(index, event.sign);
+				active[event.slot] += event.sign;
+			}
+			pp64_apply_net_rows(fused, net);
+			Pp64Feature expected;
+			for (int slot = 0; slot < 4; ++slot) {
+				if (active[slot] < 0) ++mismatches;
+				for (int count = 0; count < active[slot]; ++count)
+					expected.push_back(indices[slot]);
+			}
+			pp64_refresh_rows(scratch, expected);
+			if (net.overflow || std::memcmp(per_ply, fused, sizeof(fused))
+			    || std::memcmp(fused, scratch, sizeof(scratch)))
+				++mismatches;
+		}
+		return mismatches;
+	}
+
+   private:
+
+	void pp64_update_stack_chain(const Position& pos,
+	                           const std::array<StateInfo*, MAX_PLY + 1>& chain,
+	                           std::size_t length) const {
+#if NNUE_SIMPLE_R5_REPLAY >= 1
+		// R5-only intermediate reuse (direct Legacy->P1 gain in Experiment 142).
+		// R5 validity never implies HalfKA or score validity.
+		if (pos.state()->accumulator.computed_r5) return;
+		std::array<StateInfo*, MAX_PLY + 1> r5_chain{};
+		std::size_t r5_length = 0;
+		auto* r5_cursor = pos.state();
+		while (r5_cursor && !r5_cursor->accumulator.computed_r5
+		       && r5_length < r5_chain.size()) {
+			r5_chain[r5_length++] = r5_cursor;
+			r5_cursor = r5_cursor->previous;
+		}
+		ASSERT(r5_cursor && r5_length < r5_chain.size());
+		const auto& work_chain = r5_chain;
+		const auto work_length = r5_length;
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+		if (r5_length < length) ++StackCounters().r5_boundary_cache_hit;
+#endif
+#else
+		const auto& work_chain = chain;
+		const auto work_length = length;
+#endif
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+		if (work_length == 1) ++StackCounters().r5_one_ply;
+		else {
+			++StackCounters().r5_multi_ply;
+			StackCounters().r5_chain_length_total.fetch_add(
+			  work_length, std::memory_order_relaxed);
+			auto observed = StackCounters().r5_chain_length_max.load(
+			  std::memory_order_relaxed);
+			while (observed < work_length &&
+			       !StackCounters().r5_chain_length_max.compare_exchange_weak(
+			         observed, work_length, std::memory_order_relaxed)) {}
+		}
+#endif
+		if (work_length == 1) {
+			// The common case needs no reconstructed BoardState: the live
+			// Position is exactly the after-board expected by fast dirty.
+			auto& transition = *work_chain[0];
+			auto& destination = transition.accumulator;
+			auto& source = transition.previous->accumulator;
+			EnsureSimpleAccumulatorStorage(source);
+			EnsureSimpleAccumulatorStorage(destination);
+			const auto& delta = transition.localpairDirty;
+			for (int c = 0; c < COLOR_NB; ++c) {
+				const auto perspective = static_cast<Color>(c);
+				auto* output = destination.pp3wide64_accumulation[c];
+				const bool moved_king = transition.dirtyPiece.dirty_num
+				  && transition.dirtyPiece.pieceNo[0]
+				     == PIECE_NUMBER_KING + perspective;
+				const Square king = pos.square<KING>(perspective);
+				if (moved_king && (delta.flags & 2)) {
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+					++StackCounters().r5_full_rebuild;
+					++StackCounters().r5_mirror_rebuild;
+					pp64_note_mirror_rebuild(destination, c);
+#endif
+					Pp64Feature active;
+					const auto board = pp64_board_from_position(pos);
+					pp64_append_active(board, perspective, king, active);
+					pp64_refresh_rows(output, active);
+					continue;
+				}
+				std::memcpy(output, source.pp3wide64_accumulation[c],
+				            kPp64Width * sizeof(std::int16_t));
+				if (delta.removed_count == 0 && delta.added_count == 0)
+					continue;
+				Pp64Feature removed, added;
+				pp64_make_dirty_fast(pos, perspective, king, removed, added);
+				ASSERT(!removed.overflow && !added.overflow);
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+				StackCounters().r5_rows_applied.fetch_add(
+				  removed.count + added.count, std::memory_order_relaxed);
+#endif
+				pp64_apply_diff(output, removed, added);
+			}
+			destination.computed_r5 = true;
+			return;
+		}
+#if NNUE_SIMPLE_R5_REPLAY == 2
+		if (pp64_update_stack_chain_fused(pos, work_chain, work_length))
+			return;
+#endif
+		auto board = pp64_board_from_position(pos);
+		for (std::size_t i = 0; i < work_length; ++i)
+			pp64_board_reverse(board, *work_chain[i]);
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+		R5NetRows diagnostic_rows[2];
+#endif
+		for (std::size_t i = work_length; i-- > 0;) {
+			auto& transition = *work_chain[i];
+			pp64_board_forward(board, transition);
+			auto& destination = transition.accumulator;
+			auto& source = transition.previous->accumulator;
+			EnsureSimpleAccumulatorStorage(source);
+			EnsureSimpleAccumulatorStorage(destination);
+			const auto& delta = transition.localpairDirty;
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+			if (delta.flags & 2) {
+				pp64_record_replay_segment(diagnostic_rows);
+				diagnostic_rows[BLACK].clear();
+				diagnostic_rows[WHITE].clear();
+			}
+#endif
+			for (int c = 0; c < COLOR_NB; ++c) {
+				const auto perspective = static_cast<Color>(c);
+				auto* output = destination.pp3wide64_accumulation[c];
+				const bool moved_king = transition.dirtyPiece.dirty_num
+				  && transition.dirtyPiece.pieceNo[0]
+				     == PIECE_NUMBER_KING + perspective;
+				// HalfKA stores WHITE's king in rotated coordinates.  LocalPair's
+				// orient_piece() expects the physical square and rotates it itself.
+				const Square king = perspective == BLACK
+				  ? destination.stack_king_square[c]
+				  : static_cast<Square>(80 - int(destination.stack_king_square[c]));
+				if (moved_king && (delta.flags & 2)) {
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+					++StackCounters().r5_full_rebuild;
+					++StackCounters().r5_mirror_rebuild;
+					pp64_note_mirror_rebuild(destination, c);
+#endif
+					Pp64Feature active;
+					pp64_append_active(board, perspective, king, active);
+					pp64_refresh_rows(output, active);
+					continue;
+				}
+				std::memcpy(output, source.pp3wide64_accumulation[c],
+				            kPp64Width * sizeof(std::int16_t));
+				if (delta.removed_count == 0 && delta.added_count == 0)
+					continue;
+				Pp64Feature removed, added;
+				Features::LocalPair64Shogi::make_local_dirty_diff_fast(
+				  Pp64BoardView{board}, delta, perspective, king,
+				  removed, added);
+				ASSERT(!removed.overflow && !added.overflow);
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+				diagnostic_rows[c].append(removed, added);
+				StackCounters().r5_rows_applied.fetch_add(
+				  removed.count + added.count, std::memory_order_relaxed);
+#endif
+				pp64_apply_diff(output, removed, added);
+			}
+#if NNUE_SIMPLE_R5_REPLAY >= 1
+			// P1 materializes every intermediate R5 entry while replaying.  Each
+			// one is valid and must be marked so a later Main-computed ancestor is
+			// not mistaken for an R5-uncomputed state.
+			destination.computed_r5 = true;
+#endif
+		}
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+		pp64_record_replay_segment(diagnostic_rows);
+#endif
+#if NNUE_SIMPLE_R5_REPLAY == 0
+		work_chain[0]->accumulator.computed_r5 = true;
+#endif
+	}
+#endif
+
 	static Pp64Board pp64_board_from_state(const StateInfo& state,
 	                                      bool after) {
 		Pp64Board board{};
@@ -931,6 +1487,10 @@ class FeatureTransformer {
 	}
 
 	void refresh_pp3wide64(const Position& pos) const {
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+		StackCounters().r5_full_rebuild.fetch_add(2,
+		  std::memory_order_relaxed);
+#endif
 		auto& accumulator = pos.state()->accumulator;
 		const auto board = pp64_board_from_position(pos);
 		for (int c = 0; c < COLOR_NB; ++c) {
@@ -941,9 +1501,15 @@ class FeatureTransformer {
 			pp64_refresh_rows(
 				accumulator.pp3wide64_accumulation[perspective], active);
 		}
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK) && defined(NNUE_SIMPLE_LOCALPAIR32_R5)
+		accumulator.computed_r5 = true;
+#endif
 	}
 
 	void update_pp3wide64(const Position& pos) const {
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+		++StackCounters().r5_one_ply;
+#endif
 		const auto& state = *pos.state();
 		const auto& previous = state.previous->accumulator;
 		auto& current = pos.state()->accumulator;
@@ -989,6 +1555,10 @@ class FeatureTransformer {
 				king_moved;
 #endif
 			if (king_moved && mirror_boundary_crossed) {
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+				++StackCounters().r5_full_rebuild;
+				++StackCounters().r5_mirror_rebuild;
+#endif
 				Pp64Feature active;
 #if defined(NNUE_SIMPLE_LOCALPAIR64_ANY) \
 	&& !defined(NNUE_LOCALPAIR64_DIRTY_SCAN_REFERENCE)
@@ -1037,6 +1607,10 @@ class FeatureTransformer {
 #endif
 			}
 			pp64_apply_diff(destination, removed, added);
+#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+			StackCounters().r5_rows_applied.fetch_add(
+			  removed.count + added.count, std::memory_order_relaxed);
+#endif
 		}
 	}
 #endif
@@ -1645,6 +2219,14 @@ class FeatureTransformer {
 	bool update_accumulator_stack(const Position& pos) const {
 		auto* current = pos.state();
 		if (current->accumulator.computed_accumulation) {
+#if NNUE_SIMPLE_R5_REPLAY == 2 && defined(NNUE_SIMPLE_LOCALPAIR32_R5)
+			// A fused chain intentionally leaves intermediate R5 entries lazy,
+			// although their HalfKA entries may already be materialized.
+			if (!current->accumulator.computed_r5) {
+				const std::array<StateInfo*, MAX_PLY + 1> empty_chain{};
+				pp64_update_stack_chain(pos, empty_chain, 0);
+			}
+#endif
 	#if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
 			auto& counters = StackCounters();
 			++counters.computed_hits;
@@ -1668,6 +2250,15 @@ class FeatureTransformer {
 			return false;
 		}
 
+#if defined(NNUE_SIMPLE_LOCALPAIR32_R5) \
+ && defined(NNUE_LOCALPAIR_DIRTY_FASTPATH)
+		// R5 owns an independent Worker-stack payload.  Materialize its saved
+		// endpoint chain before Main marks any destination as computed.  A king
+		// mirror crossing refreshes only that R5 perspective at the crossing;
+		// the remaining suffix remains incremental.
+		pp64_update_stack_chain(pos, chain, length);
+#endif
+
 		// A king move changes the HalfKA_HM2 row coordinate.  Phase A keeps the
 		// safe existing contract: refresh the requested leaf rather than trying
 		// to reconstruct an intermediate board.
@@ -1679,7 +2270,14 @@ class FeatureTransformer {
 				++counters.refresh_in_chain;
 				++counters.scratch_refresh;
 	#endif
-				refresh_accumulator(pos);
+				refresh_accumulator(pos,
+#if defined(NNUE_SIMPLE_LOCALPAIR32_R5) \
+ && defined(NNUE_LOCALPAIR_DIRTY_FASTPATH)
+				                    false
+#else
+				                    true
+#endif
+				);
 				return true;
 			}
 		}
@@ -1717,7 +2315,8 @@ class FeatureTransformer {
 	// accumulator destination so the same cache algorithm can target either a
 	// legacy StateInfo payload or a Worker-stack entry.
 	void refresh_accumulator_with_finny_cache(
-		const Position& pos, Accumulator& accumulator) const {
+		const Position& pos, Accumulator& accumulator,
+		bool refresh_pair = true) const {
 #if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
 		++StackCounters().finny_refresh;
 #endif
@@ -1766,7 +2365,7 @@ class FeatureTransformer {
 #if defined(NNUE_SIMPLE_PP3WIDE)
 		refresh_pp3wide(pos);
 #elif defined(NNUE_SIMPLE_PAIR64_ANY)
-		refresh_pp3wide64(pos);
+		if (refresh_pair) refresh_pp3wide64(pos);
 #endif
 
 		accumulator.computed_accumulation = true;
@@ -1779,11 +2378,13 @@ class FeatureTransformer {
 
 	// Calculate cumulative value without using difference calculation
 	// 差分計算を用いずに累積値を計算する
-	void refresh_accumulator(const Position& pos) const {
+	void refresh_accumulator(const Position& pos,
+	                         bool refresh_pair = true) const {
 #if defined(USE_FINNY_TABLES)
 		if constexpr (kUseFinnyTables) {
 			refresh_accumulator_with_finny_cache(
-				pos, const_cast<Accumulator&>(pos.state()->accumulator));
+				pos, const_cast<Accumulator&>(pos.state()->accumulator),
+				refresh_pair);
 			return;
 		}
 #endif
@@ -1829,7 +2430,7 @@ class FeatureTransformer {
 #if defined(NNUE_SIMPLE_PP3WIDE)
 		refresh_pp3wide(pos);
 #elif defined(NNUE_SIMPLE_PAIR64_ANY)
-		refresh_pp3wide64(pos);
+		if (refresh_pair) refresh_pp3wide64(pos);
 #endif
 
 		accumulator.computed_accumulation = true;

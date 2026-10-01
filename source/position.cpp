@@ -2097,13 +2097,21 @@ void Position::do_move_impl(Move m, StateInfo& newSt, bool givesCheck, const T* 
     // The destination payload is bound by the owning Worker after do_move().
     // Non-search/test callers lazily obtain thread-local scratch storage.
     st->accumulator.accumulation = nullptr;
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
+    st->accumulator.pp3wide64_accumulation = nullptr;
+#endif
     st->accumulator.stack_computed = nullptr;
 #if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
     st->accumulator.stack_score_valid = false;
     st->accumulator.stack_cached_score = VALUE_ZERO;
+    st->accumulator.r5_mirror_builds[BLACK] = 0;
+    st->accumulator.r5_mirror_builds[WHITE] = 0;
 #endif
 #endif
     st->accumulator.computed_accumulation = false;
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK) && defined(NNUE_SIMPLE_LOCALPAIR32_R5)
+    st->accumulator.computed_r5 = false;
+#endif
     st->accumulator.computed_score        = false;
 #if defined(EVAL_HASH_VERIFY_HITS)
     st->accumulator.debug_accumulator_source = 0;

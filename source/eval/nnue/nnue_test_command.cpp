@@ -2640,7 +2640,8 @@ void TestFeatures(Position& pos) {
 #if !defined(NNUE_HALFKAHM2_SIMPLE)
 bool TestAccumulatorDelayedMaterializationPermanent(Position& pos);
 #endif
-#if defined(NNUE_SIMPLE_PAIR64_ANY)
+#if defined(NNUE_SIMPLE_PAIR64_ANY) \
+ && !defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
 bool TestPp3WideDelayedMaterializationPermanent(Position& pos);
 #endif
 #if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
@@ -2670,11 +2671,19 @@ void TestAccumulator(Position& pos) {
 #if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
   struct AccumulatorSnapshot {
     SimpleMainAccumulator accumulation{};
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
+    std::int16_t pp3wide64_accumulation[2][kSimplePairDimensions]{};
+#endif
   };
   auto snapshot_accumulator = [](const Accumulator& source) {
     AccumulatorSnapshot snapshot;
     std::memcpy(snapshot.accumulation, source.accumulation,
                 sizeof(snapshot.accumulation));
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
+    std::memcpy(snapshot.pp3wide64_accumulation,
+                source.pp3wide64_accumulation,
+                sizeof(snapshot.pp3wide64_accumulation));
+#endif
     return snapshot;
   };
 #else
@@ -2906,7 +2915,8 @@ void TestAccumulator(Position& pos) {
     std::cout << "NNUE delayed-materialization regression suite: failed."
               << std::endl;
 #endif
-#if defined(NNUE_SIMPLE_PAIR64_ANY)
+#if defined(NNUE_SIMPLE_PAIR64_ANY) \
+ && !defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
   if (!TestPp3WideDelayedMaterializationPermanent(pos))
     std::cout << "Pair64 delayed-materialization regression suite: failed."
               << std::endl;
@@ -2922,6 +2932,22 @@ void TestAccumulator(Position& pos) {
 bool TestSimpleAccumulatorStackPhaseA(Position& pos) {
   using LaneArray = std::array<std::int16_t,
       2 * kRefreshTriggers.size() * kTransformedFeatureDimensions>;
+  struct CapturedLanes {
+    LaneArray main{};
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
+    std::array<std::int16_t, 2 * kSimplePairDimensions> pair{};
+#endif
+    bool operator==(const CapturedLanes& other) const {
+      return main == other.main
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
+          && pair == other.pair
+#endif
+          ;
+    }
+    bool operator!=(const CapturedLanes& other) const {
+      return !(*this == other);
+    }
+  };
   struct Result {
     bool accumulator = false;
     bool transformed = false;
@@ -2931,18 +2957,23 @@ bool TestSimpleAccumulatorStackPhaseA(Position& pos) {
   };
 
   auto capture = [](const Accumulator& source) {
-    LaneArray result{};
-    std::memcpy(result.data(), source.accumulation, sizeof(result));
+    CapturedLanes result{};
+    std::memcpy(result.main.data(), source.accumulation,
+                sizeof(result.main));
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
+    std::memcpy(result.pair.data(), source.pp3wide64_accumulation,
+                sizeof(result.pair));
+#endif
     return result;
   };
-  auto compare_leaf = [&](const LaneArray& incremental, const Value score) {
+  auto compare_leaf = [&](const CapturedLanes& incremental, const Value score) {
     alignas(kCacheLineSize) std::array<TransformedFeatureType,
         FeatureTransformer::kBufferSize> incremental_transformed{};
     feature_transformer->Transform(pos, incremental_transformed.data(), false);
     feature_transformer->TestRefreshAccumulatorFromScratch(pos);
     pos.state()->accumulator.computed_score = false;
     const Value scratch_score = ::YaneuraOu::Eval::evaluate(pos);
-    const LaneArray scratch = capture(pos.state()->accumulator);
+    const CapturedLanes scratch = capture(pos.state()->accumulator);
     alignas(kCacheLineSize) std::array<TransformedFeatureType,
         FeatureTransformer::kBufferSize> scratch_transformed{};
     feature_transformer->Transform(pos, scratch_transformed.data(), false);
@@ -2971,7 +3002,9 @@ bool TestSimpleAccumulatorStackPhaseA(Position& pos) {
       {"4 multi-ply deferred dirty chain"},
       {"5 Finny refresh/cache restore"},
       {"3-ply forward"}, {"4-ply forward"}, {"8-ply forward"},
-      {"3-ply king refresh"}, {"sibling do/undo"}, {"null move"}};
+      {"3-ply king refresh"}, {"sibling do/undo"}, {"null move"},
+      {"R5 mirror crossing inside deferred chain"},
+      {"R5 cached mirror boundary across sibling reuse"}};
 
 #if defined(USE_EVAL_HASH)
   const bool evalhash_chain_available = Eval::EvalHash_IsInitialized();
@@ -3005,7 +3038,7 @@ bool TestSimpleAccumulatorStackPhaseA(Position& pos) {
     }
     if (complete) {
       const Value score = ::YaneuraOu::Eval::evaluate(pos);
-      const LaneArray incremental = capture(pos.state()->accumulator);
+      const CapturedLanes incremental = capture(pos.state()->accumulator);
       const Result result = compare_leaf(incremental, score);
       ++test.tested;
       if (!result.accumulator || !result.transformed || !result.score)
@@ -3024,6 +3057,101 @@ bool TestSimpleAccumulatorStackPhaseA(Position& pos) {
   run_chain(cases[6], 4, false);
   run_chain(cases[7], 8, false);
   run_chain(cases[8], 3, true);
+
+#if defined(NNUE_SIMPLE_LOCALPAIR32_R5)
+  // The third move crosses BLACK's mirror boundary.  The fourth move forces
+  // a suffix update after the R5-only refresh.  The adjacent silver/gold make
+  // the R5 accumulator nonzero throughout the test.
+  {
+    StateInfo root;
+    std::array<StateInfo, 4> states{};
+    std::array<Move, 4> moves{};
+    constexpr const char* usi[] = {"5i5h", "5a5b", "5h6h", "5b5c"};
+    pos.set("4k4/9/9/9/9/9/3SG4/9/4K4 b - 1", &root);
+    feature_transformer->TestRefreshAccumulatorFromScratch(pos);
+    auto stack = std::make_unique<SimpleAccumulatorStack>();
+    stack->reset(root.accumulator, &root);
+    int pushed = 0;
+    for (int ply = 0; ply < 4; ++ply) {
+      moves[ply] = USIEngine::to_move(pos, usi[ply]);
+      if (moves[ply] == Move::none()) break;
+      pos.do_move(moves[ply], states[ply]);
+      stack->push(states[ply].accumulator, &states[ply]);
+      ++pushed;
+    }
+    if (pushed == 4) {
+      const Value score = ::YaneuraOu::Eval::evaluate(pos);
+      const CapturedLanes incremental = capture(pos.state()->accumulator);
+      const Result result = compare_leaf(incremental, score);
+      ++cases[11].tested;
+      if (!result.accumulator || !result.transformed || !result.score
+          || !(states[2].localpairDirty.flags & 2))
+        ++cases[11].mismatches;
+    }
+    while (pushed-- > 0) {
+      const StateInfo* child = pos.state();
+      pos.undo_move(moves[pushed]);
+      stack->pop(child);
+    }
+  }
+#if NNUE_SIMPLE_R5_REPLAY >= 1
+  // Materialize a descendant across the mirror crossing, return to the
+  // R5-only cached boundary and request a different sibling.  Main remains
+  // lazy at the boundary, so an accidental shared validity bit must fail.
+  {
+    StateInfo root;
+    std::array<StateInfo, 3> prefix_states{};
+    StateInfo child_a, child_b;
+    std::array<Move, 3> prefix_moves{};
+    constexpr const char* usi[] = {"5i5h", "5a5b", "5h6h"};
+    pos.set("4k4/9/9/9/9/9/3SG4/9/4K4 b - 1", &root);
+    feature_transformer->TestRefreshAccumulatorFromScratch(pos);
+    auto stack = std::make_unique<SimpleAccumulatorStack>();
+    stack->reset(root.accumulator, &root);
+    bool complete = true;
+    for (int ply = 0; ply < 3; ++ply) {
+      prefix_moves[ply] = USIEngine::to_move(pos, usi[ply]);
+      if (prefix_moves[ply] == Move::none()) { complete = false; break; }
+      pos.do_move(prefix_moves[ply], prefix_states[ply]);
+      stack->push(prefix_states[ply].accumulator, &prefix_states[ply]);
+    }
+    if (complete) {
+      std::vector<Move> choices;
+      for (const Move move : MoveList<LEGAL_ALL>(pos)) {
+        choices.push_back(move);
+        if (choices.size() == 2) break;
+      }
+      if (choices.size() == 2) {
+        pos.do_move(choices[0], child_a);
+        stack->push(child_a.accumulator, &child_a);
+        (void)::YaneuraOu::Eval::evaluate(pos);
+        const StateInfo* child = pos.state();
+        pos.undo_move(choices[0]);
+        stack->pop(child);
+        const bool partial = prefix_states[2].accumulator.computed_r5
+                          && !prefix_states[2].accumulator.computed_accumulation;
+        pos.do_move(choices[1], child_b);
+        stack->push(child_b.accumulator, &child_b);
+        const Value score = ::YaneuraOu::Eval::evaluate(pos);
+        const CapturedLanes incremental = capture(pos.state()->accumulator);
+        const Result result = compare_leaf(incremental, score);
+        ++cases[12].tested;
+        if (!partial || !result.accumulator || !result.transformed
+            || !result.score)
+          ++cases[12].mismatches;
+        child = pos.state();
+        pos.undo_move(choices[1]);
+        stack->pop(child);
+      }
+    }
+    for (int ply = 3; complete && ply-- > 0;) {
+      const StateInfo* child = pos.state();
+      pos.undo_move(prefix_moves[ply]);
+      stack->pop(child);
+    }
+  }
+#endif
+#endif
 
   // Leave a parent unmaterialized while one or more temporary children are
   // pushed and popped, then materialize the parent.
@@ -3051,7 +3179,7 @@ bool TestSimpleAccumulatorStackPhaseA(Position& pos) {
         stack->pop(child);
       }
       const Value score = ::YaneuraOu::Eval::evaluate(pos);
-      const LaneArray incremental = capture(pos.state()->accumulator);
+      const CapturedLanes incremental = capture(pos.state()->accumulator);
       const Result result = compare_leaf(incremental, score);
       auto& test = cases[variant + 1];
       ++test.tested;
@@ -3070,9 +3198,9 @@ bool TestSimpleAccumulatorStackPhaseA(Position& pos) {
 #else
     feature_transformer->ForceRefreshAccumulator(pos);
 #endif
-    const LaneArray finny = capture(pos.state()->accumulator);
+    const CapturedLanes finny = capture(pos.state()->accumulator);
     feature_transformer->TestRefreshAccumulatorFromScratch(pos);
-    const LaneArray scratch = capture(pos.state()->accumulator);
+    const CapturedLanes scratch = capture(pos.state()->accumulator);
     ++cases[4].tested;
     if (finny != scratch) ++cases[4].mismatches;
   }
@@ -3100,7 +3228,7 @@ bool TestSimpleAccumulatorStackPhaseA(Position& pos) {
       pos.do_move(root_moves[1], child_b);
       stack->push(child_b.accumulator, &child_b);
       const Value score = ::YaneuraOu::Eval::evaluate(pos);
-      const LaneArray incremental = capture(pos.state()->accumulator);
+      const CapturedLanes incremental = capture(pos.state()->accumulator);
       const Result result = compare_leaf(incremental, score);
       ++cases[9].tested;
       if (!result.accumulator || !result.transformed || !result.score)
@@ -3190,8 +3318,12 @@ bool TestSimpleAccumulatorStackPhaseA(Position& pos) {
         if (ply < warm_hits)
           hit_contract &= !pos.state()->accumulator.computed_accumulation
                        && !pos.state()->accumulator.computed_score;
+#if defined(NNUE_SIMPLE_LOCALPAIR32_R5)
+        if (ply < warm_hits)
+          hit_contract &= !pos.state()->accumulator.computed_r5;
+#endif
       }
-      const LaneArray incremental = capture(pos.state()->accumulator);
+      const CapturedLanes incremental = capture(pos.state()->accumulator);
       const bool final_materialized =
         pos.state()->accumulator.computed_accumulation;
       Eval::EvalHash_SetEnabled(false);
@@ -3216,9 +3348,15 @@ bool TestSimpleAccumulatorStackPhaseA(Position& pos) {
   bool passed = true;
   std::cout << "[Simple AccumulatorStack Phase-A regression]" << std::endl;
   for (const auto& test : cases) {
-    passed &= test.tested != 0 && test.mismatches == 0;
+#if defined(NNUE_SIMPLE_LOCALPAIR32_R5)
+    const bool applicable = (&test != &cases[12]) || NNUE_SIMPLE_R5_REPLAY >= 1;
+#else
+    const bool applicable = &test != &cases[11] && &test != &cases[12];
+#endif
+    passed &= (!applicable || test.tested != 0) && test.mismatches == 0;
     std::cout << "  " << test.name << " : "
-              << (test.tested != 0 && test.mismatches == 0 ? "passed" : "failed")
+              << (!applicable ? "not applicable" :
+                  test.tested != 0 && test.mismatches == 0 ? "passed" : "failed")
               << ", tested positions = " << test.tested
               << ", mismatch count = " << test.mismatches << std::endl;
   }
@@ -3239,7 +3377,8 @@ bool TestSimpleAccumulatorStackPhaseA(Position& pos) {
 }
 #endif
 
-#if defined(NNUE_SIMPLE_PAIR64_ANY)
+#if defined(NNUE_SIMPLE_PAIR64_ANY) \
+ && !defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
 bool TestPp3WideDelayedMaterializationPermanent(Position& pos) {
   struct Stats { const char* name; int tested = 0; int mismatches = 0; } stats[] = {
       {"1 immediate evaluate"},
@@ -15149,6 +15288,37 @@ void TestCommand(IEngine& engine, std::istream& stream) {
                 << " legacy_parent_uncomputed="
                 << c.legacy_parent_uncomputed.load()
                 << " evalhash_multi_ply=" << c.evalhash_multi_ply.load()
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
+                << " r5_full_rebuild=" << c.r5_full_rebuild.load()
+                << " r5_mirror_rebuild=" << c.r5_mirror_rebuild.load()
+                << " r5_one_ply=" << c.r5_one_ply.load()
+                << " r5_multi_ply=" << c.r5_multi_ply.load()
+                << " r5_rows_applied=" << c.r5_rows_applied.load()
+                << " r5_replay_segments_black=" << c.r5_replay_segments[BLACK].load()
+                << " r5_replay_segments_white=" << c.r5_replay_segments[WHITE].load()
+                << " r5_replay_original_black=" << c.r5_replay_original[BLACK].load()
+                << " r5_replay_original_white=" << c.r5_replay_original[WHITE].load()
+                << " r5_replay_removed_black=" << c.r5_replay_removed[BLACK].load()
+                << " r5_replay_removed_white=" << c.r5_replay_removed[WHITE].load()
+                << " r5_replay_added_black=" << c.r5_replay_added[BLACK].load()
+                << " r5_replay_added_white=" << c.r5_replay_added[WHITE].load()
+                << " r5_replay_net_black=" << c.r5_replay_net[BLACK].load()
+                << " r5_replay_net_white=" << c.r5_replay_net[WHITE].load()
+                << " r5_replay_distinct_black=" << c.r5_replay_distinct[BLACK].load()
+                << " r5_replay_distinct_white=" << c.r5_replay_distinct[WHITE].load()
+                << " r5_replay_unique_black=" << c.r5_replay_unique[BLACK].load()
+                << " r5_replay_unique_white=" << c.r5_replay_unique[WHITE].load()
+                << " r5_cancel_remove_add_black=" << c.r5_cancel_remove_add[BLACK].load()
+                << " r5_cancel_remove_add_white=" << c.r5_cancel_remove_add[WHITE].load()
+                << " r5_cancel_add_remove_black=" << c.r5_cancel_add_remove[BLACK].load()
+                << " r5_cancel_add_remove_white=" << c.r5_cancel_add_remove[WHITE].load()
+                << " r5_fusion_fallback=" << c.r5_fusion_fallback.load()
+                << " r5_mirror_unique=" << c.r5_mirror_unique.load()
+                << " r5_mirror_repeat=" << c.r5_mirror_repeat.load()
+                << " r5_boundary_cache_hit=" << c.r5_boundary_cache_hit.load()
+                << " r5_chain_length_total=" << c.r5_chain_length_total.load()
+                << " r5_chain_length_max=" << c.r5_chain_length_max.load()
+#endif
                 << " max_dirty_chain=" << c.max_dirty_chain.load()
                 << " mean_multi_dirty_chain="
                 << (multi_count ? double(dirty_total) / multi_count : 0.0)
@@ -15203,6 +15373,14 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     std::uint64_t repeats = 1000000;
     stream >> repeats;
     TestPp3Wide64Microbench(position(), repeats);
+#endif
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK) && defined(NNUE_SIMPLE_LOCALPAIR32_R5)
+  } else if (sub_command == "r5_replay_fusion") {
+    const unsigned mismatches = feature_transformer
+      ? feature_transformer->TestR5ReplayFusionRows() : 1;
+    std::cout << "R5_REPLAY_FUSION_TEST cases=5 mismatch_count="
+              << mismatches << (mismatches ? " failed" : " passed")
+              << std::endl;
 #endif
 #if defined(NNUE_SIMPLE_PP3WIDE_ANY)
   } else if (sub_command == "pp3wide_features") {

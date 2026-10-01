@@ -203,30 +203,51 @@ ifeq ($(NNUE_SIMPLE_BUCKET),PHASE9)
 else ifeq ($(NNUE_SIMPLE_BUCKET),KINGFREE_TREE)
 	CPPFLAGS += -DNNUE_SIMPLE_BUCKET_KINGFREE_TREE
 else ifneq ($(NNUE_SIMPLE_BUCKET),K3K3)
-	$(error NNUE_SIMPLE_BUCKET must be K3K3, PHASE9, or KINGFREE_TREE)
+$(error NNUE_SIMPLE_BUCKET must be K3K3, PHASE9, or KINGFREE_TREE)
 endif
 
-# Experiment 136: Simple HalfKA_HM2-only hybrid accumulator stack prototype.
-# This is deliberately opt-in.  It is incompatible with the optional Simple
-# side branches and non-K3K3 routers in Phase A.
+# Simple production policy: baseline uses Stack=NO.  R5-D2-32 + K3K3 may
+# explicitly opt in to Stack=YES with R5 replay=1 (Experiment 142).
+# Other side branches and non-K3K3 routers remain outside this contract.
 NNUE_SIMPLE_ACCUMULATOR_STACK ?= NO
 NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS ?= NO
+# 0=legacy Stack replay, 1=R5 intermediate reuse (production R5 candidate).
+# 2=experimental row fusion; slower in Experiment 141, not recommended.
+NNUE_SIMPLE_R5_REPLAY ?= 0
+ifneq ($(filter $(NNUE_SIMPLE_R5_REPLAY),0 1 2),$(NNUE_SIMPLE_R5_REPLAY))
+$(error NNUE_SIMPLE_R5_REPLAY must be 0, 1, or 2)
+endif
+ifneq ($(NNUE_SIMPLE_R5_REPLAY),0)
+ifneq ($(NNUE_SIMPLE_ACCUMULATOR_STACK),YES)
+$(error NNUE_SIMPLE_R5_REPLAY=1/2 requires NNUE_SIMPLE_ACCUMULATOR_STACK=YES)
+endif
+ifneq ($(NNUE_SIMPLE_LOCAL_PAIR),LOCALPAIR32_R5)
+$(error NNUE_SIMPLE_R5_REPLAY=1/2 requires NNUE_SIMPLE_LOCAL_PAIR=LOCALPAIR32_R5)
+endif
+endif
 ifeq ($(NNUE_SIMPLE_ACCUMULATOR_STACK),YES)
 	CPPFLAGS += -DNNUE_SIMPLE_ACCUMULATOR_STACK
-	ifneq ($(NNUE_SIMPLE_LOCAL_PAIR),NONE)
-		$(error NNUE_SIMPLE_ACCUMULATOR_STACK Phase A requires NNUE_SIMPLE_LOCAL_PAIR=NONE)
-	endif
-	ifneq ($(NNUE_SIMPLE_BUCKET),K3K3)
-		$(error NNUE_SIMPLE_ACCUMULATOR_STACK Phase A requires NNUE_SIMPLE_BUCKET=K3K3)
-	endif
+	CPPFLAGS += -DNNUE_SIMPLE_R5_REPLAY=$(NNUE_SIMPLE_R5_REPLAY)
+ifneq ($(YANEURAOU_EDITION),YANEURAOU_ENGINE_NNUE_HALFKAHM2_SIMPLE_1536)
+$(error NNUE_SIMPLE_ACCUMULATOR_STACK is supported only for YANEURAOU_ENGINE_NNUE_HALFKAHM2_SIMPLE_1536)
+endif
+ifneq ($(NNUE_SIMPLE_LOCAL_PAIR),NONE)
+ifneq ($(NNUE_SIMPLE_LOCAL_PAIR),LOCALPAIR32_R5)
+$(error NNUE_SIMPLE_ACCUMULATOR_STACK requires NNUE_SIMPLE_LOCAL_PAIR=NONE or LOCALPAIR32_R5)
+endif
+endif
+ifneq ($(NNUE_SIMPLE_BUCKET),K3K3)
+$(error NNUE_SIMPLE_ACCUMULATOR_STACK requires NNUE_SIMPLE_BUCKET=K3K3)
+endif
 else ifneq ($(NNUE_SIMPLE_ACCUMULATOR_STACK),NO)
-	$(error NNUE_SIMPLE_ACCUMULATOR_STACK must be YES or NO)
+$(error NNUE_SIMPLE_ACCUMULATOR_STACK must be YES or NO)
 endif
 
 ifeq ($(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS),YES)
 	CPPFLAGS += -DNNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS
+	CPPFLAGS += -DMEASURE_EVAL_HASH_BENCHMARK
 else ifneq ($(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS),NO)
-	$(error NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS must be YES or NO)
+$(error NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS must be YES or NO)
 endif
 
 # Experiment 127: runtime-only dirty generation fast path for the two R5-32
@@ -239,6 +260,13 @@ ifneq ($(filter $(NNUE_SIMPLE_LOCAL_PAIR),LOCALPAIR32_R5 LOCALPAIR32_R5_D1),)
 		CPPFLAGS += -DNNUE_LOCALPAIR_DIRTY_FASTPATH
 	else ifneq ($(NNUE_LOCALPAIR_DIRTY_FASTPATH),NO)
 		$(error NNUE_LOCALPAIR_DIRTY_FASTPATH must be YES or NO)
+	endif
+endif
+ifeq ($(NNUE_SIMPLE_ACCUMULATOR_STACK),YES)
+	ifeq ($(NNUE_SIMPLE_LOCAL_PAIR),LOCALPAIR32_R5)
+		ifneq ($(NNUE_LOCALPAIR_DIRTY_FASTPATH),YES)
+			$(error R5 AccumulatorStack requires NNUE_LOCALPAIR_DIRTY_FASTPATH=YES)
+		endif
 	endif
 endif
 

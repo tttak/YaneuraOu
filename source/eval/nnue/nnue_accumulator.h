@@ -18,6 +18,17 @@
 namespace YaneuraOu {
 namespace Eval::NNUE {
 
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
+// The relation machinery is shared by the 64d and 32d LocalPair variants;
+// only the compact accumulator/transform width differs.
+inline constexpr IndexType kSimplePairDimensions =
+#if defined(NNUE_SIMPLE_LOCALPAIR32_R5)
+    32;
+#else
+    64;
+#endif
+#endif
+
 #if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
 #if !defined(NNUE_HALFKAHM2_SIMPLE)
 #error "NNUE_SIMPLE_ACCUMULATOR_STACK is Simple HalfKA_HM2-only"
@@ -31,18 +42,10 @@ using SimpleMainAccumulator = std::int16_t
 // are not carried into the per-worker stack.
 struct alignas(64) SimpleAccumulatorPayload {
   SimpleMainAccumulator accumulation{};
-};
-#endif
-
 #if defined(NNUE_SIMPLE_PAIR64_ANY)
-// The relation machinery is shared by the 64d and 32d LocalPair variants;
-// only the compact accumulator/transform width differs.
-inline constexpr IndexType kSimplePairDimensions =
-#if defined(NNUE_SIMPLE_LOCALPAIR32_R5)
-    32;
-#else
-    64;
+  alignas(64) std::int16_t pp3wide64_accumulation[2][kSimplePairDimensions]{};
 #endif
+};
 #endif
 
 // 入力特徴量をアフィン変換した結果を保持するクラス
@@ -63,8 +66,12 @@ struct alignas(64) Accumulator {
   // Experiment 121: PP3WidePL has an independent compact accumulator.  It is
   // materialized together with the ordinary FT accumulator, so the existing
   // computed_accumulation flag is the single validity bit for both paths.
+#if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+  std::int16_t (*pp3wide64_accumulation)[kSimplePairDimensions] = nullptr;
+#else
   alignas(64) std::int16_t
       pp3wide64_accumulation[2][kSimplePairDimensions];
+#endif
 #endif
 
 
@@ -85,12 +92,18 @@ struct alignas(64) Accumulator {
   bool computed_accumulation = false;
   bool computed_score = false;
 #if defined(NNUE_SIMPLE_ACCUMULATOR_STACK)
+#if defined(NNUE_SIMPLE_LOCALPAIR32_R5)
+  // R5 may be cached at a mirror-boundary entry while HalfKA is still lazy.
+  // This bit is tied to the StateInfo/Worker slot identity, never to the score.
+  bool computed_r5 = false;
+#endif
   // Captured at the destination state.  It lets Phase A replay an arbitrary
   // HalfKA_HM2 dirty suffix without consulting the leaf Position's king
   // squares for older transitions.
   Square stack_king_square[COLOR_NB] = {SQ_NONE, SQ_NONE};
   bool* stack_computed = nullptr;
 #if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
+  std::uint8_t r5_mirror_builds[COLOR_NB]{};
   // Diagnostic provenance only.  Production score validity lives in the
   // EvalHash entry and is deliberately independent from FT validity.
   bool stack_score_valid = false;
@@ -149,6 +162,9 @@ inline SimpleAccumulatorPayload& EnsureSimpleFallbackPayload(Accumulator& accumu
   for (auto& slot : slots)
     if (slot.owner == &accumulator) {
       accumulator.accumulation = slot.payload.accumulation;
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
+      accumulator.pp3wide64_accumulation = slot.payload.pp3wide64_accumulation;
+#endif
       return slot.payload;
     }
 
@@ -156,6 +172,9 @@ inline SimpleAccumulatorPayload& EnsureSimpleFallbackPayload(Accumulator& accumu
     if (!slot.owner) {
       slot.owner = &accumulator;
       accumulator.accumulation = slot.payload.accumulation;
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
+      accumulator.pp3wide64_accumulation = slot.payload.pp3wide64_accumulation;
+#endif
       return slot.payload;
     }
 
@@ -166,6 +185,9 @@ inline SimpleAccumulatorPayload& EnsureSimpleFallbackPayload(Accumulator& accumu
                      % slots.size()];
   slot.owner = &accumulator;
   accumulator.accumulation = slot.payload.accumulation;
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
+  accumulator.pp3wide64_accumulation = slot.payload.pp3wide64_accumulation;
+#endif
   return slot.payload;
 }
 
@@ -189,6 +211,12 @@ class SimpleAccumulatorStack {
     if (root.accumulation)
       std::memcpy(entry.payload.accumulation, root.accumulation,
                   sizeof(entry.payload.accumulation));
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
+    if (root.pp3wide64_accumulation)
+      std::memcpy(entry.payload.pp3wide64_accumulation,
+                  root.pp3wide64_accumulation,
+                  sizeof(entry.payload.pp3wide64_accumulation));
+#endif
     entry.state = state;
     entry.computed = root.computed_accumulation;
     entry.king_square[BLACK] = root.stack_king_square[BLACK];
@@ -204,10 +232,15 @@ class SimpleAccumulatorStack {
     entry.king_square[BLACK] = destination.stack_king_square[BLACK];
     entry.king_square[WHITE] = destination.stack_king_square[WHITE];
     destination.computed_accumulation = false;
+#if defined(NNUE_SIMPLE_LOCALPAIR32_R5)
+    destination.computed_r5 = false;
+#endif
     destination.computed_score = false;
 #if defined(NNUE_SIMPLE_ACCUMULATOR_DIAGNOSTICS)
     destination.stack_score_valid = false;
     destination.stack_cached_score = VALUE_ZERO;
+    destination.r5_mirror_builds[BLACK] = 0;
+    destination.r5_mirror_builds[WHITE] = 0;
 #endif
     bind(destination, entry);
   }
@@ -225,6 +258,9 @@ class SimpleAccumulatorStack {
  private:
   static void bind(Accumulator& accumulator, Entry& entry) {
     accumulator.accumulation = entry.payload.accumulation;
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
+    accumulator.pp3wide64_accumulation = entry.payload.pp3wide64_accumulation;
+#endif
     accumulator.stack_computed = &entry.computed;
     accumulator.stack_king_square[BLACK] = entry.king_square[BLACK];
     accumulator.stack_king_square[WHITE] = entry.king_square[WHITE];
