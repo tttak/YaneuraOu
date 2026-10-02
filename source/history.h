@@ -15,6 +15,7 @@
 #include "memory.h"
 #include "misc.h"
 #include "position.h"
+#include "engine/yaneuraou-engine/quiet_malus_diagnostics.h"
 
 namespace YaneuraOu {
 
@@ -97,6 +98,9 @@ struct StatsEntry {
 
         T   val          = *this;
         *this            = val + clampedBonus - val * std::abs(clampedBonus) / D;
+#if defined(SEARCH_QUIET_MALUS_DIAGNOSTICS)
+        QuietMalus148::diagnostics.update(bonus, val, T(*this), D);
+#endif
 
         assert(std::abs(T(*this)) <= D);
 

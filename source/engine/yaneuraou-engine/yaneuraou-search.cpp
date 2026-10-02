@@ -21,6 +21,11 @@
 #include <cstring>	// memset()
 
 #include "yaneuraou-search.h"
+#include "quiet_malus_order.h"
+#if defined(SEARCH_QUIET_MALUS_ORDER)
+static_assert(SEARCH_QUIET_MALUS_LAMBDA_Q8 == 0 || SEARCH_QUIET_MALUS_LAMBDA_Q8 == 64,
+              "Experiment 148 supports neutral 0 or lambda=1/4 (64) only");
+#endif
 #include "../../position.h"
 #include "../../thread.h"
 #include "../../misc.h"
@@ -795,6 +800,9 @@ void Search::YaneuraOuWorker::pre_start_searching() {
 }
 
 void Search::YaneuraOuWorker::start_searching() {
+#if defined(SEARCH_QUIET_MALUS_DIAGNOSTICS)
+    QuietMalus148::diagnostics = {};
+#endif
 
 #if defined(USE_SFNN)
     // 探索の初回evaluate()では局面の差分更新ができないので
@@ -1227,6 +1235,17 @@ SKIP_SEARCH:
 
 #endif
 
+#if defined(SEARCH_QUIET_MALUS_DIAGNOSTICS)
+    QuietMalus148::diagnostics.print(); // Main worker only; use 1T diagnostics.
+    uint64_t historyHash=1469598103934665603ULL;
+    QuietMalus148::hash_table(historyHash,mainHistory);
+    QuietMalus148::hash_table(historyHash,lowPlyHistory);
+    QuietMalus148::hash_table(historyHash,continuationHistory);
+    QuietMalus148::hash_table(historyHash,captureHistory);
+    for(size_t i=0;i<sharedHistory.pawnHistory.get_size();++i)
+        QuietMalus148::hash_table(historyHash,sharedHistory.pawnHistory[i]);
+    std::cout << "info string QM148 final_history_checksum " << historyHash << '\n';
+#endif
     main_manager()->updates.onBestmove(bestmove, ponder);
 }
 
@@ -2343,6 +2362,9 @@ Value YaneuraOuWorker::search(Position& pos, Stack* ss, Value alpha, Value beta,
 
     SearchedList capturesSearched;
     SearchedList quietsSearched;
+#if defined(SEARCH_QUIET_MALUS_DIAGNOSTICS)
+    int diagnosticSearchedMoves = 0, diagnosticSearchedQuiets = 0;
+#endif
 
 	// -----------------------
     // Step 1. Initialize node
@@ -3795,8 +3817,12 @@ moves_loop:  // When in check, search starts here
                 // Continuation history based pruning
                 // Continuation historyに基づいた枝刈り(historyの値が悪いものに関してはskip)
 
-                if (history < -4312 * depth)
+                if (history < -4312 * depth) {
+#if defined(SEARCH_QUIET_MALUS_DIAGNOSTICS)
+                    ++QuietMalus148::diagnostics.history_pruned;
+#endif
                     continue;
+                }
 
                 history += 76 * mainHistory[us][move.raw()] / 32;
 
@@ -3856,8 +3882,12 @@ moves_loop:  // When in check, search starts here
 #if defined(ENABLE_NNUE_FUTILITY_SHADOW)
                     && !nnueForwardFutilityShadow
 #endif
-                    )
+                    ) {
+#if defined(SEARCH_QUIET_MALUS_DIAGNOSTICS)
+                    ++QuietMalus148::diagnostics.see_pruned;
+#endif
                     continue;
+                }
             }
         }
 
@@ -4022,6 +4052,10 @@ moves_loop:  // When in check, search starts here
 
 		// -----------------------
         // Step 16. Make the move
+#if defined(SEARCH_QUIET_MALUS_DIAGNOSTICS)
+        ++diagnosticSearchedMoves;
+        diagnosticSearchedQuiets += !capture;
+#endif
         // Step 16. 指し手で進める
         // -----------------------
 
@@ -4465,6 +4499,10 @@ moves_loop:  // When in check, search starts here
 #endif
 
             ss->reduction = newDepth - d;
+#if defined(SEARCH_QUIET_MALUS_DIAGNOSTICS)
+            const bool diagnosticReducedQuiet = !capture && d < newDepth;
+            QuietMalus148::diagnostics.lmr += diagnosticReducedQuiet;
+#endif
 #if defined(ENABLE_NNUE_DECISION_TRACE)
             const int nnueTraceLmrReduction = static_cast<int>(ss->reduction);
 #endif
@@ -4492,6 +4530,9 @@ moves_loop:  // When in check, search starts here
 
             if (value > alpha)
             {
+#if defined(SEARCH_QUIET_MALUS_DIAGNOSTICS)
+                QuietMalus148::diagnostics.failhigh += diagnosticReducedQuiet;
+#endif
                 // Adjust full-depth search based on LMR results - if the result was
                 // good enough search deeper, if it was bad enough search shallower.
                 // LMRの結果に基づいて完全な探索深さを調整します -
@@ -4503,6 +4544,9 @@ moves_loop:  // When in check, search starts here
                 newDepth += doDeeperSearch - doShallowerSearch;
 
                 if (newDepth > d) {
+#if defined(SEARCH_QUIET_MALUS_DIAGNOSTICS)
+                    QuietMalus148::diagnostics.research += diagnosticReducedQuiet;
+#endif
 #if defined(USE_LAZY_SMP_DUPLICATE_LMR)
                     if (lazySmpDuplicateLmrAdjusted)
                         Search::LazySmpDuplicateLmr::record_research(threadIdx);
@@ -4788,6 +4832,14 @@ moves_loop:  // When in check, search starts here
 					// (*Scaler) Infrequent and small updates scale well
 					// （*Scaler）まれで、小さな更新はスケールする。
 
+#if defined(SEARCH_QUIET_MALUS_DIAGNOSTICS)
+                    auto& qd = QuietMalus148::diagnostics;
+                    ++qd.cutoffs;
+                    qd.first_cutoffs += diagnosticSearchedMoves == 1;
+                    qd.cutoff_moves += diagnosticSearchedMoves;
+                    qd.cutoff_quiets += diagnosticSearchedQuiets;
+                    if (!capture) { ++qd.quiet_cutoffs; qd.quiet_cutoff_ranks += diagnosticSearchedQuiets; }
+#endif
                     ss->cutoffCnt += (extension < 2) || PvNode;
                     ASSERT_LV3(value >= beta);  // Fail high
 
@@ -6008,8 +6060,67 @@ void update_all_stats(const Position&          pos,
         // Decrease stats for all non-best quiet moves
         // 最善でないquietの指し手すべての統計を減少させる
 
+#if defined(SEARCH_QUIET_MALUS_DIAGNOSTICS)
+        auto& qd = QuietMalus148::diagnostics;
+        const int n = quietsSearched.size();
+        ++qd.events; qd.quiet_moves += n;
+        ++qd.histogram[n <= 2 ? n : n <= 4 ? 3 : n <= 8 ? 4 : n <= 16 ? 5 : 6];
+#endif
+#if defined(SEARCH_QUIET_MALUS_ORDER) && SEARCH_QUIET_MALUS_LAMBDA_Q8 != 0
+        int quietRank = 0;
+        const int original = -malus * 1083 / 1024;
         for (Move move : quietsSearched)
+        {
+            // Real search inputs are small (bounded depth/legal move count);
+            // allocator intermediates/return remain int64 for boundary testing.
+            const int requested = int(QuietMalus148::assigned(original, quietsSearched.size(),
+                                                              quietRank, SEARCH_QUIET_MALUS_LAMBDA_Q8));
+#if defined(SEARCH_QUIET_MALUS_DIAGNOSTICS)
+            const bool check = pos.gives_check(move);
+            qd.categories = (!move.is_drop() && !check && !move.is_promote() ? 1 : 0)
+                          | (move.is_drop() ? 2 : 0) | (check ? 4 : 0)
+                          | (check && move.is_drop() ? 8 : 0) | (move.is_promote() ? 16 : 0);
+            for (int k=0;k<5;++k) if(qd.categories & (1<<k)) {
+                ++qd.moves[k];
+                qd.multiplier_sum[k] += original ? double(requested)/original : 1.0;
+                qd.ranks[k] += quietRank+1; qd.assigned_sum[k] += requested;
+                qd.original_sum[k] += original;
+            }
+            qd.table = 0;
+#endif
+            update_quiet_histories(pos, ss, workerThread, move, requested);
+#if defined(SEARCH_QUIET_MALUS_DIAGNOSTICS)
+            qd.table=-1; qd.categories=0;
+#endif
+            ++quietRank;
+        }
+#else
+        // OFF and enabled strength=0 execute the original production loop.
+#if defined(SEARCH_QUIET_MALUS_DIAGNOSTICS)
+        int diagnosticRank=0;
+#endif
+        for (Move move : quietsSearched)
+        {
+#if defined(SEARCH_QUIET_MALUS_DIAGNOSTICS)
+            const bool check = pos.gives_check(move);
+            qd.categories = (!move.is_drop() && !check && !move.is_promote() ? 1 : 0)
+                          | (move.is_drop() ? 2 : 0) | (check ? 4 : 0)
+                          | (check && move.is_drop() ? 8 : 0) | (move.is_promote() ? 16 : 0);
+            for (int k=0;k<5;++k) if(qd.categories & (1<<k)) {
+                ++qd.moves[k];
+                qd.multiplier_sum[k] += 1.0;
+                qd.ranks[k] += diagnosticRank+1; qd.assigned_sum[k] += -malus*1083/1024;
+                qd.original_sum[k] += -malus*1083/1024;
+            }
+            ++diagnosticRank;
+            qd.table=0;
+#endif
             update_quiet_histories(pos, ss, workerThread, move, -malus * 1083 / 1024);
+#if defined(SEARCH_QUIET_MALUS_DIAGNOSTICS)
+            qd.table=-1; qd.categories=0;
+#endif
+        }
+#endif
     }
     else
     {
@@ -6092,14 +6203,27 @@ void update_quiet_histories(
   const Position& pos, Stack* ss, Search::YaneuraOuWorker& workerThread, Move move, int bonus) {
 
     Color us = pos.side_to_move();
+#if defined(SEARCH_QUIET_MALUS_DIAGNOSTICS)
+    const bool diagnosticMalus = QuietMalus148::diagnostics.table >= 0;
+    if (diagnosticMalus) QuietMalus148::diagnostics.table=0;
+#endif
     workerThread.mainHistory[us][move.raw()] << bonus;  // Untuned to prevent duplicate effort
 														// 重複した処理を防ぐためにチューニングされていない
 
+#if defined(SEARCH_QUIET_MALUS_DIAGNOSTICS)
+    if (diagnosticMalus) QuietMalus148::diagnostics.table=1;
+#endif
     if (ss->ply < LOW_PLY_HISTORY_SIZE)
         workerThread.lowPlyHistory[ss->ply][move.raw()] << bonus * 761 / 1024;
 
+#if defined(SEARCH_QUIET_MALUS_DIAGNOSTICS)
+    if (diagnosticMalus) QuietMalus148::diagnostics.table=2;
+#endif
     update_continuation_histories(ss, pos.moved_piece(move), move.to_sq(), bonus * 955 / 1024);
 
+#if defined(SEARCH_QUIET_MALUS_DIAGNOSTICS)
+    if (diagnosticMalus) QuietMalus148::diagnostics.table=3;
+#endif
 	workerThread.sharedHistory.pawn_entry(pos)[pos.moved_piece(move)][move.to_sq()]
       << bonus * (bonus > 0 ? 850 : 550) / 1024;
 }
