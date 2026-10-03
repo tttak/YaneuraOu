@@ -735,14 +735,21 @@ namespace {
         }
 
 #if defined(NNUE_HALFKAHM2_SIMPLE)
+#if !defined(NNUE_SIMPLE_FUSED_TRANSFORM_FC0)
         alignas(kCacheLineSize) TransformedFeatureType
             transformed_features[FeatureTransformer::kBufferSize];
+#endif
 #if defined(MEASURE_EVAL_HASH_BENCHMARK)
         EvalHash_DiagnosticBeforeTransform(pos, refresh);
 #endif
-        feature_transformer->Transform(pos, transformed_features, refresh);
         alignas(kCacheLineSize) char buffer[Network::kBufferSize];
         const int bucket = stack_index_for_nnue(pos);
+#if defined(NNUE_SIMPLE_FUSED_TRANSFORM_FC0)
+        feature_transformer->TransformFc0(pos, network[bucket]->fc_0,
+            reinterpret_cast<Network::Buffer*>(buffer)->fc0, refresh);
+#else
+        feature_transformer->Transform(pos, transformed_features, refresh);
+#endif
 #if defined(USE_EXPERIMENTAL_KP_PROGRESS_FT_PROXY)
         if (bucket == 8)
             NnueKpProgressFtProxy::observe(transformed_features);
@@ -759,10 +766,18 @@ namespace {
 #if defined(NNUE_SIMPLE_PAIR64_ANY)
         alignas(kCacheLineSize) std::int32_t pp3wide64_residual[16];
         feature_transformer->TransformPp3Wide64(pos, pp3wide64_residual);
+#if defined(NNUE_SIMPLE_FUSED_TRANSFORM_FC0)
+        const auto output = network[bucket]->PropagateFromFc0(buffer, pp3wide64_residual);
+#else
         const auto output = network[bucket]->Propagate(
             transformed_features, buffer, pp3wide64_residual);
+#endif
+#else
+#if defined(NNUE_SIMPLE_FUSED_TRANSFORM_FC0)
+        const auto output = network[bucket]->PropagateFromFc0(buffer);
 #else
         const auto output = network[bucket]->Propagate(transformed_features, buffer);
+#endif
 #endif
         auto score = static_cast<Value>(output[0] / FV_SCALE);
         score = Math::clamp(score, -VALUE_MAX_EVAL, VALUE_MAX_EVAL);

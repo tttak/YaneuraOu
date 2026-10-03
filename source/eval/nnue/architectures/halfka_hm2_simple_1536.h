@@ -112,6 +112,19 @@ struct Network {
                                 ) const {
         auto& b = *reinterpret_cast<Buffer*>(storage);
         fc_0.Propagate(input, b.fc0);
+        return PropagateFromFc0(storage
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
+                                , pp3wide64_residual
+#endif
+                                );
+    }
+    // Shared tail for legacy and fused input processing. FC0 is already in b.
+    const OutputType* PropagateFromFc0(char* storage
+#if defined(NNUE_SIMPLE_PAIR64_ANY)
+                                     , const std::int32_t* pp3wide64_residual = nullptr
+#endif
+                                     ) const {
+        auto& b = *reinterpret_cast<Buffer*>(storage);
 #if defined(NNUE_SIMPLE_PAIR64_ANY)
         if (pp3wide64_residual)
             for (IndexType i = 0; i < 16; ++i)

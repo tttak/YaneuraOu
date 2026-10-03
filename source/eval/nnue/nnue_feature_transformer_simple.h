@@ -367,6 +367,42 @@ class FeatureTransformer {
 	}
 
 	// Convert input features
+#if defined(NNUE_HALFKAHM2_SIMPLE) && defined(USE_AVX2) && !defined(USE_AVX512) \
+    && (defined(NNUE_SIMPLE_FUSED_TRANSFORM_FC0) || defined(ENABLE_SIMPLE_FUSED_DIAGNOSTICS))
+#if defined(NNUE_SIMPLE_FUSED_TRANSFORM_FC0) && (defined(NNUE_SMALL_SFNN_FT) || defined(USE_EXPERIMENTAL_KP_PROGRESS_FT_PROXY))
+#error Fused transform requires the ordinary AVX2 packed FT layout and no FT proxy
+#endif
+	// Same physical pack order and doubled-int16 FT contract as Transform().
+	// Capture is a separate diagnostic instantiation; normal evaluation stores
+	// neither the full uint8 array nor a per-chunk temporary array.
+	template<bool Capture = false, class Affine>
+	void TransformFc0(const Position& pos, const Affine& affine,
+	                  std::int32_t* fc0, bool refresh = false,
+	                  OutputType* capture = nullptr) const {
+		EnsureAccumulator(pos, refresh);
+		const auto& accumulation = pos.state()->accumulator.accumulation;
+		const Color perspectives[] = {pos.side_to_move(), ~pos.side_to_move()};
+		const __m256i zero = _mm256_setzero_si256();
+		const __m256i upper = _mm256_set1_epi16(254);
+		const auto* a = reinterpret_cast<const __m256i*>(accumulation[perspectives[0]][0]);
+		const auto* b = a + 48;
+		const auto* other = reinterpret_cast<const __m256i*>(accumulation[perspectives[1]][0]);
+		affine.PropagateFused([&](IndexType chunk) {
+			if (chunk == 24) { a = other; b = other + 48; }
+			const __m256i a0 = _mm256_slli_epi16(_mm256_max_epi16(_mm256_min_epi16(a[0], upper), zero), 7);
+			const __m256i a1 = _mm256_slli_epi16(_mm256_max_epi16(_mm256_min_epi16(a[1], upper), zero), 7);
+			const __m256i b0 = _mm256_min_epi16(b[0], upper);
+			const __m256i b1 = _mm256_min_epi16(b[1], upper);
+			a += 2; b += 2;
+			const __m256i packed = _mm256_packus_epi16(
+				_mm256_mulhi_epi16(a0, b0), _mm256_mulhi_epi16(a1, b1));
+			if constexpr (Capture)
+				_mm256_store_si256(reinterpret_cast<__m256i*>(capture + chunk*32), packed);
+			return packed;
+		}, fc0);
+	}
+#endif
+
 	// 入力特徴量を変換する
 	void Transform(const Position& pos, OutputType* output, bool refresh) const {
 		EnsureAccumulator(pos, refresh);

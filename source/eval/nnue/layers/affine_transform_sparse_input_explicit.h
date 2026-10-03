@@ -515,6 +515,48 @@ public:
         }
 #endif
 
+#if defined(NNUE_HALFKAHM2_SIMPLE) && defined(USE_AVX2) && !defined(USE_AVX512) \
+    && (defined(NNUE_SIMPLE_FUSED_TRANSFORM_FC0) || defined(ENABLE_SIMPLE_FUSED_DIAGNOSTICS))
+        // Producer returns the next 32 transformed bytes in legacy pack order.
+        // Weight layout, bias, sparse skip and modulo-int32 dot contract remain
+        // unchanged. No input array or prepacked copy of the weights is needed.
+        template<class Producer>
+#if defined(__GNUC__) || defined(__clang__)
+        __attribute__((always_inline))
+#endif
+        inline void PropagateFused(Producer&& producer, OutputType* output) const {
+                static_assert(kInputDimensions == 1536 && kOutputDimensions == 16);
+                __m256i lo = _mm256_load_si256(reinterpret_cast<const __m256i*>(biases_));
+                __m256i hi = _mm256_load_si256(reinterpret_cast<const __m256i*>(biases_ + 8));
+                for (IndexType base = 0; base < kInputDimensions / 4; base += 8) {
+                        const __m256i packed = producer(base / 8);
+                        const __m128i lower = _mm256_castsi256_si128(packed);
+                        const __m128i upper = _mm256_extracti128_si256(packed, 1);
+                        FusedLane<0>(lower, base+0, lo, hi);
+                        FusedLane<1>(lower, base+1, lo, hi);
+                        FusedLane<2>(lower, base+2, lo, hi);
+                        FusedLane<3>(lower, base+3, lo, hi);
+                        FusedLane<0>(upper, base+4, lo, hi);
+                        FusedLane<1>(upper, base+5, lo, hi);
+                        FusedLane<2>(upper, base+6, lo, hi);
+                        FusedLane<3>(upper, base+7, lo, hi);
+                }
+                _mm256_store_si256(reinterpret_cast<__m256i*>(output), lo);
+                _mm256_store_si256(reinterpret_cast<__m256i*>(output + 8), hi);
+        }
+    private:
+        template<int Lane>
+        void FusedLane(__m128i packed, IndexType block, __m256i& lo, __m256i& hi) const {
+                if (_mm_extract_epi32(packed, Lane) == 0) return;
+                const __m256i in = _mm256_broadcastd_epi32(
+                  _mm_shuffle_epi32(packed, _MM_SHUFFLE(Lane,Lane,Lane,Lane)));
+                const auto* col = reinterpret_cast<const __m256i*>(weights_ + block*64);
+                Simd::m256_add_dpbusd_epi32(lo, in, col[0]);
+                Simd::m256_add_dpbusd_epi32(hi, in, col[1]);
+        }
+    public:
+#endif
+
    private:
         using BiasType   = OutputType;
         using WeightType = std::int8_t;

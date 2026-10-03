@@ -128,6 +128,9 @@ namespace Eval::NNUE {
 namespace {
 
 #if defined(NNUE_HALFKAHM2_SIMPLE)
+#if defined(ENABLE_SIMPLE_FUSED_DIAGNOSTICS)
+#include "simple_fused_diagnostics.inc"
+#endif
 void DumpHalfKAHM2SimpleFeatures(const Position& pos) {
   using SimpleFeature = Features::HalfKA_hm2<Features::Side::kFriend>;
   constexpr int kFriendBand[9] = {0, 0, 0, 3, 3, 3, 6, 6, 6};
@@ -15243,6 +15246,22 @@ void TestCommand(IEngine& engine, std::istream& stream) {
     TestAccumulatorRegression109(position());
 #endif
 #if defined(NNUE_HALFKAHM2_SIMPLE)
+#if defined(ENABLE_SIMPLE_FUSED_DIAGNOSTICS)
+  } else if (sub_command == "simple_profile153") {
+    std::uint64_t repeats = 100000;
+    stream >> repeats;
+    SimpleProfile153(position(), repeats);
+  } else if (sub_command == "simple_correctness153") {
+    unsigned games = 1000;
+    stream >> games;
+    SimpleCorrectness153(position(), games);
+  } else if (sub_command == "simple_mixed153") {
+    std::uint64_t repeats = 100000;
+    stream >> repeats;
+    SimpleMixed153(position(), repeats);
+  } else if (sub_command == "simple_delayed153") {
+    SimpleDelayed153(position());
+#endif
   } else if (sub_command == "simple_state_size") {
     std::cout << "SIMPLE_STATE_SIZE sizeof(StateInfo)=" << sizeof(StateInfo)
               << " sizeof(Accumulator)=" << sizeof(Accumulator)

@@ -198,6 +198,19 @@ endif
 # with the production architecture; PHASE9 and KINGFREE_TREE only change the
 # selector contract and therefore receive distinct architecture hashes.
 NNUE_SIMPLE_BUCKET ?= K3K3
+# Experiment 153: integer-equivalent AVX2 FT/FC0 fusion, opt-in only.
+NNUE_SIMPLE_FUSED_TRANSFORM_FC0 ?= NO
+ifeq ($(NNUE_SIMPLE_FUSED_TRANSFORM_FC0),YES)
+	ifneq ($(YANEURAOU_EDITION),YANEURAOU_ENGINE_NNUE_HALFKAHM2_SIMPLE_1536)
+		$(error NNUE_SIMPLE_FUSED_TRANSFORM_FC0=YES requires the HalfKA_HM2 Simple edition)
+	endif
+	ifneq ($(TARGET_CPU),AVX2)
+		$(error NNUE_SIMPLE_FUSED_TRANSFORM_FC0=YES currently requires TARGET_CPU=AVX2)
+	endif
+	CPPFLAGS += -DNNUE_SIMPLE_FUSED_TRANSFORM_FC0
+else ifneq ($(NNUE_SIMPLE_FUSED_TRANSFORM_FC0),NO)
+	$(error NNUE_SIMPLE_FUSED_TRANSFORM_FC0 must be YES or NO)
+endif
 ifeq ($(NNUE_SIMPLE_BUCKET),PHASE9)
 	CPPFLAGS += -DNNUE_SIMPLE_BUCKET_PHASE9
 else ifeq ($(NNUE_SIMPLE_BUCKET),KINGFREE_TREE)
